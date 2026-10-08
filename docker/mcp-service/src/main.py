@@ -70,8 +70,8 @@ def create_app(custom_settings: Optional[Settings] = None):
     # 2. search_notes
     @mcp.tool(description="Search notes in the collection by Anki query with bounded pagination.")
     async def search_notes(query: str, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
-        SearchNotesInput(query=query, limit=limit, offset=offset)
         try:
+            SearchNotesInput(query=query, limit=limit, offset=offset)
             return await note_tools.search_notes(anki_client, query, limit, offset)
         except (AnkiConnectError, AnkiConnectConnectionError, ValidationError) as e:
             return _tool_error_response(e)
@@ -79,8 +79,8 @@ def create_app(custom_settings: Optional[Settings] = None):
     # 3. get_note
     @mcp.tool(description="Retrieve details and fields for a specific note by ID.")
     async def get_note(note_id: int) -> Dict[str, Any]:
-        GetNoteInput(note_id=note_id)
         try:
+            GetNoteInput(note_id=note_id)
             return await note_tools.get_note(anki_client, note_id)
         except (AnkiConnectError, AnkiConnectConnectionError, ValidationError) as e:
             return _tool_error_response(e)
