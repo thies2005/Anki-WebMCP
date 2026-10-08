@@ -7,17 +7,20 @@
 ## Table of Contents
 
 1. [Overview & Philosophy](#overview--philosophy)
-2. [Architecture](#architecture)
-3. [Write Safety & Synchronization Model](#write-safety--synchronization-model)
-4. [Quick Start](#quick-start)
-5. [First-Run Setup: Logging into AnkiWeb](#first-run-setup-logging-into-ankiweb)
-6. [Exposure Modes](#exposure-modes)
+2. [Prerequisites](#prerequisites)
+3. [Architecture](#architecture)
+4. [Write Safety & Synchronization Model](#write-safety--synchronization-model)
+5. [Quick Start](#quick-start)
+6. [First-Run Setup: Logging into AnkiWeb](#first-run-setup-logging-into-ankiweb)
+7. [Exposure Modes](#exposure-modes)
    - [Mode 1: Cloudflare Tunnel](#mode-1-cloudflare-tunnel)
    - [Mode 2: Coolify HTTPS Reverse Proxy](#mode-2-coolify-https-reverse-proxy)
-7. [MCP Client Integration](#mcp-client-integration)
-8. [Available MCP Tools](#available-mcp-tools)
-9. [Security Architecture](#security-architecture)
-10. [Testing & Verification](#testing--verification)
+8. [MCP Client Integration](#mcp-client-integration)
+9. [Available MCP Tools](#available-mcp-tools)
+10. [Security Architecture](#security-architecture)
+11. [Troubleshooting](#troubleshooting)
+12. [Operations](#operations)
+13. [Testing & Verification](#testing--verification)
 
 ---
 
@@ -34,6 +37,17 @@
 - This is **not** a replacement Anki backend, custom sync server, or web scraper.
 - The browser interface is a **streamed virtual desktop session** (rendered via KasmVNC/WebSocket), not a native responsive HTML website. It provides full fidelity to the real Anki application, allowing you to configure add-ons, review cards, manage profiles, and resolve modal dialogs.
 - Audio playback in flashcards is delivered over the KasmVNC/PulseAudio stream to supported browsers.
+
+---
+
+## Prerequisites
+
+- **Docker Engine 24+ and Docker Compose v2.24+** (the exposure-mode override files use the `!override` compose tag, which requires 2.24+).
+- **x86_64 host**: the pinned Anki `linux-qt6` release tarball is x86_64-only; builds on arm64 fail at download time.
+- ~2 GB free RAM for the Qt6 desktop and 5+ GB disk for images and the Anki data volume.
+- Free host ports `3000` (GUI) and `8000` (MCP) — configurable via `.env`.
+- A Cloudflare account with a Zero Trust tunnel (only for Exposure Mode 1).
+- `openssl` to generate the three required secrets.
 
 ---
 
@@ -71,13 +85,13 @@ The system consists of two core containerized services and an optional exposure 
    - Extends the maintained `ghcr.io/linuxserver/baseimage-kasmvnc:debianbookworm` base image.
    - Installs pinned official release **Anki 24.11** with full Qt6 runtime libraries.
    - Pre-installs and pre-configures **AnkiConnect** (Add-on `2055492159`).
-   - Binds AnkiConnect to `0.0.0.0:8765` within the private container network and enforces `ANKI_CONNECT_API_KEY`.
+   - Binds AnkiConnect to `0.0.0.0:8765` within the private container network and requires `ANKI_CONNECT_API_KEY` (startup fails without it).
    - Protects the desktop web UI with HTTP Basic Authentication (`ANKI_GUI_USER` / `ANKI_GUI_PASSWORD`).
 
 2. **`mcp-service`**:
    - Python 3.12 service running the official Model Context Protocol SDK (`mcp`).
    - Serves the **Remote Streamable HTTP transport** at `/mcp` on port 8000.
-   - Enforces Bearer token / API key authentication (`MCP_AUTH_TOKEN`).
+   - Requires Bearer token / API key authentication (`MCP_AUTH_TOKEN`); the service exits at startup without it.
    - Sanitizes and redacts all secrets and tokens from logs.
    - Coordinates mutation jobs using an in-process lock and persistent idempotency ledger.
 
@@ -143,6 +157,8 @@ sequenceDiagram
   ```
 - **Duplicate Prevention**: `add_notes` pre-validates note candidates using Anki's duplicate scope checks (`canAddNotes`) before executing creation.
 - **Crash-Window Semantics**: The idempotency ledger is flushed atomically to disk using `tempfile` and `os.replace`. If a power loss occurs between step 5 (Anki DB write) and step 6 (ledger commit), Anki's first-field duplicate checking prevents accidental duplicates on retry if `allow_duplicates` is false.
+- **Ambiguous-outcome semantics**: if the connection to Anki Desktop is lost while applying a mutation, the response reports `local_status: "failed"` with an outcome-UNKNOWN warning and the idempotency key is deliberately **not** recorded — retrying with the same key re-executes the mutation, so verify the collection state first. Deterministic application errors (e.g. duplicate rejection) do persist a `failed` record.
+- **Bounded ledger**: the idempotency ledger keeps at most 1000 most-recent keys.
 
 ---
 
@@ -150,7 +166,7 @@ sequenceDiagram
 
 ### 1. Clone & Configure
 ```bash
-git clone https://github.com/your-username/Anki-WebMCP.git
+git clone <your-repository-url>
 cd Anki-WebMCP
 
 # Copy environment template
@@ -168,10 +184,10 @@ openssl rand -base64 16 # Use for ANKI_GUI_PASSWORD
 
 Example `.env`:
 ```env
-ANKI_CONNECT_API_KEY=a94f83b2e71c99f12d45a89b43e7610c12e834b971a82f01
-MCP_AUTH_TOKEN=e4b78901ca9f8812de45b901a76f2310b89e34a1708234ef
+ANKI_CONNECT_API_KEY=<output of: openssl rand -hex 24>
+MCP_AUTH_TOKEN=<output of: openssl rand -hex 24>
 ANKI_GUI_USER=admin
-ANKI_GUI_PASSWORD=MySecretGuiPassword123!
+ANKI_GUI_PASSWORD=<output of: openssl rand -base64 16>
 ANKI_GUI_PORT=3000
 MCP_PORT=8000
 TZ=UTC
@@ -193,6 +209,8 @@ Expected health output:
 {"status":"healthy","service":"anki-mcp","anki_connected":true,"maintenance_mode":false,"auth_enabled":true}
 ```
 
+> **Note:** On first boot Anki Desktop takes up to ~90 seconds to start inside the worker. Until then `/health` returns HTTP **503** with `"status":"degraded"` — this is expected. Watch progress with `docker compose logs -f anki-worker`.
+
 ---
 
 ## First-Run Setup: Logging into AnkiWeb
@@ -201,8 +219,7 @@ Before the MCP service can synchronize notes with AnkiWeb, you must log into you
 
 1. Open **http://localhost:3000** in your browser (or your configured HTTPS domain).
 2. Enter the HTTP Basic Auth credentials (`ANKI_GUI_USER` and `ANKI_GUI_PASSWORD`).
-3. You will see the live Anki Desktop running in your browser:
-   ![Anki Desktop Streamed GUI](https://raw.githubusercontent.com/chrislongros/anki-desktop-docker/main/.github/screenshot.png)
+3. You will see the live Anki Desktop running in your browser.
 4. In Anki Desktop, click the **Sync** button (or navigate to `Tools` -> `Preferences` -> `Syncing`).
 5. Enter your official **AnkiWeb username/email** and **password**.
 6. Click **Log In** and synchronize your collection.
@@ -236,8 +253,11 @@ Recommended for self-hosters without a public IP or open router ports.
 
 Recommended for self-hosters running Coolify.
 
-1. In Coolify, create a new project and select **Docker Compose**.
-2. Deploy using `docker-compose.yml` and `docker-compose.coolify.yml`.
+1. Merge the base and override files into a single stack file Coolify can consume:
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.coolify.yml config > coolify-stack.yml
+   ```
+2. In Coolify, create a new project, add a resource of type **Docker Compose**, and paste the contents of `coolify-stack.yml`.
 3. Set the environment variables in Coolify's Environment settings:
    ```env
    ANKI_GUI_DOMAIN=anki.yourdomain.com
@@ -251,6 +271,8 @@ Recommended for self-hosters running Coolify.
    - `https://anki.yourdomain.com` -> `anki-worker:3000` (WebSocket-enabled streamed GUI)
    - `https://anki-mcp.yourdomain.com` -> `mcp-service:8000` (Streamable HTTP MCP)
 
+> **Note:** Coolify must be able to route to the containers via its Traefik proxy network. If the domains do not resolve, attach both containers to Coolify's proxy network in the Coolify UI.
+
 ---
 
 ## MCP Client Integration
@@ -259,7 +281,7 @@ AI clients connect to the MCP server over the **Remote Streamable HTTP transport
 
 ### Claude Desktop Configuration
 
-Add the following to your `claude_desktop_config.json`:
+Claude Desktop has no native remote-HTTP MCP transport, so bridge it with [`mcp-remote`](https://www.npmjs.com/package/mcp-remote). Add the following to your `claude_desktop_config.json`:
 
 ```json
 {
@@ -268,16 +290,17 @@ Add the following to your `claude_desktop_config.json`:
       "command": "npx",
       "args": [
         "-y",
-        "@modelcontextprotocol/server-fetch",
-        "https://anki-mcp.yourdomain.com/mcp"
-      ],
-      "env": {
-        "HTTP_HEADER_AUTHORIZATION": "Bearer your-mcp-bearer-token"
-      }
+        "mcp-remote",
+        "https://anki-mcp.yourdomain.com/mcp",
+        "--header",
+        "Authorization: Bearer ${MCP_AUTH_TOKEN}"
+      ]
     }
   }
 }
 ```
+
+Replace `${MCP_AUTH_TOKEN}` with the literal value of `MCP_AUTH_TOKEN` from your `.env`.
 
 Or for direct HTTP clients supporting standard MCP Streamable HTTP / SSE:
 - **URL**: `https://anki-mcp.yourdomain.com/mcp`
@@ -312,20 +335,50 @@ Or for direct HTTP clients supporting standard MCP Streamable HTTP / SSE:
    - AnkiConnect listens on port `8765` solely on the internal Docker network `anki-net`.
    - Port 8765 is **never exposed** on host interfaces or reverse proxies.
    - All internal calls must supply `ANKI_CONNECT_API_KEY`.
+   - AnkiConnect's CORS origin list is restricted to localhost; the mcp-service reaches it over the private docker network without an Origin header.
+   - Both the worker and the MCP service refuse to start when required secrets are missing or still the .env.example placeholders (fail closed).
 2. **KasmVNC Desktop Protection**:
    - HTTP Basic Authentication is enforced before streaming the virtual X11 canvas.
    - Compatible with Cloudflare Access (SSO / 2FA).
 3. **MCP Service Security**:
-   - Constant-time HMAC comparison prevents timing attacks on `MCP_AUTH_TOKEN`.
+   - Constant-time token comparison prevents timing attacks on `MCP_AUTH_TOKEN`.
    - Supports `Authorization: Bearer <token>` and `X-API-Key: <token>`.
 4. **Log Redaction**:
    - Automatic regex filters mask Authorization headers, bearer tokens, passwords, API keys, and AnkiWeb credentials before writing to container logs.
+5. **Fail-Closed Startup**:
+   - `mcp-service` exits at startup unless `MCP_AUTH_TOKEN` and `ANKI_CONNECT_API_KEY` are set to non-placeholder values.
+   - `anki-worker` aborts its startup script unless `ANKI_CONNECT_API_KEY` and `ANKI_GUI_PASSWORD` are set to non-placeholder values.
+6. **Known trade-offs**:
+   - The worker runs with `seccomp=unconfined` and Chromium `--no-sandbox` flags, required for Qt/Chromium under KasmVNC; the desktop is therefore trusted to render only your own collection.
+   - `/health` is intentionally unauthenticated and reports connectivity/auth state for monitoring; it exposes no collection data.
+   - In Cloudflare Tunnel mode, never map a public hostname to `anki-worker:8765` — ingress rules live in the Cloudflare dashboard, outside this repository's control.
+
+---
+
+## Troubleshooting
+
+- **`/health` returns 503 / `degraded`**: Anki Desktop is still booting (up to ~90s on first start). Check `docker compose logs -f anki-worker`.
+- **Container exits with `[FATAL] ... placeholder`**: a required secret in `.env` is empty or still `replace-with...`; generate real values (see Quick Start) and `docker compose up -d --force-recreate`.
+- **Build fails downloading the Anki tarball (404)**: you are on an arm64 host; the pinned `linux-qt6` build is x86_64-only.
+- **`Bind for 0.0.0.0:3000 failed: port already allocated`**: another service holds the port — change `ANKI_GUI_PORT`/`MCP_PORT` in `.env`.
+- **Sync warnings say `sync: auth not configured`**: no AnkiWeb account is logged in yet — complete First-Run Setup through the GUI.
+- **MCP client gets 401**: the client's token does not match `MCP_AUTH_TOKEN`; only `Authorization: Bearer` and `X-API-Key` headers are accepted (query parameters are not).
+- **Cloudflare/Coolify variant still exposes ports**: your Docker Compose is older than 2.24 and does not honor `!override` — upgrade Compose.
+
+---
+
+## Operations
+
+- **Backup**: `docker run --rm -v anki_data:/config -v "$PWD":/backup alpine tar czf /backup/anki-data-$(date +%F).tgz -C /config .`
+- **Restore**: `docker run --rm -v anki_data:/config -v "$PWD":/backup alpine sh -c "cd /config && tar xzf /backup/anki-data-<date>.tgz"` then `docker compose restart anki-worker`.
+- **Upgrade**: `git pull && docker compose build --pull && docker compose up -d`
+- **Logs**: `docker compose logs -f mcp-service` / `docker compose logs -f anki-worker`
 
 ---
 
 ## Testing & Verification
 
-The repository includes a comprehensive 35-test unit suite covering client parsing, authentication middleware, write-safety coordinators, and idempotency persistence:
+The repository includes a comprehensive unit suite covering client parsing, authentication middleware, write-safety coordinators, and idempotency persistence:
 
 ```bash
 # Set up a Python environment and run tests
