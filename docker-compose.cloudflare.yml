@@ -1,0 +1,30 @@
+# Cloudflare Tunnel Exposure Mode Override
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.cloudflare.yml up -d
+#
+# Routes traffic securely through an outbound Cloudflare Tunnel to:
+#   1. anki-worker:3000 (Desktop GUI) -> configured in Cloudflare Dashboard / ingress
+#   2. mcp-service:8000 (MCP endpoint /mcp) -> configured in Cloudflare Dashboard / ingress
+#
+# No router ports or firewall rules need to be opened.
+
+services:
+  # In Cloudflare Tunnel mode, prevent direct public exposure of host ports
+  anki-worker:
+    ports:
+      - "127.0.0.1:${ANKI_GUI_PORT:-3000}:3000"
+
+  mcp-service:
+    ports:
+      - "127.0.0.1:${MCP_PORT:-8000}:8000"
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    networks:
+      - anki-net
+    depends_on:
+      - anki-worker
+      - mcp-service

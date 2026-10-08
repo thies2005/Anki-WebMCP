@@ -1,0 +1,67 @@
+# Core Production Docker Compose Configuration
+# Provides anki-worker (desktop GUI + AnkiConnect) and mcp-service (Streamable HTTP MCP endpoint)
+
+services:
+  anki-worker:
+    build:
+      context: ./docker/anki-worker
+      dockerfile: Dockerfile
+    image: anki-worker:latest
+    container_name: anki-worker
+    restart: unless-stopped
+    shm_size: 1gb
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-UTC}
+      - CUSTOM_USER=${ANKI_GUI_USER:-admin}
+      - PASSWORD=${ANKI_GUI_PASSWORD:-}
+      - ANKI_CONNECT_API_KEY=${ANKI_CONNECT_API_KEY}
+      - TITLE=Anki Desktop
+    volumes:
+      - anki_data:/config
+    networks:
+      - anki-net
+    ports:
+      # Expose KasmVNC web UI (HTTP on 3000, optional HTTPS on 3001)
+      # For public exposure, use Cloudflare Tunnel or Coolify HTTPS proxy with credentials.
+      - "${ANKI_GUI_PORT:-3000}:3000"
+    # IMPORTANT: Port 8765 (AnkiConnect) is intentionally NOT exposed in host ports!
+    # It is accessible exclusively by mcp-service on private bridge network 'anki-net'.
+
+  mcp-service:
+    build:
+      context: ./docker/mcp-service
+      dockerfile: Dockerfile
+    image: mcp-service:latest
+    container_name: mcp-service
+    restart: unless-stopped
+    depends_on:
+      - anki-worker
+    environment:
+      - ANKI_CONNECT_URL=http://anki-worker:8765
+      - ANKI_CONNECT_API_KEY=${ANKI_CONNECT_API_KEY}
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}
+      - MCP_PORT=8000
+      - MCP_HOST=0.0.0.0
+      - MCP_PATH=/mcp
+      - IDEMPOTENCY_LEDGER_PATH=/data/idempotency_ledger.json
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - mcp_data:/data
+    networks:
+      - anki-net
+    ports:
+      - "${MCP_PORT:-8000}:8000"
+
+networks:
+  anki-net:
+    driver: bridge
+
+volumes:
+  anki_data:
+    name: anki_data
+  mcp_data:
+    name: mcp_data

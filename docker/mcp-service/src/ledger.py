@@ -1,0 +1,105 @@
+"""Persistent idempotency ledger for operation deduplication across restarts."""
+
+import asyncio
+from datetime import datetime, timezone
+import json
+import logging
+import os
+import tempfile
+from typing import Any, Dict, Optional
+
+logger = logging.getLogger("anki_mcp.ledger")
+
+
+class IdempotencyLedger:
+    """Thread- and coroutine-safe persistent store for idempotency keys.
+    
+    CRASH-WINDOW LIMITATION DOCUMENTATION:
+    The mutation lifecycle follows:
+      1. Pre-sync with AnkiWeb.
+      2. Execute local write in Anki Desktop (Anki commits to its SQLite database).
+      3. Commit record to this Idempotency Ledger (flushed atomically to disk).
+      4. Post-sync with AnkiWeb.
+    
+    If the worker crashes or loses power between step 2 (Anki DB write) and step 3
+    (ledger commit), the ledger will not contain the key upon restart. On retry:
+      - For notes, Anki's built-in first-field duplicate checking ('canAddNotes') will
+        detect and reject accidental duplicate creation if allowDuplicate is False.
+      - If duplicates were explicitly allowed, a duplicated note could be created in this
+        narrow crash window.
+    """
+
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self._lock = asyncio.Lock()
+        self._entries: Dict[str, Dict[str, Any]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        """Load ledger entries from disk if file exists."""
+        if os.path.exists(self.file_path):
+            try:
+                with open(self.file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        self._entries = data
+                        logger.info("Loaded %d idempotency records from %s", len(self._entries), self.file_path)
+                    else:
+                        logger.warning("Corrupted ledger format in %s, starting fresh", self.file_path)
+            except Exception as e:
+                logger.error("Failed to read idempotency ledger from %s: %s", self.file_path, e)
+
+    def _save_atomic(self) -> None:
+        """Persist entries to disk using an atomic rename to prevent corruption on crash."""
+        dir_name = os.path.dirname(self.file_path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+
+        temp_fd, temp_path = tempfile.mkstemp(dir=dir_name if dir_name else ".", prefix="ledger_", suffix=".tmp")
+        try:
+            with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
+                json.dump(self._entries, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, self.file_path)
+        except Exception as e:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+            logger.error("Failed to atomically save idempotency ledger to %s: %s", self.file_path, e)
+            raise
+
+    async def get(self, key: str) -> Optional[Dict[str, Any]]:
+        """Retrieve existing record for key if it exists."""
+        if not key:
+            return None
+        async with self._lock:
+            return self._entries.get(key)
+
+    async def record_success(self, key: str, data: Any) -> None:
+        """Record successful operation in ledger."""
+        if not key:
+            return
+        async with self._lock:
+            self._entries[key] = {
+                "status": "committed",
+                "data": data,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            self._save_atomic()
+            logger.info("Recorded idempotency key '%s' with committed status", key)
+
+    async def record_failure(self, key: str, error: str) -> None:
+        """Record failed operation in ledger."""
+        if not key:
+            return
+        async with self._lock:
+            self._entries[key] = {
+                "status": "failed",
+                "error": error,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            self._save_atomic()
+            logger.info("Recorded idempotency key '%s' with failed status", key)

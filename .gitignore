@@ -1,0 +1,31 @@
+# Environment & secrets
+.env
+*.env
+*.key
+*.token
+
+# Python & venvs
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+/tmp/
+
+# Testing & linting
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Anki local data (when mounted locally)
+/data/
+/config/
+*.db-journal
+*.anki2
+
+# OS artifacts
+.DS_Store
+Thumbs.db

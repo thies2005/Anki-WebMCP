@@ -1,0 +1,32 @@
+# Coolify HTTPS Reverse Proxy Exposure Mode Override
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.coolify.yml up -d
+#
+# Coolify's Traefik reverse proxy automatically provisions Let's Encrypt certificates
+# and routes HTTPS domains to container internal ports:
+#   1. ${ANKI_GUI_DOMAIN} -> anki-worker:3000
+#   2. ${ANKI_MCP_DOMAIN} -> mcp-service:8000
+
+services:
+  anki-worker:
+    # Disable direct host port exposure so all traffic goes through Coolify's Traefik
+    ports: []
+    labels:
+      - "coolify.managed=true"
+      - "traefik.enable=true"
+      - "traefik.http.routers.anki-gui.rule=Host(`${ANKI_GUI_DOMAIN}`)"
+      - "traefik.http.routers.anki-gui.entrypoints=websecure"
+      - "traefik.http.routers.anki-gui.tls=true"
+      - "traefik.http.routers.anki-gui.tls.certresolver=letsencrypt"
+      - "traefik.http.services.anki-gui.loadbalancer.server.port=3000"
+
+  mcp-service:
+    ports: []
+    labels:
+      - "coolify.managed=true"
+      - "traefik.enable=true"
+      - "traefik.http.routers.anki-mcp.rule=Host(`${ANKI_MCP_DOMAIN}`)"
+      - "traefik.http.routers.anki-mcp.entrypoints=websecure"
+      - "traefik.http.routers.anki-mcp.tls=true"
+      - "traefik.http.routers.anki-mcp.tls.certresolver=letsencrypt"
+      - "traefik.http.services.anki-mcp.loadbalancer.server.port=8000"
