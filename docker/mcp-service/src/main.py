@@ -8,6 +8,7 @@ from mcp.server.mcpserver import MCPServer
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 import uvicorn
+from pydantic import ValidationError
 
 from .anki_client import AnkiClient, AnkiConnectConnectionError, AnkiConnectError
 from .auth import AuthMiddleware
@@ -63,7 +64,7 @@ def create_app(custom_settings: Optional[Settings] = None):
     async def list_decks() -> Dict[str, Any]:
         try:
             return await deck_tools.list_decks(anki_client)
-        except (AnkiConnectError, AnkiConnectConnectionError) as e:
+        except (AnkiConnectError, AnkiConnectConnectionError, ValidationError) as e:
             return _tool_error_response(e)
 
     # 2. search_notes
@@ -72,7 +73,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         SearchNotesInput(query=query, limit=limit, offset=offset)
         try:
             return await note_tools.search_notes(anki_client, query, limit, offset)
-        except (AnkiConnectError, AnkiConnectConnectionError) as e:
+        except (AnkiConnectError, AnkiConnectConnectionError, ValidationError) as e:
             return _tool_error_response(e)
 
     # 3. get_note
@@ -81,7 +82,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         GetNoteInput(note_id=note_id)
         try:
             return await note_tools.get_note(anki_client, note_id)
-        except (AnkiConnectError, AnkiConnectConnectionError) as e:
+        except (AnkiConnectError, AnkiConnectConnectionError, ValidationError) as e:
             return _tool_error_response(e)
 
     # 4. get_collection_stats
@@ -89,7 +90,7 @@ def create_app(custom_settings: Optional[Settings] = None):
     async def get_collection_stats() -> Dict[str, Any]:
         try:
             return await stats_tools.get_collection_stats(anki_client)
-        except (AnkiConnectError, AnkiConnectConnectionError) as e:
+        except (AnkiConnectError, AnkiConnectConnectionError, ValidationError) as e:
             return _tool_error_response(e)
 
     # 5. sync_collection
@@ -106,26 +107,35 @@ def create_app(custom_settings: Optional[Settings] = None):
         idempotency_key: Optional[str] = None,
         allow_duplicates: bool = False,
     ) -> Dict[str, Any]:
-        # Validate the full batch (non-empty, <=100 notes, field shapes) before any sync happens
-        parsed_input = AddNotesInput(notes=notes, idempotency_key=idempotency_key, allow_duplicates=allow_duplicates)
-        res = await note_tools.add_notes(
-            sync_manager, parsed_input.notes, parsed_input.idempotency_key, parsed_input.allow_duplicates
-        )
-        return res.model_dump()
+        try:
+            # Validate the full batch (non-empty, <=100 notes, field shapes) before any sync happens
+            parsed_input = AddNotesInput(notes=notes, idempotency_key=idempotency_key, allow_duplicates=allow_duplicates)
+            res = await note_tools.add_notes(
+                sync_manager, parsed_input.notes, parsed_input.idempotency_key, parsed_input.allow_duplicates
+            )
+            return res.model_dump()
+        except (AnkiConnectError, AnkiConnectConnectionError, ValidationError) as e:
+            return _tool_error_response(e)
 
     # 7. update_note_fields
     @mcp.tool(description="Update fields on an existing note with pre-sync and post-sync.")
     async def update_note_fields(note_id: int, fields: Dict[str, str]) -> Dict[str, Any]:
-        UpdateNoteFieldsInput(note_id=note_id, fields=fields)
-        res = await note_tools.update_note_fields(sync_manager, note_id, fields)
-        return res.model_dump()
+        try:
+            UpdateNoteFieldsInput(note_id=note_id, fields=fields)
+            res = await note_tools.update_note_fields(sync_manager, note_id, fields)
+            return res.model_dump()
+        except (AnkiConnectError, AnkiConnectConnectionError, ValidationError) as e:
+            return _tool_error_response(e)
 
     # 8. add_tags
     @mcp.tool(description="Add tags to notes with pre-sync and post-sync.")
     async def add_tags(note_ids: List[int], tags: List[str]) -> Dict[str, Any]:
-        parsed = AddTagsInput(note_ids=note_ids, tags=tags)
-        res = await note_tools.add_tags(sync_manager, parsed.note_ids, parsed.tags)
-        return res.model_dump()
+        try:
+            parsed = AddTagsInput(note_ids=note_ids, tags=tags)
+            res = await note_tools.add_tags(sync_manager, parsed.note_ids, parsed.tags)
+            return res.model_dump()
+        except (AnkiConnectError, AnkiConnectConnectionError, ValidationError) as e:
+            return _tool_error_response(e)
 
     # Create Starlette app for streamable HTTP with reverse-proxy support
     from mcp.server.transport_security import TransportSecuritySettings
@@ -157,13 +167,19 @@ def create_app(custom_settings: Optional[Settings] = None):
     # Close the shared AnkiConnect HTTP client on app shutdown.
     # (Starlette 1.x removed add_event_handler; wrap the lifespan instead so the
     # client is closed after the SDK's session-manager shutdown completes.)
+    # Capture the client BEFORE defining the wrapper: close must run even if the
+    # inner shutdown raises, and a later create_app() must not be able to rebind
+    # which client this wrapper closes.
+    client_to_close = anki_client
     inner_lifespan = app.router.lifespan_context
 
     @asynccontextmanager
     async def lifespan_with_client_close(a):
-        async with inner_lifespan(a):
-            yield
-        await anki_client.close()
+        try:
+            async with inner_lifespan(a):
+                yield
+        finally:
+            await client_to_close.close()
 
     app.router.lifespan_context = lifespan_with_client_close
 

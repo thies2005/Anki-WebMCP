@@ -262,10 +262,10 @@ Recommended for self-hosters running Coolify.
    ```env
    ANKI_GUI_DOMAIN=anki.yourdomain.com
    ANKI_MCP_DOMAIN=anki-mcp.yourdomain.com
-   ANKI_CONNECT_API_KEY=your-anki-key
-   MCP_AUTH_TOKEN=your-mcp-bearer-token
+   ANKI_CONNECT_API_KEY=<output of: openssl rand -hex 24>
+   MCP_AUTH_TOKEN=<output of: openssl rand -hex 24>
    ANKI_GUI_USER=admin
-   ANKI_GUI_PASSWORD=your-gui-password
+   ANKI_GUI_PASSWORD=<output of: openssl rand -base64 16>
    ```
 4. Coolify's Traefik reverse proxy will automatically issue Let's Encrypt certificates and route:
    - `https://anki.yourdomain.com` -> `anki-worker:3000` (WebSocket-enabled streamed GUI)
@@ -358,7 +358,9 @@ Or for direct HTTP clients supporting standard MCP Streamable HTTP / SSE:
 ## Troubleshooting
 
 - **`/health` returns 503 / `degraded`**: Anki Desktop is still booting (up to ~90s on first start). Check `docker compose logs -f anki-worker`.
-- **Container exits with `[FATAL] ... placeholder`**: a required secret in `.env` is empty or still `replace-with...`; generate real values (see Quick Start) and `docker compose up -d --force-recreate`.
+- **`anki-worker` logs show `[FATAL] ... ANKI_CONNECT_API_KEY` or `... ANKI_GUI_PASSWORD`**: the startup gate aborted the desktop session. The container itself stays up (the login page may even load), but Anki never starts, so `/health` remains 503. Fix the `.env` values and run `docker compose up -d --force-recreate`.
+- **`mcp-service` restart-loops with `FATAL: MCP_AUTH_TOKEN ...` (or `FATAL: ANKI_CONNECT_API_KEY ...`) in its logs**: the service exits at startup because a required secret is empty or still the `.env.example` placeholder. Generate real values (see Quick Start) and recreate the container.
+- **A retry unexpectedly says `Previous attempt with this idempotency key failed`**: the key was recorded as `failed` by the pre-fix version after an ambiguous connection loss. Use a new idempotency key; old entries age out of the 1000-entry ledger.
 - **Build fails downloading the Anki tarball (404)**: you are on an arm64 host; the pinned `linux-qt6` build is x86_64-only.
 - **`Bind for 0.0.0.0:3000 failed: port already allocated`**: another service holds the port — change `ANKI_GUI_PORT`/`MCP_PORT` in `.env`.
 - **Sync warnings say `sync: auth not configured`**: no AnkiWeb account is logged in yet — complete First-Run Setup through the GUI.

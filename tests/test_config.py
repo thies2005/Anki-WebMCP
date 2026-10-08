@@ -46,10 +46,13 @@ def test_validate_deployment_config_valid():
     assert validate_deployment_config(settings) == []
 
 
-def test_main_refuses_unsafe_config(monkeypatch):
-    monkeypatch.delenv("MCP_AUTH_TOKEN", raising=False)
-    monkeypatch.delenv("ANKI_CONNECT_API_KEY", raising=False)
-    from src.main import main
+def test_main_refuses_unsafe_config(monkeypatch, temp_ledger_file):
+    from src import main as main_module
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        Settings(mcp_auth_token="", anki_connect_api_key="", idempotency_ledger_path=temp_ledger_file),
+    )
     with pytest.raises(SystemExit) as exc_info:
-        main()
+        main_module.main()
     assert exc_info.value.code == 1

@@ -60,14 +60,49 @@ async def test_tools_call_returns_structured_error_when_anki_down(temp_ledger_fi
             assert "error" not in payload
             text = payload["result"]["content"][0]["text"]
             # The upstream failure message must reach the client as structured
-            # data, not the SDK's generic "Error executing tool" mask.
+            # JSON, not the SDK's generic "Error executing tool" mask.
             assert "Error executing tool" not in text
-            try:
-                structured = json.loads(text)
-            except json.JSONDecodeError:
-                structured = None
-            if structured is not None:
-                assert structured.get("success") is False
-                assert "Could not connect to Anki Desktop" in structured.get("error", "")
-            else:
-                assert "Could not connect to Anki Desktop" in text
+            structured = json.loads(text)
+            assert structured.get("success") is False
+            assert "Could not connect to Anki Desktop" in structured.get("error", "")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_add_notes_empty_batch_returns_structured_protocol_error(temp_ledger_file):
+    sync_route = respx.post("http://127.0.0.1:8765/").mock(
+        return_value=httpx.Response(200, json={"result": None, "error": None})
+    )
+    settings = Settings(
+        anki_connect_url="http://127.0.0.1:8765",
+        mcp_auth_token="secure-token",
+        idempotency_ledger_path=temp_ledger_file,
+    )
+    app = create_app(settings)
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client:
+            init_res = await client.post("/mcp", headers=AUTH_HEADERS, json={
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "pytest", "version": "0"}},
+            })
+            assert init_res.status_code == 200
+            headers = dict(AUTH_HEADERS)
+            session_id = init_res.headers.get("mcp-session-id")
+            if session_id:
+                headers["mcp-session-id"] = session_id
+            await client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+            call_res = await client.post("/mcp", headers=headers, json={
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "add_notes", "arguments": {"notes": []}},
+            })
+            assert call_res.status_code == 200
+            payload = _parse_mcp_response(call_res)
+            text = payload["result"]["content"][0]["text"]
+            assert "Error executing tool" not in text
+            structured = json.loads(text)
+            assert structured.get("success") is False
+            assert structured.get("error_type") == "ValidationError"
+            # No sync must have been triggered for an empty batch
+            assert sync_route.call_count == 0
