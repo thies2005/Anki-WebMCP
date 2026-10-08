@@ -92,7 +92,7 @@ async def test_mcp_api_key_header_accepted(temp_ledger_file):
 
 
 @pytest.mark.asyncio
-async def test_mcp_query_param_token_accepted(temp_ledger_file):
+async def test_mcp_query_param_token_rejected(temp_ledger_file):
     settings = Settings(
         mcp_auth_token="secure-token",
         idempotency_ledger_path=temp_ledger_file,
@@ -105,21 +105,50 @@ async def test_mcp_query_param_token_accepted(temp_ledger_file):
                 "/mcp?token=secure-token",
                 json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
             )
-            assert res.status_code != 401
+            assert res.status_code == 401
 
 
 @pytest.mark.asyncio
-async def test_auth_disabled_when_token_empty(temp_ledger_file):
+async def test_create_app_rejects_empty_token(temp_ledger_file):
     settings = Settings(
         mcp_auth_token="",
         idempotency_ledger_path=temp_ledger_file,
     )
     app = create_app(settings)
+    # Starlette builds the middleware stack lazily; construction of
+    # AuthMiddleware (which must raise) happens on stack build.
+    with pytest.raises(ValueError, match="MCP_AUTH_TOKEN"):
+        app.build_middleware_stack()
 
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client:
-            res = await client.post(
-                "/mcp",
-                json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
-            )
-            assert res.status_code != 401
+
+@pytest.mark.asyncio
+async def test_mcp_non_ascii_token_rejected_without_500(temp_ledger_file):
+    settings = Settings(
+        mcp_auth_token="secure-token",
+        idempotency_ledger_path=temp_ledger_file,
+    )
+    app = create_app(settings)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client:
+        # Send the token as raw UTF-8 bytes, as it would arrive on the wire;
+        # httpx rejects non-ASCII str header values before sending.
+        res = await client.post(
+            "/mcp",
+            headers={"Authorization": "Bearer tökén".encode("utf-8")},
+            json={},
+        )
+        assert res.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_mcp_malformed_authorization_header_rejected(temp_ledger_file):
+    settings = Settings(
+        mcp_auth_token="secure-token",
+        idempotency_ledger_path=temp_ledger_file,
+    )
+    app = create_app(settings)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client:
+        for header in ("Bearer", "Token secure-token", "Basic dXNlcjpwYXNz"):
+            res = await client.post("/mcp", headers={"Authorization": header}, json={})
+            assert res.status_code == 401

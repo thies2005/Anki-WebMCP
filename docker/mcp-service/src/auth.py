@@ -13,21 +13,24 @@ logger = logging.getLogger("anki_mcp.auth")
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    """Protects MCP endpoints with Bearer token / API key authentication."""
+    """Protects MCP endpoints with Bearer token / API key authentication.
+
+    Authentication is mandatory: constructing this middleware without a
+    configured token raises, so the endpoint can never serve unauthenticated.
+    """
 
     def __init__(self, app, settings: Optional[Settings] = None):
         super().__init__(app)
         self.settings = settings or get_settings()
-        if not self.settings.is_auth_enabled:
-            logger.warning("WARNING: MCP_AUTH_TOKEN is not set! Remote MCP endpoint is unauthenticated.")
+        if not self.settings.mcp_auth_token:
+            raise ValueError(
+                "AuthMiddleware requires a non-empty MCP_AUTH_TOKEN. "
+                "Refusing to serve an unauthenticated MCP endpoint."
+            )
 
     async def dispatch(self, request: Request, call_next) -> Response:
-        # Permit health checks and OPTIONS without authentication
+        # Permit health checks and CORS preflights without authentication
         if request.url.path == "/health" or request.method == "OPTIONS":
-            return await call_next(request)
-
-        # If auth is disabled, allow
-        if not self.settings.is_auth_enabled:
             return await call_next(request)
 
         provided_token = self._extract_token(request)
@@ -39,7 +42,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
-        if not hmac.compare_digest(provided_token, self.settings.mcp_auth_token):
+        if not self._tokens_match(provided_token, self.settings.mcp_auth_token):
             logger.warning("Rejected request to %s: invalid token provided", request.url.path)
             return JSONResponse(
                 status_code=401,
@@ -49,22 +52,26 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         return await call_next(request)
 
-    def _extract_token(self, request: Request) -> Optional[str]:
-        # 1. Check Authorization: Bearer <token>
+    @staticmethod
+    def _tokens_match(provided: str, expected: str) -> bool:
+        """Constant-time comparison on UTF-8 bytes; never raises on odd input."""
+        try:
+            return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+        except UnicodeEncodeError:
+            return False
+
+    @staticmethod
+    def _extract_token(request: Request) -> Optional[str]:
+        # 1. Authorization: Bearer <token>
         auth_header = request.headers.get("Authorization")
         if auth_header:
             parts = auth_header.strip().split()
             if len(parts) == 2 and parts[0].lower() == "bearer":
                 return parts[1]
 
-        # 2. Check X-API-Key: <token>
+        # 2. X-API-Key: <token>
         api_key_header = request.headers.get("X-API-Key")
         if api_key_header:
             return api_key_header.strip()
-
-        # 3. Check query param: ?token=<token>
-        token_query = request.query_params.get("token")
-        if token_query:
-            return token_query.strip()
 
         return None

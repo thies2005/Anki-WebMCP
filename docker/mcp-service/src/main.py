@@ -10,7 +10,7 @@ import uvicorn
 
 from .anki_client import AnkiClient
 from .auth import AuthMiddleware
-from .config import Settings, get_settings
+from .config import Settings, get_settings, validate_deployment_config
 from .ledger import IdempotencyLedger
 from .logging_util import setup_logging
 from .models import NoteInput
@@ -123,12 +123,15 @@ def create_app(custom_settings: Optional[Settings] = None):
 
 
 def main():
-    """Start uvicorn server."""
+    """Start uvicorn server, refusing unsafe configuration."""
+    problems = validate_deployment_config(settings)
+    if problems:
+        for problem in problems:
+            logger.error("FATAL: %s", problem)
+        raise SystemExit(1)
+
     logger.info("Starting Anki MCP Service on %s:%d (path: %s)", settings.mcp_host, settings.mcp_port, settings.mcp_path)
-    if settings.is_auth_enabled:
-        logger.info("Authentication enabled with configured MCP_AUTH_TOKEN")
-    else:
-        logger.warning("Authentication is DISABLED (MCP_AUTH_TOKEN is empty)")
+    logger.info("Authentication enabled with configured MCP_AUTH_TOKEN")
 
     app = create_app()
     uvicorn.run(
