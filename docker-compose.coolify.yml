@@ -6,11 +6,13 @@
 # and routes HTTPS domains to container internal ports:
 #   1. ${ANKI_GUI_DOMAIN} -> anki-worker:3000
 #   2. ${ANKI_MCP_DOMAIN} -> mcp-service:8000
+# NOTE: The !override tag requires Docker Compose >= 2.24. Without it, Compose
+# APPENDS ports from the base file instead of replacing them.
 
 services:
   anki-worker:
     # Disable direct host port exposure so all traffic goes through Coolify's Traefik
-    ports: []
+    ports: !override []
     labels:
       - "coolify.managed=true"
       - "traefik.enable=true"
@@ -21,7 +23,7 @@ services:
       - "traefik.http.services.anki-gui.loadbalancer.server.port=3000"
 
   mcp-service:
-    ports: []
+    ports: !override []
     labels:
       - "coolify.managed=true"
       - "traefik.enable=true"

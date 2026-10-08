@@ -19,6 +19,7 @@ services:
       - CUSTOM_USER=${ANKI_GUI_USER:-admin}
       - PASSWORD=${ANKI_GUI_PASSWORD:-}
       - ANKI_CONNECT_API_KEY=${ANKI_CONNECT_API_KEY}
+      - ANKI_SYNC_SERVER=${ANKI_SYNC_SERVER:-}
       - TITLE=Anki Desktop
     volumes:
       - anki_data:/config
@@ -39,7 +40,8 @@ services:
     container_name: mcp-service
     restart: unless-stopped
     depends_on:
-      - anki-worker
+      anki-worker:
+        condition: service_healthy
     environment:
       - ANKI_CONNECT_URL=http://anki-worker:8765
       - ANKI_CONNECT_API_KEY=${ANKI_CONNECT_API_KEY}
@@ -49,6 +51,10 @@ services:
       - MCP_PATH=/mcp
       - IDEMPOTENCY_LEDGER_PATH=/data/idempotency_ledger.json
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - TZ=${TZ:-UTC}
+      - MAINTENANCE_MODE=${MAINTENANCE_MODE:-false}
+      - REQUEST_TIMEOUT_SECONDS=${REQUEST_TIMEOUT_SECONDS:-30}
+      - SYNC_TIMEOUT_SECONDS=${SYNC_TIMEOUT_SECONDS:-60}
     volumes:
       - mcp_data:/data
     networks:
