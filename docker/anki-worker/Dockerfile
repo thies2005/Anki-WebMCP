@@ -81,8 +81,10 @@ COPY root/ /
 EXPOSE 3000 3001 8765
 
 # Healthcheck: KasmVNC web UI is responsive
+# KasmVNC enforces HTTP basic auth: the healthcheck must present credentials
+# (CUSTOM_USER/PASSWORD env are provided by the baseimage) or it would 401.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -sf http://localhost:3000/ || exit 1
+    CMD curl -sf -u "${CUSTOM_USER}:${PASSWORD}" http://localhost:3000/ || exit 1
 
 # Persistent user configuration volume
 VOLUME /config

@@ -3,6 +3,25 @@ set -e
 
 echo "[INFO] Initializing Anki Desktop environment..."
 
+# Fail closed: refuse to run with missing or placeholder secrets
+fail_deploy() {
+    echo "[FATAL] $1" >&2
+    echo "[FATAL] Deployment aborted: fix .env and recreate the container." >&2
+    exit 1
+}
+
+case "${ANKI_CONNECT_API_KEY:-}" in
+    ""|replace-with*)
+        fail_deploy "ANKI_CONNECT_API_KEY is empty or still the placeholder. Generate one with: openssl rand -hex 24"
+        ;;
+esac
+
+case "${PASSWORD:-}" in
+    ""|replace-with*)
+        fail_deploy "ANKI_GUI_PASSWORD (PASSWORD) is empty or still the placeholder. Generate one with: openssl rand -base64 16"
+        ;;
+esac
+
 # Set HOME so Anki finds /config
 export HOME=/config
 
@@ -36,26 +55,21 @@ cat > "$ADDON_DIR/meta.json" << 'EOF'
 {"disabled": false, "mod": 0, "conflicts": [], "max_point_version": 0, "min_point_version": 0, "branch_index": 0, "update_enabled": false}
 EOF
 
-# Configure AnkiConnect (webBindAddress=0.0.0.0, apiKey from environment)
-API_KEY_VAL="${ANKI_CONNECT_API_KEY:-}"
-if [ -z "$API_KEY_VAL" ]; then
-    API_KEY_JSON="null"
-else
-    ESCAPED_KEY=$(echo "$API_KEY_VAL" | sed 's/"/\\"/g')
-    API_KEY_JSON="\"$ESCAPED_KEY\""
-fi
-
-cat > "$ADDON_DIR/config.json" << EOF
-{
-    "apiKey": $API_KEY_JSON,
-    "apiLogPath": null,
-    "ignoreOriginList": [],
-    "webBindAddress": "0.0.0.0",
-    "webBindPort": 8765,
-    "webCorsOriginList": ["*"]
-}
-EOF
-echo "[INFO] AnkiConnect configured (binding: 0.0.0.0:8765, apiKey: $([ -z "$API_KEY_VAL" ] && echo "none" || echo "configured"))"
+# Configure AnkiConnect: bind all interfaces (private docker network only),
+# require the API key (validated above), and restrict CORS to localhost
+# origins. Non-browser clients like mcp-service send no Origin header and
+# are unaffected by the CORS list.
+jq -n \
+    --arg key "$ANKI_CONNECT_API_KEY" \
+    '{
+        apiKey: $key,
+        apiLogPath: null,
+        ignoreOriginList: [],
+        webBindAddress: "0.0.0.0",
+        webBindPort: 8765,
+        webCorsOriginList: ["http://localhost"]
+    }' > "$ADDON_DIR/config.json"
+echo "[INFO] AnkiConnect configured (binding: 0.0.0.0:8765, apiKey: configured, CORS: localhost)"
 
 # Optional custom sync server override (official AnkiWeb is used by default)
 if [ -n "$ANKI_SYNC_SERVER" ]; then
