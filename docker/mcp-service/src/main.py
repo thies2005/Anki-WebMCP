@@ -1,6 +1,7 @@
 """Main entrypoint for Anki MCP Service."""
 
 import asyncio
+from contextlib import asynccontextmanager
 import logging
 from typing import Any, Dict, List, Optional
 from mcp.server.mcpserver import MCPServer
@@ -137,18 +138,34 @@ def create_app(custom_settings: Optional[Settings] = None):
     # Healthcheck endpoint (exempt from authentication)
     async def health_endpoint(request: Request) -> JSONResponse:
         anki_healthy = await anki_client.check_health()
-        return JSONResponse({
+        payload = {
             "status": "healthy" if anki_healthy else "degraded",
             "service": "anki-mcp",
             "anki_connected": anki_healthy,
             "maintenance_mode": sync_manager.maintenance_mode,
             "auth_enabled": settings.is_auth_enabled,
-        })
+        }
+        # 503 when degraded so Docker healthchecks and orchestrators can tell
+        # a live-but-broken service from a functional one.
+        return JSONResponse(payload, status_code=200 if anki_healthy else 503)
 
     app.add_route("/health", health_endpoint, methods=["GET"])
 
     # Attach AuthMiddleware
     app.add_middleware(AuthMiddleware, settings=settings)
+
+    # Close the shared AnkiConnect HTTP client on app shutdown.
+    # (Starlette 1.x removed add_event_handler; wrap the lifespan instead so the
+    # client is closed after the SDK's session-manager shutdown completes.)
+    inner_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan_with_client_close(a):
+        async with inner_lifespan(a):
+            yield
+        await anki_client.close()
+
+    app.router.lifespan_context = lifespan_with_client_close
 
     return app
 

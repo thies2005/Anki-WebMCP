@@ -3,7 +3,7 @@
 import httpx
 import pytest
 import respx
-from src.anki_client import AnkiClient
+from src.anki_client import AnkiClient, AnkiConnectConnectionError
 from src.sync_manager import SyncManager
 
 
@@ -186,3 +186,34 @@ async def test_idempotency_replay_prevents_duplicate_mutation(sync_mgr):
     assert counter == 1  # Still 1!
     assert res2.data == {"note_id": 500}
     assert any("Idempotent operation replay" in w for w in res2.warnings)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_connection_loss_does_not_poison_idempotency_key(sync_mgr, ledger):
+    # Pre-sync succeeds; the connection drops while applying the mutation.
+    call_count = 0
+
+    def side_effect(request):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return httpx.Response(200, json={"result": None, "error": None})
+        raise httpx.ConnectError("connection reset")
+
+    respx.post("http://127.0.0.1:8765/").mock(side_effect=side_effect)
+
+    async def lost_connection_mutation():
+        raise AnkiConnectConnectionError("AnkiConnect timed out while executing 'addNotes'.")
+
+    res = await sync_mgr.execute_mutation(
+        operation_name="add_notes",
+        mutation_fn=lost_connection_mutation,
+        idempotency_key="idemp-ambiguous",
+    )
+
+    assert res.success is False
+    assert res.local_status == "failed"
+    assert "UNKNOWN" in "".join(res.warnings)
+    # Crucially: no ledger record was persisted for the ambiguous outcome
+    assert await ledger.get("idemp-ambiguous") is None

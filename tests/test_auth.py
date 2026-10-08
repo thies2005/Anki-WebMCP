@@ -2,15 +2,21 @@
 
 import httpx
 import pytest
+import respx
 from src.config import Settings
 from src.main import create_app
 
 
 @pytest.mark.asyncio
+@respx.mock
 async def test_health_endpoint_exempt_from_auth(temp_ledger_file):
     settings = Settings(
+        anki_connect_url="http://127.0.0.1:8765",
         mcp_auth_token="secure-token",
         idempotency_ledger_path=temp_ledger_file,
+    )
+    respx.post("http://127.0.0.1:8765/").mock(
+        return_value=httpx.Response(200, json={"result": 6, "error": None})
     )
     app = create_app(settings)
 
@@ -19,7 +25,26 @@ async def test_health_endpoint_exempt_from_auth(temp_ledger_file):
         assert res.status_code == 200
         data = res.json()
         assert data["service"] == "anki-mcp"
+        assert data["anki_connected"] is True
         assert data["auth_enabled"] is True
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_health_degraded_returns_503(temp_ledger_file):
+    settings = Settings(
+        anki_connect_url="http://127.0.0.1:8765",
+        mcp_auth_token="secure-token",
+        idempotency_ledger_path=temp_ledger_file,
+    )
+    respx.post("http://127.0.0.1:8765/").mock(side_effect=httpx.ConnectError("refused"))
+    app = create_app(settings)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client:
+        res = await client.get("/health")
+        assert res.status_code == 503
+        assert res.json()["status"] == "degraded"
+        assert res.json()["anki_connected"] is False
 
 
 @pytest.mark.asyncio

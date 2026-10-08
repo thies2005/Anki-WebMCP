@@ -50,3 +50,18 @@ async def test_ledger_persistence_across_restarts(temp_ledger_file):
     entry = await ledger2.get("op-persist")
     assert entry is not None
     assert entry["data"] == {"saved": True}
+
+
+@pytest.mark.asyncio
+async def test_ledger_evicts_oldest_entries_beyond_cap(temp_ledger_file):
+    ledger = IdempotencyLedger(temp_ledger_file, max_entries=3)
+    for i in range(5):
+        await ledger.record_success(f"op-{i}", {"i": i})
+
+    assert await ledger.get("op-0") is None
+    assert await ledger.get("op-1") is None
+    assert await ledger.get("op-2") is not None
+    assert await ledger.get("op-4") is not None
+
+    with open(temp_ledger_file, "r", encoding="utf-8") as f:
+        assert len(json.load(f)) == 3

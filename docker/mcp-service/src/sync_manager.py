@@ -7,6 +7,7 @@ from typing import Any, List, Optional
 
 from .anki_client import (
     AnkiClient,
+    AnkiConnectConnectionError,
     AnkiConnectError,
     AnkiSyncAuthNotConfiguredError,
 )
@@ -145,6 +146,24 @@ class SyncManager:
                 logger.info("Applying local mutation for '%s'...", operation_name)
                 local_data = await mutation_fn()
                 local_status = "committed"
+            except AnkiConnectConnectionError as e:
+                # Connection lost mid-flight: the write may or may not have
+                # landed in Anki. Recording a 'failed' entry would permanently
+                # poison the idempotency key while the true outcome is unknown.
+                err_msg = str(e)
+                logger.error("Connection lost during '%s': %s (outcome unknown)", operation_name, err_msg)
+                warnings.append(
+                    "Connection to Anki Desktop failed while applying the mutation; the outcome is "
+                    "UNKNOWN (the write may have been applied). The idempotency key was NOT recorded. "
+                    "Verify the collection state before retrying with the same key."
+                )
+                return MutationResponse(
+                    success=False,
+                    local_status="failed",
+                    sync_status=sync_status,
+                    error=err_msg,
+                    warnings=warnings,
+                )
             except Exception as e:
                 local_status = "failed"
                 err_msg = str(e)

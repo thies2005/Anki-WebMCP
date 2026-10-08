@@ -10,30 +10,46 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger("anki_mcp.ledger")
 
+MAX_ENTRIES = 1000
+
 
 class IdempotencyLedger:
     """Thread- and coroutine-safe persistent store for idempotency keys.
-    
+
     CRASH-WINDOW LIMITATION DOCUMENTATION:
     The mutation lifecycle follows:
       1. Pre-sync with AnkiWeb.
       2. Execute local write in Anki Desktop (Anki commits to its SQLite database).
       3. Commit record to this Idempotency Ledger (flushed atomically to disk).
       4. Post-sync with AnkiWeb.
-    
+
     If the worker crashes or loses power between step 2 (Anki DB write) and step 3
     (ledger commit), the ledger will not contain the key upon restart. On retry:
       - For notes, Anki's built-in first-field duplicate checking ('canAddNotes') will
         detect and reject accidental duplicate creation if allowDuplicate is False.
       - If duplicates were explicitly allowed, a duplicated note could be created in this
         narrow crash window.
+
+    GROWTH LIMIT:
+    The ledger keeps at most MAX_ENTRIES (default 1000) most-recent keys,
+    evicting the oldest first, so the file cannot grow without bound.
+    Single-instance assumption: the lock is process-internal; run exactly
+    one mcp-service replica per ledger file.
     """
 
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str, max_entries: int = MAX_ENTRIES):
         self.file_path = file_path
+        self.max_entries = max_entries
         self._lock = asyncio.Lock()
         self._entries: Dict[str, Dict[str, Any]] = {}
         self._load()
+
+    def _evict_oldest_locked(self) -> None:
+        """Bound ledger growth: drop the oldest entries beyond max_entries."""
+        while len(self._entries) > self.max_entries:
+            oldest_key = next(iter(self._entries))
+            del self._entries[oldest_key]
+            logger.debug("Evicted idempotency entry '%s' (ledger cap reached)", oldest_key)
 
     def _load(self) -> None:
         """Load ledger entries from disk if file exists."""
@@ -88,6 +104,7 @@ class IdempotencyLedger:
                 "data": data,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
+            self._evict_oldest_locked()
             self._save_atomic()
             logger.info("Recorded idempotency key '%s' with committed status", key)
 
@@ -101,5 +118,6 @@ class IdempotencyLedger:
                 "error": error,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
+            self._evict_oldest_locked()
             self._save_atomic()
             logger.info("Recorded idempotency key '%s' with failed status", key)

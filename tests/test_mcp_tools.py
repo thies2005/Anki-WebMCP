@@ -418,3 +418,21 @@ async def test_search_notes_skips_phantom_entries(test_setup):
     res = await note_tools.search_notes(client, query="deck:Default")
     assert res["returned_count"] == 1
     assert res["notes"][0]["note_id"] == 1001
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_http_client_closed_on_shutdown(mock_settings, ledger):
+    from src import main as main_module
+    from src.main import create_app
+
+    respx.post("http://127.0.0.1:8765/").mock(
+        return_value=httpx.Response(200, json={"result": None, "error": None})
+    )
+    app = create_app(mock_settings)
+
+    async with app.router.lifespan_context(app):
+        await main_module.anki_client.invoke("version")
+        assert main_module.anki_client._client is not None
+
+    assert main_module.anki_client._client is None or main_module.anki_client._client.is_closed
