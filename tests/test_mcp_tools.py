@@ -242,6 +242,13 @@ async def test_update_note_fields(test_setup):
         action = body["action"]
         if action == "sync":
             return httpx.Response(200, json={"result": None, "error": None})
+        elif action == "notesInfo":
+            return httpx.Response(200, json={"result": [{
+                "noteId": 12345,
+                "modelName": "Basic",
+                "tags": [],
+                "fields": {"Front": {"value": "Old", "order": 0}, "Back": {"value": "Old", "order": 1}},
+            }], "error": None})
         elif action == "updateNoteFields":
             return httpx.Response(200, json={"result": None, "error": None})
         return httpx.Response(400)
@@ -266,6 +273,11 @@ async def test_add_tags(test_setup):
         action = body["action"]
         if action == "sync":
             return httpx.Response(200, json={"result": None, "error": None})
+        elif action == "notesInfo":
+            return httpx.Response(200, json={"result": [
+                {"noteId": 10, "modelName": "Basic", "tags": [], "fields": {}},
+                {"noteId": 20, "modelName": "Basic", "tags": [], "fields": {}},
+            ], "error": None})
         elif action == "addTags":
             assert body["params"]["notes"] == [10, 20]
             assert body["params"]["tags"] == "tag1 tag2"
@@ -291,3 +303,118 @@ async def test_sync_collection(test_setup):
     data = await sync_tools.sync_collection(sync_mgr)
     assert data["success"] is True
     assert data["sync_status"]["post_sync"] == "ok"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_update_note_fields_unknown_field_rejected(test_setup):
+    _, sync_mgr = test_setup
+
+    def side_effect(request):
+        import json
+        body = json.loads(request.content)
+        action = body["action"]
+        if action == "sync":
+            return httpx.Response(200, json={"result": None, "error": None})
+        elif action == "notesInfo":
+            return httpx.Response(200, json={"result": [{
+                "noteId": 12345,
+                "modelName": "Basic",
+                "tags": [],
+                "fields": {"Front": {"value": "Old", "order": 0}, "Back": {"value": "Old", "order": 1}},
+            }], "error": None})
+        return httpx.Response(400)
+
+    respx.post("http://127.0.0.1:8765/").mock(side_effect=side_effect)
+
+    res = await note_tools.update_note_fields(sync_mgr, 12345, {"Frant": "typo"})
+    assert res.success is False
+    assert res.local_status == "failed"
+    assert "unknown field" in res.error
+    assert "Front" in res.error  # valid fields listed
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_update_note_fields_missing_note_rejected(test_setup):
+    _, sync_mgr = test_setup
+
+    def side_effect(request):
+        import json
+        body = json.loads(request.content)
+        if body["action"] == "sync":
+            return httpx.Response(200, json={"result": None, "error": None})
+        if body["action"] == "notesInfo":
+            return httpx.Response(200, json={"result": [{}], "error": None})
+        return httpx.Response(400)
+
+    respx.post("http://127.0.0.1:8765/").mock(side_effect=side_effect)
+
+    res = await note_tools.update_note_fields(sync_mgr, 99999, {"Front": "x"})
+    assert res.success is False
+    assert "not found" in res.error
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_add_tags_missing_note_ids_rejected(test_setup):
+    _, sync_mgr = test_setup
+
+    def side_effect(request):
+        import json
+        body = json.loads(request.content)
+        if body["action"] == "sync":
+            return httpx.Response(200, json={"result": None, "error": None})
+        if body["action"] == "notesInfo":
+            # note 10 vanished, note 20 exists (AnkiConnect returns {} for missing)
+            return httpx.Response(200, json={"result": [
+                {},
+                {"noteId": 20, "modelName": "Basic", "tags": [], "fields": {}},
+            ], "error": None})
+        return httpx.Response(400)
+
+    respx.post("http://127.0.0.1:8765/").mock(side_effect=side_effect)
+
+    res = await note_tools.add_tags(sync_mgr, [10, 20], ["tag1"])
+    assert res.success is False
+    assert "not found" in res.error
+    assert "10" in res.error
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_add_notes_empty_batch_rejected(test_setup):
+    _, sync_mgr = test_setup
+    sync_route = respx.post("http://127.0.0.1:8765/").mock(
+        return_value=httpx.Response(200, json={"result": None, "error": None})
+    )
+
+    with pytest.raises(AnkiConnectError, match="At least one note"):
+        await note_tools.add_notes(sync_mgr, [])
+
+    # No sync may have been triggered for an empty batch
+    assert sync_route.call_count == 0
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_search_notes_skips_phantom_entries(test_setup):
+    client, _ = test_setup
+
+    def side_effect(request):
+        import json
+        body = json.loads(request.content)
+        if body["action"] == "findNotes":
+            return httpx.Response(200, json={"result": [1001, 1002], "error": None})
+        if body["action"] == "notesInfo":
+            return httpx.Response(200, json={"result": [
+                {"noteId": 1001, "modelName": "Basic", "tags": [], "fields": {"Front": {"value": "Q", "order": 0}}},
+                {},  # vanished between findNotes and notesInfo
+            ], "error": None})
+        return httpx.Response(400)
+
+    respx.post("http://127.0.0.1:8765/").mock(side_effect=side_effect)
+
+    res = await note_tools.search_notes(client, query="deck:Default")
+    assert res["returned_count"] == 1
+    assert res["notes"][0]["note_id"] == 1001

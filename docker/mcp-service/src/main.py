@@ -8,12 +8,12 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 import uvicorn
 
-from .anki_client import AnkiClient
+from .anki_client import AnkiClient, AnkiConnectConnectionError, AnkiConnectError
 from .auth import AuthMiddleware
 from .config import Settings, get_settings, validate_deployment_config
 from .ledger import IdempotencyLedger
 from .logging_util import setup_logging
-from .models import NoteInput
+from .models import AddNotesInput, AddTagsInput, GetNoteInput, SearchNotesInput, UpdateNoteFieldsInput
 from .sync_manager import SyncManager
 from .tools import decks as deck_tools
 from .tools import notes as note_tools
@@ -26,6 +26,19 @@ logger: logging.Logger = setup_logging(settings.log_level)
 anki_client: AnkiClient = AnkiClient(settings)
 ledger: IdempotencyLedger = IdempotencyLedger(settings.idempotency_ledger_path)
 sync_manager: SyncManager = SyncManager(anki_client, ledger, settings)
+
+
+def _tool_error_response(exc: Exception) -> Dict[str, Any]:
+    """Convert expected AnkiConnect failures into structured tool output.
+
+    Letting these propagate triggers the MCP SDK's generic
+    "Error executing tool <name>" mask, hiding the root cause from clients.
+    """
+    return {
+        "success": False,
+        "error": str(exc),
+        "error_type": type(exc).__name__,
+    }
 
 
 def create_app(custom_settings: Optional[Settings] = None):
@@ -47,22 +60,36 @@ def create_app(custom_settings: Optional[Settings] = None):
     # 1. list_decks
     @mcp.tool(description="List all available decks and their IDs in the Anki collection.")
     async def list_decks() -> Dict[str, Any]:
-        return await deck_tools.list_decks(anki_client)
+        try:
+            return await deck_tools.list_decks(anki_client)
+        except (AnkiConnectError, AnkiConnectConnectionError) as e:
+            return _tool_error_response(e)
 
     # 2. search_notes
     @mcp.tool(description="Search notes in the collection by Anki query with bounded pagination.")
     async def search_notes(query: str, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
-        return await note_tools.search_notes(anki_client, query, limit, offset)
+        SearchNotesInput(query=query, limit=limit, offset=offset)
+        try:
+            return await note_tools.search_notes(anki_client, query, limit, offset)
+        except (AnkiConnectError, AnkiConnectConnectionError) as e:
+            return _tool_error_response(e)
 
     # 3. get_note
     @mcp.tool(description="Retrieve details and fields for a specific note by ID.")
     async def get_note(note_id: int) -> Dict[str, Any]:
-        return await note_tools.get_note(anki_client, note_id)
+        GetNoteInput(note_id=note_id)
+        try:
+            return await note_tools.get_note(anki_client, note_id)
+        except (AnkiConnectError, AnkiConnectConnectionError) as e:
+            return _tool_error_response(e)
 
     # 4. get_collection_stats
     @mcp.tool(description="Get reliably supported collection statistics and deck summaries.")
     async def get_collection_stats() -> Dict[str, Any]:
-        return await stats_tools.get_collection_stats(anki_client)
+        try:
+            return await stats_tools.get_collection_stats(anki_client)
+        except (AnkiConnectError, AnkiConnectConnectionError) as e:
+            return _tool_error_response(e)
 
     # 5. sync_collection
     @mcp.tool(description="Trigger explicit synchronization with official AnkiWeb.")
@@ -78,21 +105,25 @@ def create_app(custom_settings: Optional[Settings] = None):
         idempotency_key: Optional[str] = None,
         allow_duplicates: bool = False,
     ) -> Dict[str, Any]:
-        # Validate note inputs
-        parsed_notes = [NoteInput(**n) for n in notes]
-        res = await note_tools.add_notes(sync_manager, parsed_notes, idempotency_key, allow_duplicates)
+        # Validate the full batch (non-empty, <=100 notes, field shapes) before any sync happens
+        parsed_input = AddNotesInput(notes=notes, idempotency_key=idempotency_key, allow_duplicates=allow_duplicates)
+        res = await note_tools.add_notes(
+            sync_manager, parsed_input.notes, parsed_input.idempotency_key, parsed_input.allow_duplicates
+        )
         return res.model_dump()
 
     # 7. update_note_fields
     @mcp.tool(description="Update fields on an existing note with pre-sync and post-sync.")
     async def update_note_fields(note_id: int, fields: Dict[str, str]) -> Dict[str, Any]:
+        UpdateNoteFieldsInput(note_id=note_id, fields=fields)
         res = await note_tools.update_note_fields(sync_manager, note_id, fields)
         return res.model_dump()
 
     # 8. add_tags
     @mcp.tool(description="Add tags to notes with pre-sync and post-sync.")
     async def add_tags(note_ids: List[int], tags: List[str]) -> Dict[str, Any]:
-        res = await note_tools.add_tags(sync_manager, note_ids, tags)
+        parsed = AddTagsInput(note_ids=note_ids, tags=tags)
+        res = await note_tools.add_tags(sync_manager, parsed.note_ids, parsed.tags)
         return res.model_dump()
 
     # Create Starlette app for streamable HTTP with reverse-proxy support

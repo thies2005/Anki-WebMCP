@@ -38,7 +38,8 @@ async def search_notes(
     raw_notes = await client.invoke("notesInfo", {"notes": sliced_ids}) or []
     notes: List[Dict[str, Any]] = []
     for raw in raw_notes:
-        if not isinstance(raw, dict):
+        if not isinstance(raw, dict) or not raw:
+            # AnkiConnect returns {} for IDs that vanished between findNotes and notesInfo
             continue
         fields_dict = {
             f_name: f_info.get("value", "")
@@ -90,6 +91,8 @@ async def add_notes(
     allow_duplicates: bool = False,
 ) -> MutationResponse:
     """Create one or more notes under write-safety lock with duplicate prevention."""
+    if not notes:
+        raise AnkiConnectError("At least one note must be provided.")
     logger.info("Executing add_notes with %d notes (idempotency_key=%s)", len(notes), idempotency_key)
 
     formatted_notes = [
@@ -140,6 +143,22 @@ async def update_note_fields(
     logger.info("Executing update_note_fields for note %d", note_id)
 
     async def _apply_update() -> Dict[str, Any]:
+        # Verify the note exists and all requested fields belong to its model:
+        # AnkiConnect silently skips unknown fields, which would otherwise be
+        # reported as a successful no-op update.
+        existing = await sync_manager.client.invoke("notesInfo", {"notes": [note_id]})
+        existing_fields: Dict[str, Any] = {}
+        if isinstance(existing, list) and existing and isinstance(existing[0], dict):
+            existing_fields = existing[0].get("fields", {})
+        if not existing_fields:
+            raise AnkiConnectError(f"Note with ID {note_id} not found in collection.")
+        unknown_fields = sorted(name for name in fields if name not in existing_fields)
+        if unknown_fields:
+            raise AnkiConnectError(
+                f"Cannot update note {note_id}: unknown field(s) {unknown_fields}. "
+                f"Valid fields for this note: {sorted(existing_fields.keys())}."
+            )
+
         await sync_manager.client.invoke("updateNoteFields", {
             "note": {
                 "id": note_id,
@@ -167,6 +186,18 @@ async def add_tags(
     tags_string = " ".join([t.strip() for t in tags if t.strip()])
 
     async def _apply_tags() -> Dict[str, Any]:
+        # Verify note existence up front: AnkiConnect's addTags silently
+        # ignores unknown IDs and would otherwise report a successful no-op.
+        infos = await sync_manager.client.invoke("notesInfo", {"notes": note_ids})
+        found_ids = {
+            info.get("noteId")
+            for info in (infos or [])
+            if isinstance(info, dict) and info
+        }
+        missing_ids = [nid for nid in note_ids if nid not in found_ids]
+        if missing_ids:
+            raise AnkiConnectError(f"Cannot add tags: note(s) not found: {missing_ids}")
+
         await sync_manager.client.invoke("addTags", {
             "notes": note_ids,
             "tags": tags_string,
