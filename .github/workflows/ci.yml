@@ -36,7 +36,9 @@ jobs:
           cache-dependency-path: docker/mcp-service/requirements.txt
 
       - name: Install dependencies
-        run: pip install -r docker/mcp-service/requirements.txt pytest pytest-asyncio
+        # httpx is test-only (ASGITransport); the mcp SDK depends on httpx2, not httpx,
+        # so it is deliberately not in requirements.txt (the runtime image never imports it).
+        run: pip install -r docker/mcp-service/requirements.txt pytest pytest-asyncio httpx
 
       - name: Run test suite
         run: python -m pytest tests/ -q

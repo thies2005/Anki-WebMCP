@@ -27,12 +27,11 @@ def _parse_mcp_response(res: httpx.Response) -> dict:
     return res.json()
 
 
-def _make_settings(temp_ledger_file, tmp_path) -> Settings:
+def _make_settings(tmp_path) -> Settings:
     return Settings(
         session_secret=SECRET,
         data_dir=str(tmp_path),
         users_file=str(tmp_path / "users.json"),
-        idempotency_ledger_path=temp_ledger_file,
     )
 
 
@@ -68,9 +67,9 @@ async def _call_tool(client: httpx.AsyncClient, headers: dict, name: str, argume
 
 
 @pytest.fixture
-def app_with_users(temp_ledger_file, tmp_path):
+def app_with_users(tmp_path):
     """App plus alice/bob accounts; returns (app, settings, alice_token, bob_token)."""
-    settings = _make_settings(temp_ledger_file, tmp_path)
+    settings = _make_settings(tmp_path)
     store = UserStore(settings.users_file)
     _, alice_token = store.create_user("alice", "alice-pw")
     _, bob_token = store.create_user("bob", "bob-pw")

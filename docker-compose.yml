@@ -1,73 +1,43 @@
 # Core Production Docker Compose Configuration
-# Provides anki-worker (desktop GUI + AnkiConnect) and mcp-service (Streamable HTTP MCP endpoint)
+# Single headless multi-user service: anki-mcp serves the Streamable HTTP MCP
+# endpoint (/mcp), the token portal, and the admin UI on port 8000.
 
 services:
-  anki-worker:
-    build:
-      context: ./docker/anki-worker
-      dockerfile: Dockerfile
-    image: anki-worker:latest
-    container_name: anki-worker
-    restart: unless-stopped
-    shm_size: 1gb
-    security_opt:
-      - seccomp=unconfined
-    environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=${TZ:-UTC}
-      - CUSTOM_USER=${ANKI_GUI_USER:-admin}
-      - PASSWORD=${ANKI_GUI_PASSWORD:-}
-      - ANKI_CONNECT_API_KEY=${ANKI_CONNECT_API_KEY}
-      - ANKI_SYNC_SERVER=${ANKI_SYNC_SERVER:-}
-      - TITLE=Anki Desktop
-    volumes:
-      - anki_data:/config
-    networks:
-      - anki-net
-    ports:
-      # Expose KasmVNC web UI (HTTP on 3000, optional HTTPS on 3001)
-      # For public exposure, use Cloudflare Tunnel or Coolify HTTPS proxy with credentials.
-      - "${ANKI_GUI_PORT:-3000}:3000"
-    # IMPORTANT: Port 8765 (AnkiConnect) is intentionally NOT exposed in host ports!
-    # It is accessible exclusively by mcp-service on private bridge network 'anki-net'.
-
-  mcp-service:
+  anki-mcp:
     build:
       context: ./docker/mcp-service
       dockerfile: Dockerfile
-    image: mcp-service:latest
-    container_name: mcp-service
+    image: anki-mcp:latest
+    container_name: anki-mcp
     restart: unless-stopped
-    depends_on:
-      anki-worker:
-        condition: service_healthy
     environment:
-      - ANKI_CONNECT_URL=http://anki-worker:8765
-      - ANKI_CONNECT_API_KEY=${ANKI_CONNECT_API_KEY}
-      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}
-      - MCP_PORT=8000
-      - MCP_HOST=0.0.0.0
-      - MCP_PATH=/mcp
-      - IDEMPOTENCY_LEDGER_PATH=/data/idempotency_ledger.json
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Fail-closed: the service refuses to start without a real SESSION_SECRET.
+      - SESSION_SECRET=${SESSION_SECRET}
+      # First-boot bootstrap only: create the initial admin when the store is empty.
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
       - TZ=${TZ:-UTC}
       - MAINTENANCE_MODE=${MAINTENANCE_MODE:-false}
-      - REQUEST_TIMEOUT_SECONDS=${REQUEST_TIMEOUT_SECONDS:-30}
-      - SYNC_TIMEOUT_SECONDS=${SYNC_TIMEOUT_SECONDS:-60}
+      - IDLE_TIMEOUT_MINUTES=${IDLE_TIMEOUT_MINUTES:-15}
+      - MAX_OPEN_COLLECTIONS=${MAX_OPEN_COLLECTIONS:-5}
+      - MAX_CONCURRENT_SYNCS=${MAX_CONCURRENT_SYNCS:-2}
+      - BACKUP_RETENTION=${BACKUP_RETENTION:-5}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
       - mcp_data:/data
-    networks:
-      - anki-net
     ports:
-      - "${MCP_PORT:-8000}:8000"
-
-networks:
-  anki-net:
-    driver: bridge
+      # Port 8000 serves /mcp, the token portal, and /admin. For a purely local
+      # setup, bind to loopback instead: "127.0.0.1:8000:8000". For public
+      # exposure, keep TLS termination in front (see the exposure-mode override
+      # files: Cloudflare Tunnel or Coolify HTTPS reverse proxy).
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
 
 volumes:
-  anki_data:
-    name: anki_data
   mcp_data:
     name: mcp_data

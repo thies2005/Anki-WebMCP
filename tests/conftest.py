@@ -32,10 +32,9 @@ def ledger(temp_ledger_file):
 
 
 @pytest.fixture
-def mock_settings(temp_ledger_file, tmp_path):
+def mock_settings(tmp_path):
     """Provide configured settings for testing."""
     return Settings(
         session_secret="test-session-secret",
         data_dir=str(tmp_path),
-        idempotency_ledger_path=temp_ledger_file,
     )

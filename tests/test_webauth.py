@@ -185,12 +185,11 @@ def test_rate_limiter_bounds_entries_and_evicts_oldest():
 # ---------------------------------------------------------------------------
 
 
-def _make_settings(temp_ledger_file, tmp_path) -> Settings:
+def _make_settings(tmp_path) -> Settings:
     users_file = tmp_path / "users.json"
     store = UserStore(str(users_file))
     store.create_user("alice", "correct-horse")
     return Settings(
-        idempotency_ledger_path=temp_ledger_file,
         session_secret=SECRET,
         # Task 4's portal opens real per-user collections under data_dir on
         # GET /, so it must not fall back to the ambient default (/data).
@@ -200,8 +199,8 @@ def _make_settings(temp_ledger_file, tmp_path) -> Settings:
 
 
 @pytest.fixture
-def web_app(temp_ledger_file, tmp_path):
-    return create_app(_make_settings(temp_ledger_file, tmp_path))
+def web_app(tmp_path):
+    return create_app(_make_settings(tmp_path))
 
 
 @pytest.fixture

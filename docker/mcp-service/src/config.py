@@ -26,14 +26,6 @@ def _env_int_min(name: str, default: int, minimum: int) -> int:
     return value
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name, str(default))
-    try:
-        return float(raw)
-    except ValueError:
-        raise ValueError(f"{name} must be a number, got: {raw!r}")
-
-
 def _env_bool(name: str, default: bool) -> bool:
     return os.getenv(name, str(default)).lower() in ("true", "1", "yes")
 
@@ -47,10 +39,7 @@ class Settings:
     mcp_host: str = field(default_factory=lambda: _env_str("MCP_HOST", "0.0.0.0"))
     mcp_port: int = field(default_factory=lambda: _env_int("MCP_PORT", 8000))
     mcp_path: str = field(default_factory=lambda: _env_str("MCP_PATH", "/mcp"))
-    idempotency_ledger_path: str = field(default_factory=lambda: _env_str("IDEMPOTENCY_LEDGER_PATH", "/data/idempotency_ledger.json"))
     maintenance_mode: bool = field(default_factory=lambda: _env_bool("MAINTENANCE_MODE", False))
-    request_timeout_seconds: float = field(default_factory=lambda: _env_float("REQUEST_TIMEOUT_SECONDS", 30.0))
-    sync_timeout_seconds: float = field(default_factory=lambda: _env_float("SYNC_TIMEOUT_SECONDS", 60.0))
     log_level: str = field(default_factory=lambda: _env_str("LOG_LEVEL", "INFO").upper())
     # Multi-user settings (Task 1 auth model):
     session_secret: str = field(default_factory=lambda: _env_str("SESSION_SECRET", "").strip())

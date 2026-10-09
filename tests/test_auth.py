@@ -15,12 +15,11 @@ from src.users import UserStore
 SECRET = "test-session-secret"
 
 
-def _make_settings(temp_ledger_file, tmp_path) -> Settings:
+def _make_settings(tmp_path) -> Settings:
     return Settings(
         session_secret=SECRET,
         data_dir=str(tmp_path),
         users_file=str(tmp_path / "users.json"),
-        idempotency_ledger_path=temp_ledger_file,
     )
 
 
@@ -35,8 +34,8 @@ def store(tmp_path):
 
 
 @pytest.fixture
-def app(temp_ledger_file, tmp_path, store):
-    return create_app(_make_settings(temp_ledger_file, tmp_path))
+def app(tmp_path, store):
+    return create_app(_make_settings(tmp_path))
 
 
 @pytest.fixture
@@ -66,13 +65,12 @@ async def test_health_endpoint_exempt_from_auth(client):
 
 
 @pytest.mark.asyncio
-async def test_health_endpoint_degraded_when_data_dir_missing(temp_ledger_file, tmp_path, store):
+async def test_health_endpoint_degraded_when_data_dir_missing(tmp_path, store):
     """A missing/unwritable data dir cannot host collections -> 503 degraded."""
     settings = Settings(
         session_secret=SECRET,
         data_dir=str(tmp_path / "does-not-exist"),
         users_file=str(tmp_path / "users.json"),
-        idempotency_ledger_path=temp_ledger_file,
     )
     app = create_app(settings)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
@@ -132,11 +130,11 @@ async def test_mcp_invalid_token_rejected(client, store):
 
 
 @pytest.mark.asyncio
-async def test_mcp_token_of_deleted_user_rejected(temp_ledger_file, tmp_path, store):
+async def test_mcp_token_of_deleted_user_rejected(tmp_path, store):
     users_file = str(tmp_path / "users.json")
     store, alice_token, _ = store
     store.delete_user("alice")
-    app = create_app(_make_settings(temp_ledger_file, tmp_path))
+    app = create_app(_make_settings(tmp_path))
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
         res = await client.post("/mcp", headers={"Authorization": f"Bearer {alice_token}"}, json={})
         assert res.status_code == 401

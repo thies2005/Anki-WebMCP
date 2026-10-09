@@ -89,12 +89,12 @@ def test_tuning_settings_read_env_and_enforce_minimum(monkeypatch):
 # -- main() startup gating ---------------------------------------------------
 
 
-def test_main_refuses_unsafe_config(monkeypatch, temp_ledger_file):
+def test_main_refuses_unsafe_config(monkeypatch):
     from src import main as main_module
     monkeypatch.setattr(
         main_module,
         "settings",
-        Settings(session_secret="", idempotency_ledger_path=temp_ledger_file),
+        Settings(session_secret=""),
     )
     with pytest.raises(SystemExit) as exc_info:
         main_module.main()
@@ -113,7 +113,6 @@ def test_main_refuses_empty_user_store_without_bootstrap(monkeypatch, tmp_path):
             users_file=users_file,
             admin_username="",
             admin_password="",
-            idempotency_ledger_path=str(tmp_path / "ledger.json"),
         ),
     )
     with pytest.raises(SystemExit) as exc_info:

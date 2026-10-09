@@ -23,13 +23,12 @@ SECRET = "test-session-secret"
 ROOT_PASSWORD = "root-pw"
 
 
-def _make_settings(temp_ledger_file, tmp_path) -> Settings:
+def _make_settings(tmp_path) -> Settings:
     users_file = tmp_path / "users.json"
     store = UserStore(str(users_file))
     store.create_user("root", ROOT_PASSWORD, role="admin")
     store.create_user("alice", "alice-pw")
     return Settings(
-        idempotency_ledger_path=temp_ledger_file,
         session_secret=SECRET,
         data_dir=str(tmp_path),
         users_file=str(users_file),
@@ -37,8 +36,8 @@ def _make_settings(temp_ledger_file, tmp_path) -> Settings:
 
 
 @pytest.fixture
-def app(temp_ledger_file, tmp_path):
-    return create_app(_make_settings(temp_ledger_file, tmp_path))
+def app(tmp_path):
+    return create_app(_make_settings(tmp_path))
 
 
 @pytest.fixture

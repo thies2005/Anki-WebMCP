@@ -74,12 +74,11 @@ def test_mask_email_reveals_only_first_local_char():
 # ---------------------------------------------------------------------------
 
 
-def _make_settings(temp_ledger_file, tmp_path) -> Settings:
+def _make_settings(tmp_path) -> Settings:
     users_file = tmp_path / "users.json"
     store = UserStore(str(users_file))
     store.create_user("alice", ALICE_PASSWORD)
     return Settings(
-        idempotency_ledger_path=temp_ledger_file,
         session_secret=SECRET,
         data_dir=str(tmp_path),
         users_file=str(users_file),
@@ -87,8 +86,8 @@ def _make_settings(temp_ledger_file, tmp_path) -> Settings:
 
 
 @pytest.fixture
-def app(temp_ledger_file, tmp_path):
-    return create_app(_make_settings(temp_ledger_file, tmp_path))
+def app(tmp_path):
+    return create_app(_make_settings(tmp_path))
 
 
 @pytest.fixture
@@ -186,7 +185,7 @@ async def test_collect_deck_stats_on_fresh_collection(tmp_path):
 
 @pytest.mark.asyncio
 async def test_portal_hides_token_for_legacy_record_without_plaintext(
-    temp_ledger_file, tmp_path
+    tmp_path
 ):
     users_file = tmp_path / "users.json"
     store = UserStore(str(users_file))
@@ -199,7 +198,6 @@ async def test_portal_hides_token_for_legacy_record_without_plaintext(
         json.dump(data, f)
 
     settings = Settings(
-        idempotency_ledger_path=temp_ledger_file,
         session_secret=SECRET,
         data_dir=str(tmp_path),
         users_file=str(users_file),
@@ -353,12 +351,11 @@ STATE_CHANGING_PATHS = [
 
 
 @pytest.fixture
-def admin_app(temp_ledger_file, tmp_path):
+def admin_app(tmp_path):
     users_file = tmp_path / "users.json"
     store = UserStore(str(users_file))
     store.create_user("root", "root-pw", role="admin")
     settings = Settings(
-        idempotency_ledger_path=temp_ledger_file,
         session_secret=SECRET,
         data_dir=str(tmp_path),
         users_file=str(users_file),
