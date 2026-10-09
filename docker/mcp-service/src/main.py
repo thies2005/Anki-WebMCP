@@ -1,7 +1,7 @@
 """Main entrypoint for Anki MCP Service."""
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 import html
 import logging
 from typing import Any, Dict, List, Optional
@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from .anki_client import AnkiClient, AnkiConnectConnectionError, AnkiConnectError
 from .auth import AuthMiddleware
+from .collections import CollectionRegistry
 from .config import Settings, get_settings, validate_deployment_config
 from .ledger import IdempotencyLedger
 from .logging_util import setup_logging
@@ -36,12 +37,23 @@ from .webauth import (
     verify_session,
 )
 
+# Interval between idle-collection sweeps (brief: close idle collections every minute).
+COLLECTION_IDLE_SWEEP_SECONDS = 60.0
+
 # Globals initialized in factory
 settings: Settings = get_settings()
 logger: logging.Logger = setup_logging(settings.log_level)
 anki_client: AnkiClient = AnkiClient(settings)
 ledger: IdempotencyLedger = IdempotencyLedger(settings.idempotency_ledger_path)
 sync_manager: SyncManager = SyncManager(anki_client, ledger, settings)
+# Per-user collection registry (Task 3): opened lazily per user; construction does no I/O.
+collection_registry: CollectionRegistry = CollectionRegistry(
+    data_dir=settings.data_dir,
+    idle_timeout_minutes=settings.idle_timeout_minutes,
+    max_open_collections=settings.max_open_collections,
+    max_concurrent_syncs=settings.max_concurrent_syncs,
+    backup_retention=settings.backup_retention,
+)
 login_rate_limiter: LoginRateLimiter = LoginRateLimiter()
 
 
@@ -150,13 +162,20 @@ class ScopedAuthMiddleware(BaseHTTPMiddleware):
 
 def create_app(custom_settings: Optional[Settings] = None):
     """Create and configure the MCP Starlette ASGI application."""
-    global settings, logger, anki_client, ledger, sync_manager, login_rate_limiter
+    global settings, logger, anki_client, ledger, sync_manager, login_rate_limiter, collection_registry
     if custom_settings:
         settings = custom_settings
         logger = setup_logging(settings.log_level)
         anki_client = AnkiClient(settings)
         ledger = IdempotencyLedger(settings.idempotency_ledger_path)
         sync_manager = SyncManager(anki_client, ledger, settings)
+        collection_registry = CollectionRegistry(
+            data_dir=settings.data_dir,
+            idle_timeout_minutes=settings.idle_timeout_minutes,
+            max_open_collections=settings.max_open_collections,
+            max_concurrent_syncs=settings.max_concurrent_syncs,
+            backup_retention=settings.backup_retention,
+        )
     login_rate_limiter = LoginRateLimiter()  # fresh per app: lockout state must not leak across tests/restarts
 
     mcp = MCPServer(
@@ -357,21 +376,38 @@ def create_app(custom_settings: Optional[Settings] = None):
     # above (which carry their own session-cookie authentication).
     app.add_middleware(ScopedAuthMiddleware, settings=settings)
 
-    # Close the shared AnkiConnect HTTP client on app shutdown.
-    # (Starlette 1.x removed add_event_handler; wrap the lifespan instead so the
-    # client is closed after the SDK's session-manager shutdown completes.)
-    # Capture the client BEFORE defining the wrapper: close must run even if the
-    # inner shutdown raises, and a later create_app() must not be able to rebind
-    # which client this wrapper closes.
+    # Per-user collection lifecycle (Task 3): a background task closes
+    # collections idle beyond idle_timeout_minutes every minute, and shutdown
+    # closes every open collection. Same pattern as the AnkiConnect client
+    # below: capture the registry BEFORE defining the wrapper so a later
+    # create_app() cannot rebind which registry this lifespan owns.
+    # (Starlette 1.x removed add_event_handler; wrap the lifespan instead so
+    # cleanup runs after the SDK's session-manager shutdown completes.)
     client_to_close = anki_client
+    registry_to_close = collection_registry
     inner_lifespan = app.router.lifespan_context
+
+    async def _close_idle_collections_forever() -> None:
+        while True:
+            await asyncio.sleep(COLLECTION_IDLE_SWEEP_SECONDS)
+            try:
+                await registry_to_close.close_idle()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Idle collection sweep failed")
 
     @asynccontextmanager
     async def lifespan_with_client_close(a):
+        idle_sweep_task = asyncio.create_task(_close_idle_collections_forever())
         try:
             async with inner_lifespan(a):
                 yield
         finally:
+            idle_sweep_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await idle_sweep_task
+            await registry_to_close.close_all()
             await client_to_close.close()
 
     app.router.lifespan_context = lifespan_with_client_close
