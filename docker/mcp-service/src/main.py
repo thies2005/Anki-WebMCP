@@ -817,7 +817,11 @@ def create_app(custom_settings: Optional[Settings] = None):
         form = await request.form()
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
-        raw_token = await run_in_threadpool(store.regenerate_token, user.username)
+        try:
+            raw_token = await run_in_threadpool(store.regenerate_token, user.username)
+        except ValueError as e:
+            # Account deleted mid-request; mirror the admin handlers' 400.
+            return _bad_request(f"Could not regenerate token: {e}", back_href="/", back_label="Back to portal")
         logger.info("Portal token regeneration for %r", user.username)
         # One-time reveal via the flash cookie; only the sha256 ever authenticates.
         return _redirect_with_flash("/", raw_token, kind="token")
@@ -857,9 +861,13 @@ def create_app(custom_settings: Optional[Settings] = None):
             )
         # The result dict is rendered on a dedicated page: sync output is
         # unbounded and would not fit the flash cookie.
-        result = await portal_registry.sync_user(
-            user.username, user.ankiweb_email, user.ankiweb_password
-        )
+        try:
+            result = await portal_registry.sync_user(
+                user.username, user.ankiweb_email, user.ankiweb_password
+            )
+        except ValueError as e:
+            # Account deleted mid-request; mirror the admin handlers' 400.
+            return _bad_request(f"Could not sync: {e}", back_href="/", back_label="Back to portal")
         logger.info("Portal sync for %r: success=%s", user.username, result.get("success"))
         return HTMLResponse(_sync_result_page(result))
 

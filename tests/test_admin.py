@@ -7,7 +7,6 @@ with the session cookie placed directly in the client jar so responses can
 set/clear cookies (flash) naturally.
 """
 
-import os
 import re
 
 import httpx
@@ -88,6 +87,28 @@ async def test_admin_forbids_non_admin_with_403_page(client):
     res = await client.get("/admin")
     assert res.status_code == 403
     assert "Admin access required." in res.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/admin/create-user",
+        "/admin/reset-password",
+        "/admin/regenerate-token",
+        "/admin/set-role",
+        "/admin/delete-user",
+    ],
+)
+async def test_admin_mutations_forbid_non_admin_even_with_valid_csrf(client, path):
+    # Close the loop from the review: role gating must hold on the POST
+    # mutations themselves, not only on the GET page.
+    _login(client, "alice")
+    session = client.cookies.get(SESSION_COOKIE_NAME, "")
+    from src.webauth import issue_csrf
+
+    res = await client.post(path, data={"csrf_token": issue_csrf(session)})
+    assert res.status_code == 403
 
 
 @pytest.mark.asyncio
