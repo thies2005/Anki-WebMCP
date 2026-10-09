@@ -153,12 +153,43 @@ async def test_first_boot_bootstrap_visible_to_serving_app(monkeypatch, tmp_path
 
     # The serving app is created exactly as main() creates it: no custom settings.
     app = main_module.create_app()
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        res = await client.post(
-            "/login", data={"username": "root", "password": "first-boot-pw"}
-        )
-    assert res.status_code == 303, (
-        "first-boot admin must be able to log in through the serving app "
-        f"(got {res.status_code})"
-    )
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            res = await client.post(
+                "/login", data={"username": "root", "password": "first-boot-pw"}
+            )
+            assert res.status_code == 303, (
+                "first-boot admin must be able to log in through the serving app "
+                f"(got {res.status_code})"
+            )
+
+            # Same stale-instance class of bug, second organ: the module-level
+            # sync_manager captured at import time must see bootstrapped users too.
+            raw_token = main_module.user_store.peek_token("root")
+            assert raw_token, "bootstrapped admin must have a stored token_plaintext"
+            headers = {"Authorization": f"Bearer {raw_token}",
+                       "Accept": "application/json, text/event-stream"}
+            init = await client.post("/mcp", headers=headers, json={
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                           "clientInfo": {"name": "regression", "version": "0"}},
+            })
+            assert init.status_code == 200
+            sid = init.headers.get("mcp-session-id")
+            if sid:
+                headers["mcp-session-id"] = sid
+            await client.post("/mcp", headers=headers,
+                              json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+            call = await client.post("/mcp", headers=headers, json={
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "sync_collection", "arguments": {}},
+            })
+            body = call.text
+            assert "Unknown user" not in body, (
+                "first-boot sync manager must resolve bootstrapped users "
+                f"(got: {body[:300]})"
+            )
+            assert "credentials" in body.lower(), (
+                f"sync without creds must yield the credentials error, got: {body[:300]}"
+            )

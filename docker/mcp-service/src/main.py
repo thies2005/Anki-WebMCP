@@ -1103,14 +1103,17 @@ def create_app(custom_settings: Optional[Settings] = None):
 def _bootstrap_first_admin(app_settings: Settings) -> None:
     """Fail-closed first-boot admin bootstrap, operating on the module-global store.
 
-    MUST rebind the module global (not build a local UserStore): create_app()
-    captures ``user_store`` when called without custom_settings — the production
-    path — so a bootstrap through a local instance would leave the serving app
-    with the import-time (empty on first boot) store. Regression-tested by
-    test_first_boot_bootstrap_visible_to_serving_app.
+    MUST rebind the module globals (not build locals): create_app() captures
+    ``user_store`` and the tool wrappers use ``sync_manager`` when called without
+    custom_settings — the production path — so bootstrapping through a local
+    instance would leave the serving app authenticating against the import-time
+    (empty on first boot) store, and the sync manager resolving credentials
+    through that same stale store ("Unknown user" on first boot). Regression-
+    tested by test_first_boot_bootstrap_visible_to_serving_app.
     """
-    global user_store
+    global user_store, sync_manager
     user_store = UserStore(app_settings.users_file)
+    sync_manager = SyncManager(collection_registry, user_store, app_settings)
     if not user_store.list_users():
         if app_settings.admin_username and app_settings.admin_password:
             try:
