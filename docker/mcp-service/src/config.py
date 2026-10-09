@@ -19,6 +19,13 @@ def _env_int(name: str, default: int) -> int:
         raise ValueError(f"{name} must be an integer, got: {raw!r}")
 
 
+def _env_int_min(name: str, default: int, minimum: int) -> int:
+    value = _env_int(name, default)
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got: {value}")
+    return value
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name, str(default))
     try:
@@ -37,6 +44,10 @@ def _is_placeholder(value: str) -> bool:
 
 @dataclass(frozen=True)
 class Settings:
+    # DEPRECATED (legacy single-user bridge, removed in the Task 5 auth rewrite):
+    # anki_connect_url / anki_connect_api_key are still read by src/anki_client.py
+    # and mcp_auth_token by src/auth.py. They no longer participate in deployment
+    # validation and are tolerated silently until both modules are rewritten.
     anki_connect_url: str = field(default_factory=lambda: _env_str("ANKI_CONNECT_URL", "http://anki-worker:8765").rstrip("/"))
     anki_connect_api_key: str = field(default_factory=lambda: _env_str("ANKI_CONNECT_API_KEY", "").strip())
     mcp_auth_token: str = field(default_factory=lambda: _env_str("MCP_AUTH_TOKEN", "").strip())
@@ -48,33 +59,44 @@ class Settings:
     request_timeout_seconds: float = field(default_factory=lambda: _env_float("REQUEST_TIMEOUT_SECONDS", 30.0))
     sync_timeout_seconds: float = field(default_factory=lambda: _env_float("SYNC_TIMEOUT_SECONDS", 60.0))
     log_level: str = field(default_factory=lambda: _env_str("LOG_LEVEL", "INFO").upper())
+    # Multi-user settings (Task 1 auth model):
+    session_secret: str = field(default_factory=lambda: _env_str("SESSION_SECRET", "").strip())
+    data_dir: str = field(default_factory=lambda: _env_str("DATA_DIR", "/data") or "/data")
+    users_file: str = field(default_factory=lambda: _env_str("USERS_FILE", ""))
+    admin_username: str = field(default_factory=lambda: _env_str("ADMIN_USERNAME", "").strip())
+    admin_password: str = field(default_factory=lambda: _env_str("ADMIN_PASSWORD", ""))
+    idle_timeout_minutes: int = field(default_factory=lambda: _env_int_min("IDLE_TIMEOUT_MINUTES", 15, 1))
+    max_open_collections: int = field(default_factory=lambda: _env_int_min("MAX_OPEN_COLLECTIONS", 5, 1))
+    max_concurrent_syncs: int = field(default_factory=lambda: _env_int_min("MAX_CONCURRENT_SYNCS", 2, 1))
+    backup_retention: int = field(default_factory=lambda: _env_int_min("BACKUP_RETENTION", 5, 1))
 
     @property
     def is_auth_enabled(self) -> bool:
         return bool(self.mcp_auth_token)
 
+    def __post_init__(self):
+        # Derive users_file from data_dir instead of double-reading the
+        # environment; an explicit USERS_FILE always wins.
+        if not self.users_file:
+            object.__setattr__(self, "users_file", os.path.join(self.data_dir, "users.json"))
+
 
 def validate_deployment_config(settings: Settings) -> List[str]:
-    """Return fatal configuration problems. An empty list means safe to start."""
+    """Return fatal configuration problems. An empty list means safe to start.
+
+    Auth is per-user now: the legacy MCP_AUTH_TOKEN / ANKI_CONNECT_API_KEY rules
+    are gone and the deprecated fields are tolerated silently. SESSION_SECRET is
+    fail-closed — without it the service must not start.
+    """
     problems: List[str] = []
-    if not settings.mcp_auth_token:
+    if not settings.session_secret:
         problems.append(
-            "MCP_AUTH_TOKEN is not set. The MCP endpoint refuses to start unauthenticated. "
-            "Generate one with: openssl rand -hex 24"
+            "SESSION_SECRET is not set. The service refuses to start without a session "
+            "secret (per-user sessions cannot be signed). Generate one with: openssl rand -hex 24"
         )
-    elif _is_placeholder(settings.mcp_auth_token):
+    elif _is_placeholder(settings.session_secret):
         problems.append(
-            "MCP_AUTH_TOKEN is still the .env.example placeholder. "
-            "Generate a real secret with: openssl rand -hex 24"
-        )
-    if not settings.anki_connect_api_key:
-        problems.append(
-            "ANKI_CONNECT_API_KEY is not set. AnkiConnect requires a shared API key. "
-            "Generate one with: openssl rand -hex 24"
-        )
-    elif _is_placeholder(settings.anki_connect_api_key):
-        problems.append(
-            "ANKI_CONNECT_API_KEY is still the .env.example placeholder. "
+            "SESSION_SECRET is still the .env.example placeholder. "
             "Generate a real secret with: openssl rand -hex 24"
         )
     return problems
