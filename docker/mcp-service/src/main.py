@@ -392,7 +392,11 @@ def main():
     user_store = UserStore(settings.users_file)
     if not user_store.list_users():
         if settings.admin_username and settings.admin_password:
-            user_store.bootstrap_admin(settings.admin_username, settings.admin_password)
+            try:
+                user_store.bootstrap_admin(settings.admin_username, settings.admin_password)
+            except ValueError as e:
+                logger.error("FATAL: cannot bootstrap the initial admin account: %s", e)
+                raise SystemExit(1)
             logger.info("Bootstrapped initial admin account %r", settings.admin_username)
         else:
             logger.error(
@@ -404,7 +408,13 @@ def main():
             raise SystemExit(1)
 
     logger.info("Starting Anki MCP Service on %s:%d (path: %s)", settings.mcp_host, settings.mcp_port, settings.mcp_path)
-    logger.info("Authentication enabled (legacy shared-token middleware active until the auth rewrite)")
+    if settings.is_auth_enabled:
+        logger.info("Authentication enabled (legacy shared-token middleware active until the auth rewrite)")
+    else:
+        logger.warning(
+            "MCP_AUTH_TOKEN unset: the legacy middleware will reject all /mcp requests "
+            "until the per-user token auth lands (planned)."
+        )
 
     app = create_app()
     uvicorn.run(

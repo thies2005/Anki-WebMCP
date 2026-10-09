@@ -16,7 +16,7 @@ import secrets
 import tempfile
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("anki_mcp.users")
@@ -71,10 +71,14 @@ def verify_password_hash(password: str, encoded: str) -> bool:
         prefix, n_str, r_str, p_str, salt_hex, hash_hex = encoded.split("$")
         if prefix != HASH_PREFIX:
             return False
+        # Only the parameters we issue are accepted; a tampered store must not be
+        # able to demand an arbitrarily expensive scrypt run (memory DoS).
+        if int(n_str) != SCRYPT_N or int(r_str) != SCRYPT_R or int(p_str) != SCRYPT_P:
+            return False
         salt = bytes.fromhex(salt_hex)
         expected = bytes.fromhex(hash_hex)
         digest = hashlib.scrypt(
-            password.encode("utf-8"), salt=salt, n=int(n_str), r=int(r_str), p=int(p_str),
+            password.encode("utf-8"), salt=salt, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P,
             dklen=len(expected),
         )
         return hmac.compare_digest(digest, expected)
@@ -200,9 +204,9 @@ class UserStore:
     # -- queries -------------------------------------------------------------
 
     def list_users(self) -> List[User]:
-        """All account records. Raw tokens are never stored, so none are exposed."""
+        """All account records, as copies. Raw tokens are never stored, so none are exposed."""
         with self._lock:
-            return list(self._users.values())
+            return [replace(user) for user in self._users.values()]
 
     def verify_password(self, username: str, password: str) -> bool:
         with self._lock:
@@ -231,7 +235,7 @@ class UserStore:
                 except TypeError:
                     matched = False
                 if matched:
-                    match = user
+                    match = replace(user)
         return match
 
     # -- mutations -----------------------------------------------------------
