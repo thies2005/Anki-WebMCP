@@ -190,8 +190,6 @@ def _make_settings(temp_ledger_file, tmp_path) -> Settings:
     store = UserStore(str(users_file))
     store.create_user("alice", "correct-horse")
     return Settings(
-        anki_connect_url="http://127.0.0.1:8765",
-        mcp_auth_token="secure-token",
         idempotency_ledger_path=temp_ledger_file,
         session_secret=SECRET,
         # Task 4's portal opens real per-user collections under data_dir on

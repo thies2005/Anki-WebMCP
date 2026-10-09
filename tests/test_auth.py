@@ -1,163 +1,126 @@
-"""Unit tests for MCP server authentication middleware."""
+"""Tests for the per-user MCP token authentication middleware (Task 5).
+
+The middleware resolves a presented token via ``UserStore.authenticate_token``
+to exactly one account; a valid token passes, anything else (missing header,
+unknown token, malformed Authorization, non-ASCII bytes, query-parameter
+tokens) fails closed with 401. The web routes and /health stay exempt.
+"""
 
 import httpx
 import pytest
-import respx
 from src.config import Settings
 from src.main import create_app
+from src.users import UserStore
+
+SECRET = "test-session-secret"
+
+
+def _make_settings(temp_ledger_file, tmp_path) -> Settings:
+    return Settings(
+        session_secret=SECRET,
+        data_dir=str(tmp_path),
+        users_file=str(tmp_path / "users.json"),
+        idempotency_ledger_path=temp_ledger_file,
+    )
+
+
+@pytest.fixture
+def store(tmp_path):
+    """UserStore with two accounts; returns (store, alice_token, bob_token)."""
+    users_file = str(tmp_path / "users.json")
+    store = UserStore(users_file)
+    _, alice_token = store.create_user("alice", "alice-pw")
+    _, bob_token = store.create_user("bob", "bob-pw")
+    return store, alice_token, bob_token
+
+
+@pytest.fixture
+def app(temp_ledger_file, tmp_path, store):
+    return create_app(_make_settings(temp_ledger_file, tmp_path))
+
+
+@pytest.fixture
+def client(app):
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+        follow_redirects=False,
+    )
+
+
+# -- exempt paths ---------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_health_endpoint_exempt_from_auth(temp_ledger_file):
-    settings = Settings(
-        anki_connect_url="http://127.0.0.1:8765",
-        mcp_auth_token="secure-token",
-        idempotency_ledger_path=temp_ledger_file,
-    )
-    respx.post("http://127.0.0.1:8765/").mock(
-        return_value=httpx.Response(200, json={"result": 6, "error": None})
-    )
-    app = create_app(settings)
-
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client:
-        res = await client.get("/health")
-        assert res.status_code == 200
-        data = res.json()
-        assert data["service"] == "anki-mcp"
-        assert data["anki_connected"] is True
-        assert data["auth_enabled"] is True
+async def test_health_endpoint_exempt_from_auth(client):
+    res = await client.get("/health")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["service"] == "anki-mcp"
+    assert data["anki_connected"] is True
+    assert data["auth_enabled"] is True
+    assert data["status"] == "healthy"
+    assert "maintenance_mode" in data
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_health_degraded_returns_503(temp_ledger_file):
-    settings = Settings(
-        anki_connect_url="http://127.0.0.1:8765",
-        mcp_auth_token="secure-token",
-        idempotency_ledger_path=temp_ledger_file,
-    )
-    respx.post("http://127.0.0.1:8765/").mock(side_effect=httpx.ConnectError("refused"))
-    app = create_app(settings)
+async def test_web_routes_exempt_from_auth(client):
+    # The login page renders without any token; the portal root redirects to
+    # it (session-cookie auth owns the web surface, not the middleware).
+    login_res = await client.get("/login")
+    assert login_res.status_code == 200
+    root_res = await client.get("/")
+    assert root_res.status_code == 303
+    assert root_res.headers["location"] == "/login"
 
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client:
-        res = await client.get("/health")
-        assert res.status_code == 503
-        assert res.json()["status"] == "degraded"
-        assert res.json()["anki_connected"] is False
+
+# -- rejection paths ------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_mcp_unauthenticated_request_rejected(temp_ledger_file):
-    settings = Settings(
-        mcp_auth_token="secure-token",
-        idempotency_ledger_path=temp_ledger_file,
-    )
-    app = create_app(settings)
-
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client:
-        res = await client.post("/mcp", json={})
-        assert res.status_code == 401
-        assert "Missing authentication token" in res.json().get("error", "")
+async def test_mcp_unauthenticated_request_rejected(client):
+    res = await client.post("/mcp", json={})
+    assert res.status_code == 401
+    assert "Missing authentication token" in res.json().get("error", "")
 
 
 @pytest.mark.asyncio
-async def test_mcp_invalid_token_rejected(temp_ledger_file):
-    settings = Settings(
-        mcp_auth_token="secure-token",
-        idempotency_ledger_path=temp_ledger_file,
+async def test_mcp_invalid_token_rejected(client, store):
+    res = await client.post(
+        "/mcp",
+        headers={"Authorization": "Bearer wrong-token"},
+        json={},
     )
-    app = create_app(settings)
+    assert res.status_code == 401
+    assert "Invalid authentication token" in res.json().get("error", "")
 
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client:
-        res = await client.post(
-            "/mcp",
-            headers={"Authorization": "Bearer wrong-token"},
-            json={},
-        )
+
+@pytest.mark.asyncio
+async def test_mcp_token_of_deleted_user_rejected(temp_ledger_file, tmp_path, store):
+    users_file = str(tmp_path / "users.json")
+    store, alice_token, _ = store
+    store.delete_user("alice")
+    app = create_app(_make_settings(temp_ledger_file, tmp_path))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+        res = await client.post("/mcp", headers={"Authorization": f"Bearer {alice_token}"}, json={})
         assert res.status_code == 401
         assert "Invalid authentication token" in res.json().get("error", "")
 
 
 @pytest.mark.asyncio
-async def test_mcp_bearer_token_accepted(temp_ledger_file):
-    settings = Settings(
-        mcp_auth_token="secure-token",
-        idempotency_ledger_path=temp_ledger_file,
-    )
-    app = create_app(settings)
-
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client:
-            res = await client.post(
-                "/mcp",
-                headers={"Authorization": "Bearer secure-token"},
-                json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
-            )
-            # Middleware allowed the request through, so it's not 401
-            assert res.status_code != 401
+async def test_mcp_query_param_token_rejected(client, store):
+    _, alice_token, _ = store
+    async with client as c:
+        res = await c.post(f"/mcp?token={alice_token}", json={})
+        assert res.status_code == 401
 
 
 @pytest.mark.asyncio
-async def test_mcp_api_key_header_accepted(temp_ledger_file):
-    settings = Settings(
-        mcp_auth_token="secure-token",
-        idempotency_ledger_path=temp_ledger_file,
-    )
-    app = create_app(settings)
-
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client:
-            res = await client.post(
-                "/mcp",
-                headers={"X-API-Key": "secure-token"},
-                json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
-            )
-            assert res.status_code != 401
-
-
-@pytest.mark.asyncio
-async def test_mcp_query_param_token_rejected(temp_ledger_file):
-    settings = Settings(
-        mcp_auth_token="secure-token",
-        idempotency_ledger_path=temp_ledger_file,
-    )
-    app = create_app(settings)
-
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client:
-            res = await client.post(
-                "/mcp?token=secure-token",
-                json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
-            )
-            assert res.status_code == 401
-
-
-@pytest.mark.asyncio
-async def test_create_app_rejects_empty_token(temp_ledger_file):
-    settings = Settings(
-        mcp_auth_token="",
-        idempotency_ledger_path=temp_ledger_file,
-    )
-    app = create_app(settings)
-    # Starlette builds the middleware stack lazily; construction of
-    # AuthMiddleware (which must raise) happens on stack build.
-    with pytest.raises(ValueError, match="MCP_AUTH_TOKEN"):
-        app.build_middleware_stack()
-
-
-@pytest.mark.asyncio
-async def test_mcp_non_ascii_token_rejected_without_500(temp_ledger_file):
-    settings = Settings(
-        mcp_auth_token="secure-token",
-        idempotency_ledger_path=temp_ledger_file,
-    )
-    app = create_app(settings)
-
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client:
+async def test_mcp_non_ascii_token_rejected_without_500(client):
+    async with client as c:
         # Send the token as raw UTF-8 bytes, as it would arrive on the wire;
         # httpx rejects non-ASCII str header values before sending.
-        res = await client.post(
+        res = await c.post(
             "/mcp",
             headers={"Authorization": "Bearer tökén".encode("utf-8")},
             json={},
@@ -166,14 +129,77 @@ async def test_mcp_non_ascii_token_rejected_without_500(temp_ledger_file):
 
 
 @pytest.mark.asyncio
-async def test_mcp_malformed_authorization_header_rejected(temp_ledger_file):
-    settings = Settings(
-        mcp_auth_token="secure-token",
-        idempotency_ledger_path=temp_ledger_file,
-    )
-    app = create_app(settings)
-
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client:
+async def test_mcp_malformed_authorization_header_rejected(client):
+    async with client as c:
         for header in ("Bearer", "Token secure-token", "Basic dXNlcjpwYXNz"):
-            res = await client.post("/mcp", headers={"Authorization": header}, json={})
+            res = await c.post("/mcp", headers={"Authorization": header}, json={})
             assert res.status_code == 401
+
+
+# -- acceptance paths ------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mcp_bearer_token_accepted(app, store):
+    _, alice_token, _ = store
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+            res = await client.post(
+                "/mcp",
+                headers={"Authorization": f"Bearer {alice_token}"},
+                json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            )
+            # Middleware allowed the request through, so it's not 401
+            assert res.status_code != 401
+
+
+@pytest.mark.asyncio
+async def test_mcp_api_key_header_accepted(app, store):
+    _, _, bob_token = store
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+            res = await client.post(
+                "/mcp",
+                headers={"X-API-Key": bob_token},
+                json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            )
+            assert res.status_code != 401
+
+
+@pytest.mark.asyncio
+async def test_mcp_any_user_token_authenticates_per_user(app, store):
+    """Each account's own token authenticates; tokens are per-user, not global."""
+    _, alice_token, bob_token = store
+    assert alice_token != bob_token
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+            for token in (alice_token, bob_token):
+                res = await client.post(
+                    "/mcp",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                )
+                assert res.status_code != 401
+
+
+@pytest.mark.asyncio
+async def test_regenerated_token_replaces_old_one(app, store):
+    """After regeneration the old token is dead and the new one authenticates."""
+    _, alice_token, _ = store
+    # Regenerate via the app's own store instance (UserStore is single-instance
+    # per file; a sibling instance would leave the app's in-memory copy stale).
+    new_token = app.state.anki_store.regenerate_token("alice")
+    assert new_token != alice_token
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+            old_res = await client.post(
+                "/mcp", headers={"Authorization": f"Bearer {alice_token}"}, json={}
+            )
+            assert old_res.status_code == 401
+            assert "Invalid authentication token" in old_res.json().get("error", "")
+            new_res = await client.post(
+                "/mcp",
+                headers={"Authorization": f"Bearer {new_token}"},
+                json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            )
+            assert new_res.status_code != 401

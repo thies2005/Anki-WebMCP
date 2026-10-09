@@ -29,8 +29,6 @@ def _make_settings(temp_ledger_file, tmp_path) -> Settings:
     store.create_user("root", ROOT_PASSWORD, role="admin")
     store.create_user("alice", "alice-pw")
     return Settings(
-        anki_connect_url="http://127.0.0.1:8765",
-        mcp_auth_token="secure-token",
         idempotency_ledger_path=temp_ledger_file,
         session_secret=SECRET,
         data_dir=str(tmp_path),

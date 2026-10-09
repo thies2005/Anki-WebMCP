@@ -253,6 +253,15 @@ class UserStore:
             user = self._users.get(username)
             return replace(user) if user is not None else None
 
+    def get_user(self, username: str) -> Optional[User]:
+        """One account record as a copy, or None (additive alias of :meth:`get`).
+
+        The Task 5 sync manager names this accessor when it reads a user's
+        AnkiWeb credentials; it exists so call sites read symmetrically with
+        ``authenticate_token`` rather than reaching for the terser ``get``.
+        """
+        return self.get(username)
+
     def peek_token(self, username: str) -> Optional[str]:
         """Return the account's RAW MCP token, or None when unavailable.
 

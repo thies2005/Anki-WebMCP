@@ -2,63 +2,52 @@
 
 import logging
 from typing import Any, Dict, List
-from ..anki_client import AnkiClient
 
 logger = logging.getLogger("anki_mcp.tools.stats")
 
 
-async def get_collection_stats(client: AnkiClient) -> Dict[str, Any]:
-    """Retrieve reliably supported collection and deck statistics."""
-    logger.info("Executing get_collection_stats")
+def _stats_impl(col) -> Dict[str, Any]:
+    """Per-deck counts from ONE grouped cards-table query, plus reviewed-today.
 
-    # 1. Fetch deck names
-    deck_names = await client.invoke("deckNames") or []
+    Deck queue semantics (same conventions as the portal's deck stats):
+    0 = new, 1 = learning, 2/3 = review (incl. day-learn). Reviewed-today is
+    the revlog entry count since the scheduler's day cutoff (revlog ids are
+    epoch milliseconds).
+    """
+    rows = col.db.all(
+        "SELECT did, SUM(queue = 0), SUM(queue = 1), SUM(queue IN (2, 3)), COUNT() "
+        "FROM cards GROUP BY did"
+    )
+    counts_by_did = {row[0]: row for row in rows}
 
-    # 2. Fetch deck-level stats
-    raw_stats = await client.invoke("getDeckStats", {"decks": deck_names}) or {}
-
-    # 3. Fetch reviewed today count
-    try:
-        reviewed_today = await client.invoke("getNumCardsReviewedToday")
-        if not isinstance(reviewed_today, (int, float)):
-            reviewed_today = 0
-    except Exception as e:
-        logger.warning("Could not fetch reviewed cards today: %s", e)
-        reviewed_today = None
-
-    # Aggregate summaries
     decks: List[Dict[str, Any]] = []
     total_new = 0
     total_learn = 0
     total_review = 0
     total_cards = 0
+    for deck in sorted(col.decks.all_names_and_ids(), key=lambda d: d.name.lower()):
+        row = counts_by_did.get(deck.id, (0, 0, 0, 0, 0))
+        new_c = int(row[1] or 0)
+        learn_c = int(row[2] or 0)
+        rev_c = int(row[3] or 0)
+        tot_c = int(row[4] or 0)
+        total_new += new_c
+        total_learn += learn_c
+        total_review += rev_c
+        total_cards += tot_c
+        decks.append({
+            "deck_id": deck.id,
+            "name": deck.name,
+            "new_count": new_c,
+            "learn_count": learn_c,
+            "review_count": rev_c,
+            "total_in_deck": tot_c,
+        })
 
-    if isinstance(raw_stats, dict):
-        for _, d_stat in raw_stats.items():
-            if not isinstance(d_stat, dict):
-                continue
-            name = d_stat.get("name", "")
-            new_c = d_stat.get("new_count", 0)
-            learn_c = d_stat.get("learn_count", 0)
-            rev_c = d_stat.get("review_count", 0)
-            tot_c = d_stat.get("total_in_deck", 0)
-
-            total_new += new_c
-            total_learn += learn_c
-            total_review += rev_c
-            total_cards += tot_c
-
-            decks.append({
-                "deck_id": d_stat.get("deck_id"),
-                "name": name,
-                "new_count": new_c,
-                "learn_count": learn_c,
-                "review_count": rev_c,
-                "total_in_deck": tot_c,
-            })
-
+    cutoff_ms = int(col.sched.day_cutoff) * 1000
+    reviewed_today = col.db.scalar("SELECT COUNT() FROM revlog WHERE id >= ?", cutoff_ms)
     return {
-        "cards_reviewed_today": reviewed_today,
+        "cards_reviewed_today": int(reviewed_today or 0),
         "deck_count": len(decks),
         "summary": {
             "total_new": total_new,
@@ -68,3 +57,9 @@ async def get_collection_stats(client: AnkiClient) -> Dict[str, Any]:
         },
         "decks": decks,
     }
+
+
+async def get_collection_stats(registry, username: str) -> Dict[str, Any]:
+    """Retrieve reliably supported collection and deck statistics."""
+    logger.info("Executing get_collection_stats for %r", username)
+    return await registry.run(username, _stats_impl)

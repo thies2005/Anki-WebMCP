@@ -1,213 +1,258 @@
-"""Note searching, retrieval, creation, and updating tools."""
+"""Note searching, retrieval, creation, and updating tools.
+
+All operations run against the calling user's collection via the
+``CollectionRegistry`` (no AnkiConnect). Search/note reads replicate the
+summary shape the old ``notesInfo``-based code produced:
+``{"note_id", "model_name", "tags", "fields"}``.
+
+Wheel notes (see .superpowers/sdd/anki-api-facts.md): tags are space-separated
+STRINGS at the storage layer while ``note.tags`` is a List[str] property;
+``anki.notes`` must never be the FIRST anki import (import-order footgun) —
+``anki.errors`` is imported first here, and the app imports
+``src.collections`` (anki.collection) before the tools package anyway.
+"""
 
 import logging
-from typing import Any, Dict, List, Optional
-from ..anki_client import AnkiClient, AnkiConnectError
+from typing import Any, Dict, List
+
+from anki.errors import NotFoundError
+from anki.notes import Note
+
+from ..errors import CollectionToolError
 from ..models import MutationResponse, NoteInput
 from ..sync_manager import SyncManager
 
 logger = logging.getLogger("anki_mcp.tools.notes")
 
 
+def _note_summary(col, note) -> Dict[str, Any]:
+    """The notesInfo-equivalent summary shape (schema compatibility bar)."""
+    return {
+        "note_id": int(note.id),
+        "model_name": note.note_type()["name"],
+        "tags": list(note.tags),
+        "fields": dict(note.items()),
+    }
+
+
+def _get_note_or_none(col, note_id: int):
+    try:
+        return col.get_note(note_id)
+    except NotFoundError:
+        return None
+
+
+def _escape_search_term(value: str) -> str:
+    """Escape a value for use inside a double-quoted Anki search term."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 async def search_notes(
-    client: AnkiClient,
+    registry,
+    username: str,
     query: str,
     limit: int = 50,
     offset: int = 0,
 ) -> Dict[str, Any]:
     """Search notes in the collection with bounded pagination."""
-    # Clamp pagination bounds
+    # Clamp pagination bounds (direct calls bypass the pydantic input model).
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
 
-    logger.info("Executing search_notes: query='%s', limit=%d, offset=%d", query, limit, offset)
-    note_ids = await client.invoke("findNotes", {"query": query}) or []
-    total = len(note_ids)
+    logger.info("Executing search_notes for %r: query='%s', limit=%d, offset=%d", username, query, limit, offset)
 
-    # Slice IDs for bounded response
-    sliced_ids = note_ids[offset : offset + limit]
-    if not sliced_ids:
-        return {
-            "total_matches": total,
-            "returned_count": 0,
-            "offset": offset,
-            "limit": limit,
-            "notes": [],
-        }
+    def _search(col) -> Dict[str, Any]:
+        note_ids = list(col.find_notes(query))
+        total = len(note_ids)
+        notes: List[Dict[str, Any]] = []
+        # Slice offset/limit AFTER the full find (same semantics as before).
+        for nid in note_ids[offset : offset + limit]:
+            note = _get_note_or_none(col, nid)
+            if note is None:
+                # The note vanished between find_notes and the read (the
+                # phantom-entry case AnkiConnect handled with `{}` entries).
+                continue
+            notes.append(_note_summary(col, note))
+        return {"total": total, "notes": notes}
 
-    raw_notes = await client.invoke("notesInfo", {"notes": sliced_ids}) or []
-    notes: List[Dict[str, Any]] = []
-    for raw in raw_notes:
-        if not isinstance(raw, dict) or not raw:
-            # AnkiConnect returns {} for IDs that vanished between findNotes and notesInfo
-            continue
-        fields_dict = {
-            f_name: f_info.get("value", "")
-            for f_name, f_info in raw.get("fields", {}).items()
-            if isinstance(f_info, dict)
-        }
-        notes.append({
-            "note_id": raw.get("noteId"),
-            "model_name": raw.get("modelName"),
-            "tags": raw.get("tags", []),
-            "fields": fields_dict,
-        })
-
+    result = await registry.run(username, _search)
     return {
-        "total_matches": total,
-        "returned_count": len(notes),
+        "total_matches": result["total"],
+        "returned_count": len(result["notes"]),
         "offset": offset,
         "limit": limit,
-        "notes": notes,
+        "notes": result["notes"],
     }
 
 
-async def get_note(client: AnkiClient, note_id: int) -> Dict[str, Any]:
+async def get_note(registry, username: str, note_id: int) -> Dict[str, Any]:
     """Retrieve full details of a specific note by its note ID."""
-    logger.info("Executing get_note for id %d", note_id)
-    raw_notes = await client.invoke("notesInfo", {"notes": [note_id]})
-    if not raw_notes or not isinstance(raw_notes, list) or not raw_notes[0] or not isinstance(raw_notes[0], dict):
-        raise AnkiConnectError(f"Note with ID {note_id} not found in collection.")
+    logger.info("Executing get_note for %r, id %d", username, note_id)
 
-    note_data = raw_notes[0]
-    fields_dict = {
-        f_name: f_info.get("value", "")
-        for f_name, f_info in note_data.get("fields", {}).items()
-        if isinstance(f_info, dict)
-    }
+    def _get(col):
+        note = _get_note_or_none(col, note_id)
+        if note is None:
+            raise CollectionToolError(f"Note with ID {note_id} not found in collection.")
+        return _note_summary(col, note)
 
-    return {
-        "note_id": note_data.get("noteId"),
-        "model_name": note_data.get("modelName"),
-        "tags": note_data.get("tags", []),
-        "fields": fields_dict,
-    }
+    return await registry.run(username, _get)
+
+
+def _is_first_field_duplicate(col, model, deck_name: str, fields: Dict[str, str]) -> bool:
+    """True when an existing note in ``deck_name`` shares the first field value.
+
+    Mirrors the legacy AnkiConnect ``canAddNotes`` check with
+    ``duplicateScope: "deck"``: duplicates are judged on the note type's FIRST
+    field within the target deck. (Approximation of AnkiConnect's normalized
+    comparison: values are compared as exact strings, not HTML-stripped.)
+    """
+    try:
+        first_field_name = model["flds"][0]["name"]
+    except (KeyError, IndexError, TypeError):
+        return False
+    value = (fields.get(first_field_name) or "").strip()
+    if not value:
+        return False
+    query = (
+        f'deck:"{_escape_search_term(deck_name)}" '
+        f'{first_field_name}:"{_escape_search_term(value)}"'
+    )
+    return len(col.find_notes(query)) > 0
+
+
+def _add_notes_impl(col, notes: List[NoteInput], allow_duplicates: bool) -> Dict[str, Any]:
+    # Pass 1: resolve models and run duplicate detection for the WHOLE batch
+    # up front (same all-or-nothing reporting as the legacy canAddNotes gate).
+    resolved = []
+    failures: List[int] = []
+    for idx, n in enumerate(notes):
+        model = col.models.by_name(n.model_name)
+        if model is None:
+            available = sorted(m.name for m in col.models.all_names_and_ids())
+            raise CollectionToolError(
+                f"Unknown note type {n.model_name!r}. Available models: {available}"
+            )
+        if not allow_duplicates and _is_first_field_duplicate(col, model, n.deck_name, n.fields):
+            failures.append(idx)
+        resolved.append(model)
+    if failures:
+        raise CollectionToolError(
+            f"Duplicate check failed: note index(es) {failures} would create duplicate cards. "
+            "Set allow_duplicates=True if duplicates are intended."
+        )
+
+    # Pass 2: create. col.decks.id() resolves OR CREATES the deck, matching
+    # AnkiConnect's deckName behavior.
+    created: List[int] = []
+    for n, model in zip(notes, resolved):
+        deck_id = col.decks.id(n.deck_name)
+        note = Note(col, model)
+        for field_name, value in n.fields.items():
+            note[field_name] = value
+        note.tags = list(n.tags)
+        col.add_note(note, deck_id)
+        created.append(int(note.id))
+    return {"created_note_ids": created, "count": len(created)}
 
 
 async def add_notes(
     sync_manager: SyncManager,
+    registry,
+    username: str,
     notes: List[NoteInput],
-    idempotency_key: Optional[str] = None,
+    idempotency_key: str = None,
     allow_duplicates: bool = False,
 ) -> MutationResponse:
-    """Create one or more notes under write-safety lock with duplicate prevention."""
+    """Create one or more notes with duplicate prevention and per-user idempotency."""
     if not notes:
-        raise AnkiConnectError("At least one note must be provided.")
-    logger.info("Executing add_notes with %d notes (idempotency_key=%s)", len(notes), idempotency_key)
+        raise CollectionToolError("At least one note must be provided.")
+    logger.info(
+        "Executing add_notes for %r with %d notes (idempotency_key=%s)",
+        username, len(notes), idempotency_key,
+    )
 
-    formatted_notes = [
-        {
-            "deckName": n.deck_name,
-            "modelName": n.model_name,
-            "fields": n.fields,
-            "tags": n.tags,
-            "options": {
-                "allowDuplicate": allow_duplicates,
-                "duplicateScope": "deck",
-            },
-        }
-        for n in notes
-    ]
-
-    async def _apply_add_notes() -> Dict[str, Any]:
-        # Pre-check duplicates if not allowed
-        if not allow_duplicates:
-            can_add = await sync_manager.client.invoke("canAddNotes", {"notes": formatted_notes})
-            if isinstance(can_add, list):
-                failures = [i for i, ok in enumerate(can_add) if not ok]
-                if failures:
-                    raise AnkiConnectError(
-                        f"Duplicate check failed: note index(es) {failures} would create duplicate cards. "
-                        "Set allow_duplicates=True if duplicates are intended."
-                    )
-
-        created_ids = await sync_manager.client.invoke("addNotes", {"notes": formatted_notes})
-        return {
-            "created_note_ids": created_ids,
-            "count": len(created_ids) if isinstance(created_ids, list) else 0,
-        }
+    async def _mutation() -> Dict[str, Any]:
+        return await registry.run(username, _add_notes_impl, notes, allow_duplicates)
 
     return await sync_manager.execute_mutation(
+        username,
         operation_name="add_notes",
-        mutation_fn=_apply_add_notes,
+        mutation_fn=_mutation,
         idempotency_key=idempotency_key,
     )
 
 
 async def update_note_fields(
     sync_manager: SyncManager,
+    registry,
+    username: str,
     note_id: int,
     fields: Dict[str, str],
 ) -> MutationResponse:
-    """Update fields of an existing note under write-safety lock."""
-    logger.info("Executing update_note_fields for note %d", note_id)
+    """Update fields of an existing note with pre-verification."""
+    logger.info("Executing update_note_fields for %r, note %d", username, note_id)
 
-    async def _apply_update() -> Dict[str, Any]:
-        # Verify the note exists and all requested fields belong to its model:
-        # AnkiConnect silently skips unknown fields, which would otherwise be
-        # reported as a successful no-op update.
-        existing = await sync_manager.client.invoke("notesInfo", {"notes": [note_id]})
-        existing_fields: Dict[str, Any] = {}
-        if isinstance(existing, list) and existing and isinstance(existing[0], dict):
-            existing_fields = existing[0].get("fields", {})
-        if not existing_fields:
-            raise AnkiConnectError(f"Note with ID {note_id} not found in collection.")
-        unknown_fields = sorted(name for name in fields if name not in existing_fields)
+    def _update(col) -> Dict[str, Any]:
+        note = _get_note_or_none(col, note_id)
+        if note is None:
+            raise CollectionToolError(f"Note with ID {note_id} not found in collection.")
+        # Verify all requested fields belong to the note's model: the wheel
+        # would otherwise raise a cryptic backend error (or silently skip on
+        # the old AnkiConnect path) for a mistyped field name.
+        valid_field_names = sorted(name for name, _ in note.items())
+        unknown_fields = sorted(name for name in fields if name not in valid_field_names)
         if unknown_fields:
-            raise AnkiConnectError(
+            raise CollectionToolError(
                 f"Cannot update note {note_id}: unknown field(s) {unknown_fields}. "
-                f"Valid fields for this note: {sorted(existing_fields.keys())}."
+                f"Valid fields for this note: {valid_field_names}."
             )
-
-        await sync_manager.client.invoke("updateNoteFields", {
-            "note": {
-                "id": note_id,
-                "fields": fields,
-            }
-        })
+        for field_name, value in fields.items():
+            note[field_name] = value
+        col.update_note(note)
         return {
             "note_id": note_id,
             "updated_fields": list(fields.keys()),
         }
 
+    async def _mutation() -> Dict[str, Any]:
+        return await registry.run(username, _update)
+
     return await sync_manager.execute_mutation(
+        username,
         operation_name="update_note_fields",
-        mutation_fn=_apply_update,
+        mutation_fn=_mutation,
     )
 
 
 async def add_tags(
     sync_manager: SyncManager,
+    registry,
+    username: str,
     note_ids: List[int],
     tags: List[str],
 ) -> MutationResponse:
-    """Add tags to one or more notes under write-safety lock."""
-    logger.info("Executing add_tags for %d notes: %s", len(note_ids), tags)
+    """Add tags to one or more notes with existence pre-verification."""
+    logger.info("Executing add_tags for %r over %d notes: %s", username, len(note_ids), tags)
     tags_string = " ".join([t.strip() for t in tags if t.strip()])
 
-    async def _apply_tags() -> Dict[str, Any]:
-        # Verify note existence up front: AnkiConnect's addTags silently
-        # ignores unknown IDs and would otherwise report a successful no-op.
-        infos = await sync_manager.client.invoke("notesInfo", {"notes": note_ids})
-        found_ids = {
-            info.get("noteId")
-            for info in (infos or [])
-            if isinstance(info, dict) and info
-        }
-        missing_ids = [nid for nid in note_ids if nid not in found_ids]
+    def _tag(col) -> Dict[str, Any]:
+        # Verify note existence up front: bulk_add silently ignores unknown
+        # IDs, which would otherwise report a successful no-op.
+        missing_ids = [nid for nid in note_ids if _get_note_or_none(col, nid) is None]
         if missing_ids:
-            raise AnkiConnectError(f"Cannot add tags: note(s) not found: {missing_ids}")
-
-        await sync_manager.client.invoke("addTags", {
-            "notes": note_ids,
-            "tags": tags_string,
-        })
+            raise CollectionToolError(f"Cannot add tags: note(s) not found: {missing_ids}")
+        # Tags are a single space-separated STRING in this API generation.
+        col.tags.bulk_add(note_ids, tags_string)
         return {
             "note_ids": note_ids,
             "tags_added": tags,
         }
 
+    async def _mutation() -> Dict[str, Any]:
+        return await registry.run(username, _tag)
+
     return await sync_manager.execute_mutation(
+        username,
         operation_name="add_tags",
-        mutation_fn=_apply_tags,
+        mutation_fn=_mutation,
     )

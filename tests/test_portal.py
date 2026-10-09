@@ -79,8 +79,6 @@ def _make_settings(temp_ledger_file, tmp_path) -> Settings:
     store = UserStore(str(users_file))
     store.create_user("alice", ALICE_PASSWORD)
     return Settings(
-        anki_connect_url="http://127.0.0.1:8765",
-        mcp_auth_token="secure-token",
         idempotency_ledger_path=temp_ledger_file,
         session_secret=SECRET,
         data_dir=str(tmp_path),
@@ -201,8 +199,6 @@ async def test_portal_hides_token_for_legacy_record_without_plaintext(
         json.dump(data, f)
 
     settings = Settings(
-        anki_connect_url="http://127.0.0.1:8765",
-        mcp_auth_token="secure-token",
         idempotency_ledger_path=temp_ledger_file,
         session_secret=SECRET,
         data_dir=str(tmp_path),
@@ -362,8 +358,6 @@ def admin_app(temp_ledger_file, tmp_path):
     store = UserStore(str(users_file))
     store.create_user("root", "root-pw", role="admin")
     settings = Settings(
-        anki_connect_url="http://127.0.0.1:8765",
-        mcp_auth_token="secure-token",
         idempotency_ledger_path=temp_ledger_file,
         session_secret=SECRET,
         data_dir=str(tmp_path),

@@ -37,18 +37,18 @@ def test_validate_deployment_config_placeholder_session_secret():
     assert "placeholder" in problems[0]
 
 
-def test_legacy_auth_settings_no_longer_produce_problems():
-    """Deprecated MCP_AUTH_TOKEN / ANKI_CONNECT_API_KEY are tolerated silently."""
-    settings = Settings(mcp_auth_token="", anki_connect_api_key="", session_secret="real-secret")
-    assert validate_deployment_config(settings) == []
+def test_removed_legacy_auth_fields_are_rejected():
+    """The legacy single-user bridge fields are gone from Settings entirely."""
+    with pytest.raises(TypeError):
+        Settings(mcp_auth_token="legacy-token")
+    with pytest.raises(TypeError):
+        Settings(anki_connect_url="http://127.0.0.1:8765")
+    with pytest.raises(TypeError):
+        Settings(anki_connect_api_key="legacy-key")
 
 
 def test_validate_deployment_config_valid():
-    settings = Settings(
-        session_secret="real-secret",
-        mcp_auth_token="legacy-token",
-        anki_connect_api_key="legacy-key",
-    )
+    settings = Settings(session_secret="real-secret")
     assert validate_deployment_config(settings) == []
 
 

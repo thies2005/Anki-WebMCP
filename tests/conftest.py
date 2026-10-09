@@ -32,14 +32,10 @@ def ledger(temp_ledger_file):
 
 
 @pytest.fixture
-def mock_settings(temp_ledger_file):
+def mock_settings(temp_ledger_file, tmp_path):
     """Provide configured settings for testing."""
     return Settings(
-        anki_connect_url="http://127.0.0.1:8765",
-        anki_connect_api_key="test-anki-key",
-        mcp_auth_token="secret-token-123",
-        mcp_port=8000,
-        mcp_path="/mcp",
+        session_secret="test-session-secret",
+        data_dir=str(tmp_path),
         idempotency_ledger_path=temp_ledger_file,
-        maintenance_mode=False,
     )

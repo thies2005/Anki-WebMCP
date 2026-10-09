@@ -1,220 +1,187 @@
-"""Unit tests for individual MCP tool implementations."""
+"""Unit tests for the registry-backed MCP tool implementations (Task 5).
 
-import httpx
+These run the real tool functions against REAL per-user anki collections in a
+tmp data dir (no AnkiConnect, no HTTP mocks). The asserted response shapes are
+byte-for-byte the ones the AnkiConnect-era suite asserted — that schema is the
+compatibility contract.
+"""
+
+import os
+
 import pytest
-import respx
-from src.anki_client import AnkiClient, AnkiConnectError
+import pytest_asyncio
+
+# src.collections imports anki.collection first — the wheel's anki.notes
+# cannot be the FIRST anki module imported (circular import through anki.cards).
+from src.collections import CollectionRegistry  # isort: skip
+from anki.notes import Note
+
+from src.errors import CollectionToolError
 from src.models import NoteInput
 from src.sync_manager import SyncManager
 from src.tools import decks as deck_tools
 from src.tools import notes as note_tools
 from src.tools import stats as stats_tools
-from src.tools import sync as sync_tools
 
 
-@pytest.fixture
-def test_setup(mock_settings, ledger):
-    client = AnkiClient(mock_settings)
-    sync_mgr = SyncManager(client, ledger, mock_settings)
-    return client, sync_mgr
+def add_basic_note(col, front, back="back", deck="Default"):
+    note = Note(col, col.models.by_name("Basic"))
+    note["Front"] = front
+    note["Back"] = back
+    col.add_note(note, col.decks.id(deck))
+    return note.id
+
+
+@pytest_asyncio.fixture
+async def env(tmp_path):
+    """Registry + sync manager over a shared tmp data_dir, two users."""
+    reg = CollectionRegistry(data_dir=str(tmp_path))
+    manager = SyncManager(reg, None)
+    yield reg, manager
+    await reg.close_all()
+
+
+# -- list_decks -----------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_list_decks(test_setup):
-    client, _ = test_setup
-    respx.post("http://127.0.0.1:8765/").mock(
-        return_value=httpx.Response(200, json={"result": {"Default": 1, "Japanese": 2}, "error": None})
-    )
+async def test_list_decks(env):
+    reg, _ = env
+    await reg.run("alice", add_basic_note, "q", "a", deck="Japanese")
 
-    data = await deck_tools.list_decks(client)
+    data = await deck_tools.list_decks(reg, "alice")
     assert data["count"] == 2
-    assert {"name": "Default", "id": 1} in data["decks"]
-    assert {"name": "Japanese", "id": 2} in data["decks"]
+    names = {d["name"]: d["id"] for d in data["decks"]}
+    assert set(names) == {"Default", "Japanese"}
+    assert all(isinstance(did, int) and did > 0 for did in names.values())
+    assert {"name": "Default", "id": names["Default"]} in data["decks"]
+
+
+# -- search_notes ---------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_search_notes_bounded_pagination(test_setup):
-    client, _ = test_setup
-
-    def side_effect(request):
-        import json
-        body = json.loads(request.content)
-        if body["action"] == "findNotes":
-            # Return 150 simulated IDs
-            return httpx.Response(200, json={"result": list(range(1001, 1151)), "error": None})
-        elif body["action"] == "notesInfo":
-            notes = body["params"]["notes"]
-            return httpx.Response(
-                200,
-                json={
-                    "result": [
-                        {
-                            "noteId": nid,
-                            "modelName": "Basic",
-                            "tags": ["vocab"],
-                            "fields": {
-                                "Front": {"value": f"Question {nid}", "order": 0},
-                                "Back": {"value": f"Answer {nid}", "order": 1},
-                            },
-                        }
-                        for nid in notes
-                    ],
-                    "error": None,
-                },
-            )
-        return httpx.Response(400)
-
-    respx.post("http://127.0.0.1:8765/").mock(side_effect=side_effect)
+async def test_search_notes_bounded_pagination(env):
+    reg, _ = env
+    for i in range(3):
+        await reg.run("alice", add_basic_note, f"question-{i}", f"answer-{i}")
 
     # Request limit=200 should be clamped to 100
-    res = await note_tools.search_notes(client, query="deck:Default", limit=200, offset=10)
-    assert res["total_matches"] == 150
+    res = await note_tools.search_notes(reg, "alice", query="deck:Default", limit=200, offset=1)
+    assert res["total_matches"] == 3
     assert res["limit"] == 100  # Clamped to 100
-    assert res["offset"] == 10
-    assert res["returned_count"] == 100
-    assert res["notes"][0]["note_id"] == 1011
-    assert res["notes"][0]["fields"]["Front"] == "Question 1011"
+    assert res["offset"] == 1
+    assert res["returned_count"] == 2
+    first = res["notes"][0]
+    assert set(first) == {"note_id", "model_name", "tags", "fields"}
+    assert first["model_name"] == "Basic"
+    assert first["tags"] == []
+    assert set(first["fields"]) == {"Front", "Back"}
+    assert first["fields"]["Front"].startswith("question-")
+    assert isinstance(first["note_id"], int)
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_get_note(test_setup):
-    client, _ = test_setup
-    respx.post("http://127.0.0.1:8765/").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "result": [
-                    {
-                        "noteId": 42,
-                        "modelName": "Basic",
-                        "tags": ["tag1", "tag2"],
-                        "fields": {
-                            "Front": {"value": "Hello", "order": 0},
-                            "Back": {"value": "World", "order": 1},
-                        },
-                    }
-                ],
-                "error": None,
-            },
-        )
-    )
+async def test_search_notes_query_syntax_and_tags(env):
+    reg, _ = env
+    nid = await reg.run("alice", add_basic_note, "vocab word", "答え")
 
-    note = await note_tools.get_note(client, 42)
-    assert note["note_id"] == 42
+    def _tag(col):
+        col.tags.bulk_add([nid], "vocab japanese")
+
+    await reg.run("alice", _tag)
+
+    res = await note_tools.search_notes(reg, "alice", query="tag:vocab")
+    assert res["total_matches"] == 1
+    assert res["notes"][0]["note_id"] == nid
+    # The wheel normalizes/sorts stored tags on write
+    assert sorted(res["notes"][0]["tags"]) == ["japanese", "vocab"]
+    assert res["notes"][0]["fields"]["Front"] == "vocab word"
+
+    # Anki query syntax narrows: a non-matching query finds nothing
+    empty = await note_tools.search_notes(reg, "alice", query="tag:nonexistent")
+    assert empty == {
+        "total_matches": 0,
+        "returned_count": 0,
+        "offset": 0,
+        "limit": 50,
+        "notes": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_notes_offset_past_end_returns_empty_shape(env):
+    reg, _ = env
+    await reg.run("alice", add_basic_note, "only", "note")
+    res = await note_tools.search_notes(reg, "alice", query="deck:Default", offset=5)
+    assert res["total_matches"] == 1
+    assert res["returned_count"] == 0
+    assert res["offset"] == 5
+    assert res["notes"] == []
+
+
+# -- get_note -------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_note(env):
+    reg, _ = env
+
+    def _make(col):
+        note = Note(col, col.models.by_name("Basic"))
+        note["Front"] = "Hello"
+        note["Back"] = "World"
+        note.tags = ["tag1", "tag2"]
+        col.add_note(note, col.decks.id("Default"))
+        return note.id
+
+    nid = await reg.run("alice", _make)
+
+    note = await note_tools.get_note(reg, "alice", nid)
+    assert note["note_id"] == nid
     assert note["model_name"] == "Basic"
     assert note["tags"] == ["tag1", "tag2"]
     assert note["fields"] == {"Front": "Hello", "Back": "World"}
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_get_note_not_found(test_setup):
-    client, _ = test_setup
-    respx.post("http://127.0.0.1:8765/").mock(
-        return_value=httpx.Response(200, json={"result": [], "error": None})
-    )
+async def test_get_note_not_found(env):
+    reg, _ = env
+    with pytest.raises(CollectionToolError, match="not found"):
+        await note_tools.get_note(reg, "alice", 99999)
 
-    with pytest.raises(AnkiConnectError, match="not found"):
-        await note_tools.get_note(client, 99999)
+
+# -- get_collection_stats -------------------------------------------------------
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_get_collection_stats(test_setup):
-    client, _ = test_setup
+async def test_get_collection_stats(env):
+    reg, _ = env
+    await reg.run("alice", add_basic_note, "q1", "a1")
+    await reg.run("alice", add_basic_note, "q2", "a2", deck="Deep")
 
-    def side_effect(request):
-        import json
-        body = json.loads(request.content)
-        action = body["action"]
-        if action == "deckNames":
-            return httpx.Response(200, json={"result": ["Default"], "error": None})
-        elif action == "getDeckStats":
-            return httpx.Response(
-                200,
-                json={
-                    "result": {
-                        "1": {
-                            "deck_id": 1,
-                            "name": "Default",
-                            "new_count": 5,
-                            "learn_count": 3,
-                            "review_count": 12,
-                            "total_in_deck": 50,
-                        }
-                    },
-                    "error": None,
-                },
-            )
-        elif action == "getNumCardsReviewedToday":
-            return httpx.Response(200, json={"result": 25, "error": None})
-        return httpx.Response(400)
+    stats = await stats_tools.get_collection_stats(reg, "alice")
+    assert stats["cards_reviewed_today"] == 0  # fresh collection, nothing reviewed
+    assert stats["deck_count"] == 2
+    assert set(stats["summary"]) == {"total_new", "total_learn", "total_review", "total_cards"}
+    assert stats["summary"]["total_new"] == 2  # fresh cards are queue 0
+    assert stats["summary"]["total_learn"] == 0
+    assert stats["summary"]["total_review"] == 0
+    assert stats["summary"]["total_cards"] == 2
+    deck_names = {d["name"] for d in stats["decks"]}
+    assert deck_names == {"Default", "Deep"}
+    for deck in stats["decks"]:
+        assert set(deck) == {"deck_id", "name", "new_count", "learn_count", "review_count", "total_in_deck"}
+        assert deck["total_in_deck"] == 1
+        assert deck["new_count"] == 1
 
-    respx.post("http://127.0.0.1:8765/").mock(side_effect=side_effect)
 
-    stats = await stats_tools.get_collection_stats(client)
-    assert stats["cards_reviewed_today"] == 25
-    assert stats["deck_count"] == 1
-    assert stats["summary"]["total_new"] == 5
-    assert stats["summary"]["total_learn"] == 3
-    assert stats["summary"]["total_review"] == 12
-    assert stats["summary"]["total_cards"] == 50
-    assert stats["decks"][0]["name"] == "Default"
+# -- add_notes ------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_add_notes_duplicate_prevention(test_setup):
-    _, sync_mgr = test_setup
-
-    def side_effect(request):
-        import json
-        body = json.loads(request.content)
-        action = body["action"]
-        if action == "sync":
-            return httpx.Response(200, json={"result": None, "error": None})
-        elif action == "canAddNotes":
-            # Simulate first note is duplicate (False), second note is valid (True)
-            return httpx.Response(200, json={"result": [False], "error": None})
-        return httpx.Response(400)
-
-    respx.post("http://127.0.0.1:8765/").mock(side_effect=side_effect)
-
-    notes = [
-        NoteInput(
-            deck_name="Default",
-            model_name="Basic",
-            fields={"Front": "Duplicate Question", "Back": "Answer"},
-        )
-    ]
-
-    res = await note_tools.add_notes(sync_mgr, notes, allow_duplicates=False)
-    assert res.success is False
-    assert res.local_status == "failed"
-    assert "Duplicate check failed" in res.error
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_add_notes_success(test_setup):
-    _, sync_mgr = test_setup
-
-    def side_effect(request):
-        import json
-        body = json.loads(request.content)
-        action = body["action"]
-        if action == "sync":
-            return httpx.Response(200, json={"result": None, "error": None})
-        elif action == "canAddNotes":
-            return httpx.Response(200, json={"result": [True], "error": None})
-        elif action == "addNotes":
-            return httpx.Response(200, json={"result": [1700000000001], "error": None})
-        return httpx.Response(400)
-
-    respx.post("http://127.0.0.1:8765/").mock(side_effect=side_effect)
+async def test_add_notes_success(env):
+    reg, manager = env
 
     notes = [
         NoteInput(
@@ -225,109 +192,113 @@ async def test_add_notes_success(test_setup):
         )
     ]
 
-    res = await note_tools.add_notes(sync_mgr, notes, allow_duplicates=False)
+    res = await note_tools.add_notes(manager, reg, "alice", notes, allow_duplicates=False)
     assert res.success is True
     assert res.local_status == "committed"
-    assert res.data["created_note_ids"] == [1700000000001]
+    assert len(res.data["created_note_ids"]) == 1
+    assert res.data["count"] == 1
+    nid = res.data["created_note_ids"][0]
+
+    # The note really landed, with its tag
+    def _check(col):
+        note = col.get_note(nid)
+        return dict(note.items()), list(note.tags)
+
+    fields, tags = await reg.run("alice", _check)
+    assert fields == {"Front": "Unique Q", "Back": "Ans"}
+    assert tags == ["sample"]
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_update_note_fields(test_setup):
-    _, sync_mgr = test_setup
+async def test_add_notes_creates_missing_deck(env):
+    reg, manager = env
+    notes = [NoteInput(deck_name="Japanese", model_name="Basic", fields={"Front": "q", "Back": "a"})]
+    res = await note_tools.add_notes(manager, reg, "alice", notes)
+    assert res.success is True
+    decks = await deck_tools.list_decks(reg, "alice")
+    assert "Japanese" in [d["name"] for d in decks["decks"]]
 
-    def side_effect(request):
-        import json
-        body = json.loads(request.content)
-        action = body["action"]
-        if action == "sync":
-            return httpx.Response(200, json={"result": None, "error": None})
-        elif action == "notesInfo":
-            return httpx.Response(200, json={"result": [{
-                "noteId": 12345,
-                "modelName": "Basic",
-                "tags": [],
-                "fields": {"Front": {"value": "Old", "order": 0}, "Back": {"value": "Old", "order": 1}},
-            }], "error": None})
-        elif action == "updateNoteFields":
-            return httpx.Response(200, json={"result": None, "error": None})
-        return httpx.Response(400)
 
-    respx.post("http://127.0.0.1:8765/").mock(side_effect=side_effect)
+@pytest.mark.asyncio
+async def test_add_notes_duplicate_prevention(env):
+    reg, manager = env
+    await reg.run("alice", add_basic_note, "Duplicate Question", "Answer")
 
-    res = await note_tools.update_note_fields(sync_mgr, 12345, {"Front": "New Question"})
+    notes = [
+        NoteInput(
+            deck_name="Default",
+            model_name="Basic",
+            fields={"Front": "Duplicate Question", "Back": "Answer 2"},
+        )
+    ]
+
+    res = await note_tools.add_notes(manager, reg, "alice", notes, allow_duplicates=False)
+    assert res.success is False
+    assert res.local_status == "failed"
+    assert "Duplicate check failed" in res.error
+
+    # allow_duplicates=True goes through
+    res2 = await note_tools.add_notes(manager, reg, "alice", notes, allow_duplicates=True)
+    assert res2.success is True
+
+
+@pytest.mark.asyncio
+async def test_add_notes_duplicates_scoped_to_deck(env):
+    reg, manager = env
+    await reg.run("alice", add_basic_note, "Same Front", "a", deck="Default")
+    # Same first field, different deck: not a duplicate under deck scope
+    notes = [NoteInput(deck_name="Other", model_name="Basic", fields={"Front": "Same Front", "Back": "b"})]
+    res = await note_tools.add_notes(manager, reg, "alice", notes, allow_duplicates=False)
+    assert res.success is True
+
+
+@pytest.mark.asyncio
+async def test_add_notes_unknown_model_lists_available(env):
+    reg, manager = env
+    notes = [NoteInput(deck_name="Default", model_name="No Such Model", fields={"Front": "q"})]
+    # In-mutation validation comes back as a failed MutationResponse (same
+    # semantics as the legacy duplicate/field checks inside execute_mutation).
+    res = await note_tools.add_notes(manager, reg, "alice", notes)
+    assert res.success is False
+    assert res.local_status == "failed"
+    assert "No Such Model" in res.error
+    assert "Basic" in res.error  # available models listed
+
+
+@pytest.mark.asyncio
+async def test_add_notes_empty_batch_rejected(env, tmp_path):
+    reg, manager = env
+    with pytest.raises(CollectionToolError, match="At least one note"):
+        await note_tools.add_notes(manager, reg, "alice", [])
+    # Nothing may have been opened/created for the user by a rejected batch
+    assert not os.path.exists(os.path.join(str(tmp_path), "users", "alice"))
+
+
+# -- update_note_fields ----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_note_fields(env):
+    reg, manager = env
+    nid = await reg.run("alice", add_basic_note, "Old", "Old")
+
+    res = await note_tools.update_note_fields(manager, reg, "alice", nid, {"Front": "New Question"})
     assert res.success is True
     assert res.local_status == "committed"
-    assert res.data["note_id"] == 12345
+    assert res.data["note_id"] == nid
     assert res.data["updated_fields"] == ["Front"]
 
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_add_tags(test_setup):
-    _, sync_mgr = test_setup
-
-    def side_effect(request):
-        import json
-        body = json.loads(request.content)
-        action = body["action"]
-        if action == "sync":
-            return httpx.Response(200, json={"result": None, "error": None})
-        elif action == "notesInfo":
-            return httpx.Response(200, json={"result": [
-                {"noteId": 10, "modelName": "Basic", "tags": [], "fields": {}},
-                {"noteId": 20, "modelName": "Basic", "tags": [], "fields": {}},
-            ], "error": None})
-        elif action == "addTags":
-            assert body["params"]["notes"] == [10, 20]
-            assert body["params"]["tags"] == "tag1 tag2"
-            return httpx.Response(200, json={"result": None, "error": None})
-        return httpx.Response(400)
-
-    respx.post("http://127.0.0.1:8765/").mock(side_effect=side_effect)
-
-    res = await note_tools.add_tags(sync_mgr, [10, 20], ["tag1", "tag2"])
-    assert res.success is True
-    assert res.local_status == "committed"
-    assert res.data["tags_added"] == ["tag1", "tag2"]
+    updated = await note_tools.get_note(reg, "alice", nid)
+    assert updated["fields"]["Front"] == "New Question"
+    assert updated["fields"]["Back"] == "Old"  # untouched
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_sync_collection(test_setup):
-    _, sync_mgr = test_setup
-    respx.post("http://127.0.0.1:8765/").mock(
-        return_value=httpx.Response(200, json={"result": None, "error": None})
-    )
+async def test_update_note_fields_unknown_field_rejected(env):
+    reg, manager = env
+    nid = await reg.run("alice", add_basic_note, "Old", "Old")
 
-    data = await sync_tools.sync_collection(sync_mgr)
-    assert data["success"] is True
-    assert data["sync_status"]["post_sync"] == "ok"
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_update_note_fields_unknown_field_rejected(test_setup):
-    _, sync_mgr = test_setup
-
-    def side_effect(request):
-        import json
-        body = json.loads(request.content)
-        action = body["action"]
-        if action == "sync":
-            return httpx.Response(200, json={"result": None, "error": None})
-        elif action == "notesInfo":
-            return httpx.Response(200, json={"result": [{
-                "noteId": 12345,
-                "modelName": "Basic",
-                "tags": [],
-                "fields": {"Front": {"value": "Old", "order": 0}, "Back": {"value": "Old", "order": 1}},
-            }], "error": None})
-        return httpx.Response(400)
-
-    respx.post("http://127.0.0.1:8765/").mock(side_effect=side_effect)
-
-    res = await note_tools.update_note_fields(sync_mgr, 12345, {"Frant": "typo"})
+    res = await note_tools.update_note_fields(manager, reg, "alice", nid, {"Frant": "typo"})
     assert res.success is False
     assert res.local_status == "failed"
     assert "unknown field" in res.error
@@ -335,104 +306,59 @@ async def test_update_note_fields_unknown_field_rejected(test_setup):
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_update_note_fields_missing_note_rejected(test_setup):
-    _, sync_mgr = test_setup
-
-    def side_effect(request):
-        import json
-        body = json.loads(request.content)
-        if body["action"] == "sync":
-            return httpx.Response(200, json={"result": None, "error": None})
-        if body["action"] == "notesInfo":
-            return httpx.Response(200, json={"result": [{}], "error": None})
-        return httpx.Response(400)
-
-    respx.post("http://127.0.0.1:8765/").mock(side_effect=side_effect)
-
-    res = await note_tools.update_note_fields(sync_mgr, 99999, {"Front": "x"})
+async def test_update_note_fields_missing_note_rejected(env):
+    reg, manager = env
+    res = await note_tools.update_note_fields(manager, reg, "alice", 99999, {"Front": "x"})
     assert res.success is False
     assert "not found" in res.error
 
 
+# -- add_tags ---------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
-@respx.mock
-async def test_add_tags_missing_note_ids_rejected(test_setup):
-    _, sync_mgr = test_setup
+async def test_add_tags(env):
+    reg, manager = env
+    nid1 = await reg.run("alice", add_basic_note, "q1", "a1")
+    nid2 = await reg.run("alice", add_basic_note, "q2", "a2")
 
-    def side_effect(request):
-        import json
-        body = json.loads(request.content)
-        if body["action"] == "sync":
-            return httpx.Response(200, json={"result": None, "error": None})
-        if body["action"] == "notesInfo":
-            # note 10 vanished, note 20 exists (AnkiConnect returns {} for missing)
-            return httpx.Response(200, json={"result": [
-                {},
-                {"noteId": 20, "modelName": "Basic", "tags": [], "fields": {}},
-            ], "error": None})
-        return httpx.Response(400)
+    res = await note_tools.add_tags(manager, reg, "alice", [nid1, nid2], ["tag1", "tag2"])
+    assert res.success is True
+    assert res.local_status == "committed"
+    assert res.data["tags_added"] == ["tag1", "tag2"]
 
-    respx.post("http://127.0.0.1:8765/").mock(side_effect=side_effect)
+    def _tags(col, ids):
+        return [list(col.get_note(i).tags) for i in ids]
 
-    res = await note_tools.add_tags(sync_mgr, [10, 20], ["tag1"])
+    tags = await reg.run("alice", _tags, [nid1, nid2])
+    assert tags == [["tag1", "tag2"], ["tag1", "tag2"]]
+
+
+@pytest.mark.asyncio
+async def test_add_tags_missing_note_ids_rejected(env):
+    reg, manager = env
+    nid = await reg.run("alice", add_basic_note, "q", "a")
+
+    res = await note_tools.add_tags(manager, reg, "alice", [99999, nid], ["tag1"])
     assert res.success is False
     assert "not found" in res.error
-    assert "10" in res.error
+    assert "99999" in res.error
+
+
+# -- cross-user isolation -----------------------------------------------------------
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_add_notes_empty_batch_rejected(test_setup):
-    _, sync_mgr = test_setup
-    sync_route = respx.post("http://127.0.0.1:8765/").mock(
-        return_value=httpx.Response(200, json={"result": None, "error": None})
-    )
+async def test_users_cannot_see_each_others_notes(env):
+    reg, _ = env
+    await reg.run("alice", add_basic_note, "alice secret", "x")
 
-    with pytest.raises(AnkiConnectError, match="At least one note"):
-        await note_tools.add_notes(sync_mgr, [])
+    alice_view = await note_tools.search_notes(reg, "alice", query="secret")
+    bob_view = await note_tools.search_notes(reg, "bob", query="secret")
+    assert alice_view["total_matches"] == 1
+    assert bob_view["total_matches"] == 0
 
-    # No sync may have been triggered for an empty batch
-    assert sync_route.call_count == 0
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_search_notes_skips_phantom_entries(test_setup):
-    client, _ = test_setup
-
-    def side_effect(request):
-        import json
-        body = json.loads(request.content)
-        if body["action"] == "findNotes":
-            return httpx.Response(200, json={"result": [1001, 1002], "error": None})
-        if body["action"] == "notesInfo":
-            return httpx.Response(200, json={"result": [
-                {"noteId": 1001, "modelName": "Basic", "tags": [], "fields": {"Front": {"value": "Q", "order": 0}}},
-                {},  # vanished between findNotes and notesInfo
-            ], "error": None})
-        return httpx.Response(400)
-
-    respx.post("http://127.0.0.1:8765/").mock(side_effect=side_effect)
-
-    res = await note_tools.search_notes(client, query="deck:Default")
-    assert res["returned_count"] == 1
-    assert res["notes"][0]["note_id"] == 1001
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_http_client_closed_on_shutdown(mock_settings, ledger):
-    from src import main as main_module
-    from src.main import create_app
-
-    respx.post("http://127.0.0.1:8765/").mock(
-        return_value=httpx.Response(200, json={"result": None, "error": None})
-    )
-    app = create_app(mock_settings)
-
-    async with app.router.lifespan_context(app):
-        await main_module.anki_client.invoke("version")
-        assert main_module.anki_client._client is not None
-
-    assert main_module.anki_client._client is None or main_module.anki_client._client.is_closed
+    # bob cannot read alice's note by id either
+    alice_note_id = alice_view["notes"][0]["note_id"]
+    with pytest.raises(CollectionToolError, match="not found"):
+        await note_tools.get_note(reg, "bob", alice_note_id)

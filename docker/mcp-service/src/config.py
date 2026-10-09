@@ -44,13 +44,6 @@ def _is_placeholder(value: str) -> bool:
 
 @dataclass(frozen=True)
 class Settings:
-    # DEPRECATED (legacy single-user bridge, removed in the Task 5 auth rewrite):
-    # anki_connect_url / anki_connect_api_key are still read by src/anki_client.py
-    # and mcp_auth_token by src/auth.py. They no longer participate in deployment
-    # validation and are tolerated silently until both modules are rewritten.
-    anki_connect_url: str = field(default_factory=lambda: _env_str("ANKI_CONNECT_URL", "http://anki-worker:8765").rstrip("/"))
-    anki_connect_api_key: str = field(default_factory=lambda: _env_str("ANKI_CONNECT_API_KEY", "").strip())
-    mcp_auth_token: str = field(default_factory=lambda: _env_str("MCP_AUTH_TOKEN", "").strip())
     mcp_host: str = field(default_factory=lambda: _env_str("MCP_HOST", "0.0.0.0"))
     mcp_port: int = field(default_factory=lambda: _env_int("MCP_PORT", 8000))
     mcp_path: str = field(default_factory=lambda: _env_str("MCP_PATH", "/mcp"))
@@ -70,10 +63,6 @@ class Settings:
     max_concurrent_syncs: int = field(default_factory=lambda: _env_int_min("MAX_CONCURRENT_SYNCS", 2, 1))
     backup_retention: int = field(default_factory=lambda: _env_int_min("BACKUP_RETENTION", 5, 1))
 
-    @property
-    def is_auth_enabled(self) -> bool:
-        return bool(self.mcp_auth_token)
-
     def __post_init__(self):
         # Derive users_file from data_dir instead of double-reading the
         # environment; an explicit USERS_FILE always wins.
@@ -84,9 +73,9 @@ class Settings:
 def validate_deployment_config(settings: Settings) -> List[str]:
     """Return fatal configuration problems. An empty list means safe to start.
 
-    Auth is per-user now: the legacy MCP_AUTH_TOKEN / ANKI_CONNECT_API_KEY rules
-    are gone and the deprecated fields are tolerated silently. SESSION_SECRET is
-    fail-closed — without it the service must not start.
+    Auth is per-user (MCP tokens live in the user store) and needs no legacy
+    configuration. SESSION_SECRET is fail-closed — without it the service must
+    not start.
     """
     problems: List[str] = []
     if not settings.session_secret:

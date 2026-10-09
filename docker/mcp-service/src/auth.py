@@ -1,36 +1,72 @@
-"""Authentication middleware for HTTP / Streamable HTTP MCP endpoints."""
+"""Per-user token authentication middleware for the MCP endpoints.
 
-import hmac
+Every MCP account carries its own randomly-generated token (managed by
+:class:`src.users.UserStore`); the middleware resolves a presented token to
+exactly one account via ``UserStore.authenticate_token`` and stashes the
+authenticated username on ``request.state.username``. The MCP tool wrappers
+read it back through the SDK's tool ``Context``
+(``ctx.request_context.request.state``) — Starlette backs ``request.state``
+with the shared ASGI ``scope["state"]`` dict, so the value survives into the
+SDK's session task even though tool handlers execute outside the HTTP
+request's task. See the Task 5 report for the verification trail.
+"""
+
 import logging
 from typing import Optional
+
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from .config import Settings, get_settings
+from .users import UserStore
 
 logger = logging.getLogger("anki_mcp.auth")
 
+# Web routes authenticate with session cookies and run their own CSRF checks
+# (Task 2/4), so the bearer-token middleware must not guard them. Kept as an
+# explicit allowlist so a newly added route is protected by default.
+WEB_AUTH_PATHS = frozenset(
+    {
+        "/",
+        "/login",
+        "/logout",
+        "/portal/regenerate-token",
+        "/portal/credentials",
+        "/portal/sync",
+        "/admin",
+        "/admin/create-user",
+        "/admin/reset-password",
+        "/admin/regenerate-token",
+        "/admin/set-role",
+        "/admin/delete-user",
+    }
+)
+
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    """Protects MCP endpoints with Bearer token / API key authentication.
+    """Protects the MCP endpoint with per-user token authentication.
 
-    Authentication is mandatory: constructing this middleware without a
-    configured token raises, so the endpoint can never serve unauthenticated.
+    Authentication is mandatory and has no configuration switch: constructing
+    without a :class:`UserStore` raises, so the endpoint can never serve
+    unauthenticated (the legacy single-token middleware's fail-closed
+    construction contract, carried over).
     """
 
-    def __init__(self, app, settings: Optional[Settings] = None):
+    def __init__(self, app, store: UserStore, settings: Optional[Settings] = None):
         super().__init__(app)
-        self.settings = settings or get_settings()
-        if not self.settings.mcp_auth_token:
+        if store is None:
             raise ValueError(
-                "AuthMiddleware requires a non-empty MCP_AUTH_TOKEN. "
-                "Refusing to serve an unauthenticated MCP endpoint."
+                "AuthMiddleware requires a UserStore. Refusing to serve an "
+                "MCP endpoint that could never authenticate anybody."
             )
+        self.store = store
+        self.settings = settings or get_settings()
 
     async def dispatch(self, request: Request, call_next) -> Response:
-        # Permit health checks and CORS preflights without authentication
-        if request.url.path == "/health" or request.method == "OPTIONS":
+        # Permit health checks, CORS preflights, and the cookie-authenticated
+        # web routes without bearer-token authentication.
+        if request.url.path == "/health" or request.method == "OPTIONS" or request.url.path in WEB_AUTH_PATHS:
             return await call_next(request)
 
         provided_token = self._extract_token(request)
@@ -42,7 +78,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
-        if not self._tokens_match(provided_token, self.settings.mcp_auth_token):
+        # sha256 + in-memory scan (no I/O, no scrypt): safe to run inline.
+        user = self.store.authenticate_token(provided_token)
+        if user is None:
             logger.warning("Rejected request to %s: invalid token provided", request.url.path)
             return JSONResponse(
                 status_code=401,
@@ -50,15 +88,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
+        # Travel with the ASGI scope (scope["state"]) into the MCP SDK's
+        # session task; tool wrappers read it via the tool Context.
+        request.state.username = user.username
+        request.state.user = user
         return await call_next(request)
-
-    @staticmethod
-    def _tokens_match(provided: str, expected: str) -> bool:
-        """Constant-time comparison on UTF-8 bytes; never raises on odd input."""
-        try:
-            return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
-        except UnicodeEncodeError:
-            return False
 
     @staticmethod
     def _extract_token(request: Request) -> Optional[str]:

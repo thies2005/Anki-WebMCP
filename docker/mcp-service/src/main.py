@@ -8,18 +8,15 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.context import Context
 from starlette.concurrency import run_in_threadpool
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 import uvicorn
-from pydantic import ValidationError
 
-from .anki_client import AnkiClient, AnkiConnectConnectionError, AnkiConnectError
 from .auth import AuthMiddleware
 from .collections import CollectionRegistry
 from .config import Settings, get_settings, validate_deployment_config
-from .ledger import IdempotencyLedger
 from .logging_util import setup_logging
 from .models import AddNotesInput, AddTagsInput, GetNoteInput, SearchNotesInput, UpdateNoteFieldsInput
 from .sync_manager import SyncManager
@@ -51,9 +48,8 @@ COLLECTION_IDLE_SWEEP_SECONDS = 60.0
 # Globals initialized in factory
 settings: Settings = get_settings()
 logger: logging.Logger = setup_logging(settings.log_level)
-anki_client: AnkiClient = AnkiClient(settings)
-ledger: IdempotencyLedger = IdempotencyLedger(settings.idempotency_ledger_path)
-sync_manager: SyncManager = SyncManager(anki_client, ledger, settings)
+# Per-user account store: MCP tokens and AnkiWeb credentials.
+user_store: UserStore = UserStore(settings.users_file)
 # Per-user collection registry (Task 3): opened lazily per user; construction does no I/O.
 collection_registry: CollectionRegistry = CollectionRegistry(
     data_dir=settings.data_dir,
@@ -62,11 +58,13 @@ collection_registry: CollectionRegistry = CollectionRegistry(
     max_concurrent_syncs=settings.max_concurrent_syncs,
     backup_retention=settings.backup_retention,
 )
+# Write-safety + explicit sync coordination on top of the registry.
+sync_manager: SyncManager = SyncManager(collection_registry, user_store, settings)
 login_rate_limiter: LoginRateLimiter = LoginRateLimiter()
 
 
 def _tool_error_response(exc: Exception) -> Dict[str, Any]:
-    """Convert expected AnkiConnect failures into structured tool output.
+    """Convert expected collection-layer failures into structured tool output.
 
     Letting these propagate triggers the MCP SDK's generic
     "Error executing tool <name>" mask, hiding the root cause from clients.
@@ -75,6 +73,39 @@ def _tool_error_response(exc: Exception) -> Dict[str, Any]:
         "success": False,
         "error": str(exc),
         "error_type": type(exc).__name__,
+    }
+
+
+def _username_from_context(ctx: Context) -> Optional[str]:
+    """The authenticated username for THIS MCP request, or None.
+
+    The Starlette middleware stashes it on ``request.state.username`` after
+    resolving the caller's per-user token. Starlette backs ``request.state``
+    with the shared ASGI ``scope["state"]`` dict, and the MCP SDK frames every
+    inbound message with that very Request (``ServerMessageMetadata.request_context``),
+    so tool wrappers read it via the injected tool ``Context`` — even though
+    the SDK executes tool handlers in its own session task rather than the
+    HTTP request's task (verified end-to-end against mcp 2.3.0).
+    """
+    try:
+        request = ctx.request_context.request
+    except ValueError:
+        return None  # Context not bound to a request (cannot happen for tools/call)
+    if request is None:
+        return None
+    return getattr(request.state, "username", None)
+
+
+def _unauthorized_tool_response() -> Dict[str, Any]:
+    """Structured 401-flavored output for a request with no username context.
+
+    Unreachable while the middleware guards /mcp; kept fail-closed so a user
+    context gap can never silently act on the wrong (or a default) collection.
+    """
+    return {
+        "success": False,
+        "error": "Unauthorized: no authenticated user on this request",
+        "error_type": "UnauthorizedError",
     }
 
 
@@ -497,56 +528,13 @@ def _archive_user_data(data_dir: str, username: str) -> Optional[str]:
     return dest
 
 
-class ScopedAuthMiddleware(BaseHTTPMiddleware):
-    """Legacy shared-token auth, scoped to the MCP API surface.
-
-    The web routes (/, /login, /logout, the portal POST actions under /portal/,
-    and the admin console under /admin) authenticate with session cookies and
-    run their own CSRF checks, so the legacy bearer-token middleware must not
-    guard them; everything else keeps the exact legacy behavior (including the
-    /health and OPTIONS exemptions inside AuthMiddleware itself) until the
-    Task 5 auth rewrite replaces this split.
-
-    AuthMiddleware is constructed eagerly so its fail-closed contract (refusing
-    to build the stack without a configured token) is preserved unchanged.
-    """
-
-    WEB_AUTH_PATHS = frozenset(
-        {
-            "/",
-            "/login",
-            "/logout",
-            "/portal/regenerate-token",
-            "/portal/credentials",
-            "/portal/sync",
-            "/admin",
-            "/admin/create-user",
-            "/admin/reset-password",
-            "/admin/regenerate-token",
-            "/admin/set-role",
-            "/admin/delete-user",
-        }
-    )
-
-    def __init__(self, app, settings: Settings):
-        super().__init__(app)
-        self._legacy = AuthMiddleware(app, settings=settings)
-
-    async def dispatch(self, request: Request, call_next) -> Response:
-        if request.url.path in self.WEB_AUTH_PATHS:
-            return await call_next(request)
-        return await self._legacy.dispatch(request, call_next)
-
-
 def create_app(custom_settings: Optional[Settings] = None):
     """Create and configure the MCP Starlette ASGI application."""
-    global settings, logger, anki_client, ledger, sync_manager, login_rate_limiter, collection_registry
+    global settings, logger, user_store, sync_manager, login_rate_limiter, collection_registry
     if custom_settings:
         settings = custom_settings
         logger = setup_logging(settings.log_level)
-        anki_client = AnkiClient(settings)
-        ledger = IdempotencyLedger(settings.idempotency_ledger_path)
-        sync_manager = SyncManager(anki_client, ledger, settings)
+        user_store = UserStore(settings.users_file)
         collection_registry = CollectionRegistry(
             data_dir=settings.data_dir,
             idle_timeout_minutes=settings.idle_timeout_minutes,
@@ -554,7 +542,14 @@ def create_app(custom_settings: Optional[Settings] = None):
             max_concurrent_syncs=settings.max_concurrent_syncs,
             backup_retention=settings.backup_retention,
         )
+        sync_manager = SyncManager(collection_registry, user_store, settings)
     login_rate_limiter = LoginRateLimiter()  # fresh per app: lockout state must not leak across tests/restarts
+
+    # Captured AFTER the possible custom_settings rebind above, so the tool
+    # wrappers always use the registry/manager THIS app owns — never a later
+    # create_app()'s (same pattern as portal_registry below).
+    tool_registry = collection_registry
+    tool_sync_manager = sync_manager
 
     mcp = MCPServer(
         name="anki-mcp",
@@ -564,80 +559,109 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # 1. list_decks
     @mcp.tool(description="List all available decks and their IDs in the Anki collection.")
-    async def list_decks() -> Dict[str, Any]:
+    async def list_decks(ctx: Context) -> Dict[str, Any]:
+        username = _username_from_context(ctx)
+        if username is None:
+            return _unauthorized_tool_response()
         try:
-            return await deck_tools.list_decks(anki_client)
-        except (AnkiConnectError, AnkiConnectConnectionError, ValidationError) as e:
+            return await deck_tools.list_decks(tool_registry, username)
+        except Exception as e:
             return _tool_error_response(e)
 
     # 2. search_notes
     @mcp.tool(description="Search notes in the collection by Anki query with bounded pagination.")
-    async def search_notes(query: str, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
+    async def search_notes(query: str, limit: int = 50, offset: int = 0, ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
         try:
             SearchNotesInput(query=query, limit=limit, offset=offset)
-            return await note_tools.search_notes(anki_client, query, limit, offset)
-        except (AnkiConnectError, AnkiConnectConnectionError, ValidationError) as e:
+            return await note_tools.search_notes(tool_registry, username, query, limit, offset)
+        except Exception as e:
             return _tool_error_response(e)
 
     # 3. get_note
     @mcp.tool(description="Retrieve details and fields for a specific note by ID.")
-    async def get_note(note_id: int) -> Dict[str, Any]:
+    async def get_note(note_id: int, ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
         try:
             GetNoteInput(note_id=note_id)
-            return await note_tools.get_note(anki_client, note_id)
-        except (AnkiConnectError, AnkiConnectConnectionError, ValidationError) as e:
+            return await note_tools.get_note(tool_registry, username, note_id)
+        except Exception as e:
             return _tool_error_response(e)
 
     # 4. get_collection_stats
     @mcp.tool(description="Get reliably supported collection statistics and deck summaries.")
-    async def get_collection_stats() -> Dict[str, Any]:
+    async def get_collection_stats(ctx: Context) -> Dict[str, Any]:
+        username = _username_from_context(ctx)
+        if username is None:
+            return _unauthorized_tool_response()
         try:
-            return await stats_tools.get_collection_stats(anki_client)
-        except (AnkiConnectError, AnkiConnectConnectionError, ValidationError) as e:
+            return await stats_tools.get_collection_stats(tool_registry, username)
+        except Exception as e:
             return _tool_error_response(e)
 
     # 5. sync_collection
     @mcp.tool(description="Trigger explicit synchronization with official AnkiWeb.")
-    async def sync_collection() -> Dict[str, Any]:
-        return await sync_tools.sync_collection(sync_manager)
+    async def sync_collection(ctx: Context) -> Dict[str, Any]:
+        username = _username_from_context(ctx)
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            return await sync_tools.sync_collection(tool_sync_manager, username)
+        except Exception as e:
+            return _tool_error_response(e)
 
     # 6. add_notes
     @mcp.tool(
-        description="Add notes to the collection with pre-sync, duplicate prevention, and post-sync."
+        description="Add notes to the collection with duplicate prevention and per-user idempotency."
     )
     async def add_notes(
         notes: List[Dict[str, Any]],
         idempotency_key: Optional[str] = None,
         allow_duplicates: bool = False,
+        ctx: Context = None,
     ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
         try:
-            # Validate the full batch (non-empty, <=100 notes, field shapes) before any sync happens
+            # Validate the full batch (non-empty, <=100 notes, field shapes) up front
             parsed_input = AddNotesInput(notes=notes, idempotency_key=idempotency_key, allow_duplicates=allow_duplicates)
             res = await note_tools.add_notes(
-                sync_manager, parsed_input.notes, parsed_input.idempotency_key, parsed_input.allow_duplicates
+                tool_sync_manager, tool_registry, username,
+                parsed_input.notes, parsed_input.idempotency_key, parsed_input.allow_duplicates,
             )
             return res.model_dump()
-        except (AnkiConnectError, AnkiConnectConnectionError, ValidationError) as e:
+        except Exception as e:
             return _tool_error_response(e)
 
     # 7. update_note_fields
-    @mcp.tool(description="Update fields on an existing note with pre-sync and post-sync.")
-    async def update_note_fields(note_id: int, fields: Dict[str, str]) -> Dict[str, Any]:
+    @mcp.tool(description="Update fields on an existing note.")
+    async def update_note_fields(note_id: int, fields: Dict[str, str], ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
         try:
             UpdateNoteFieldsInput(note_id=note_id, fields=fields)
-            res = await note_tools.update_note_fields(sync_manager, note_id, fields)
+            res = await note_tools.update_note_fields(tool_sync_manager, tool_registry, username, note_id, fields)
             return res.model_dump()
-        except (AnkiConnectError, AnkiConnectConnectionError, ValidationError) as e:
+        except Exception as e:
             return _tool_error_response(e)
 
     # 8. add_tags
-    @mcp.tool(description="Add tags to notes with pre-sync and post-sync.")
-    async def add_tags(note_ids: List[int], tags: List[str]) -> Dict[str, Any]:
+    @mcp.tool(description="Add tags to notes.")
+    async def add_tags(note_ids: List[int], tags: List[str], ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
         try:
             parsed = AddTagsInput(note_ids=note_ids, tags=tags)
-            res = await note_tools.add_tags(sync_manager, parsed.note_ids, parsed.tags)
+            res = await note_tools.add_tags(tool_sync_manager, tool_registry, username, parsed.note_ids, parsed.tags)
             return res.model_dump()
-        except (AnkiConnectError, AnkiConnectConnectionError, ValidationError) as e:
+        except Exception as e:
             return _tool_error_response(e)
 
     # Create Starlette app for streamable HTTP with reverse-proxy support
@@ -650,23 +674,22 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # Healthcheck endpoint (exempt from authentication)
     async def health_endpoint(request: Request) -> JSONResponse:
-        anki_healthy = await anki_client.check_health()
+        # Schema-compatible with the AnkiConnect era: with collections served
+        # locally by the registry there is no remote client to probe, so the
+        # service reports healthy whenever it is up (status_code is always 200).
         payload = {
-            "status": "healthy" if anki_healthy else "degraded",
+            "status": "healthy",
             "service": "anki-mcp",
-            "anki_connected": anki_healthy,
-            "maintenance_mode": sync_manager.maintenance_mode,
-            "auth_enabled": settings.is_auth_enabled,
+            "anki_connected": True,
+            "maintenance_mode": tool_sync_manager.maintenance_mode,
+            "auth_enabled": True,  # per-user token auth is unconditional now
         }
-        # 503 when degraded so Docker healthchecks and orchestrators can tell
-        # a live-but-broken service from a functional one.
-        return JSONResponse(payload, status_code=200 if anki_healthy else 503)
+        return JSONResponse(payload, status_code=200)
 
     app.add_route("/health", health_endpoint, methods=["GET"])
 
-    # -- Web authentication routes (session-cookie based; interim until the
-    # Task 5 auth rewrite unifies the middleware) ---------------------------
-    store = UserStore(settings.users_file)
+    # -- Web authentication routes (session-cookie based) ---------------------
+    store = user_store
 
     # Captured AFTER the possible custom_settings rebind above, so the portal
     # handlers below always use the registry this app owns — never a later
@@ -1007,18 +1030,22 @@ def create_app(custom_settings: Optional[Settings] = None):
     app.add_route("/admin/set-role", admin_set_role, methods=["POST"])
     app.add_route("/admin/delete-user", admin_delete_user, methods=["POST"])
 
-    # Legacy shared-token auth for the MCP surface, bypassed for the web routes
-    # above (which carry their own session-cookie authentication).
-    app.add_middleware(ScopedAuthMiddleware, settings=settings)
+    # Per-user token auth for the MCP surface; the web routes above are in the
+    # middleware's explicit exempt allowlist (they carry their own session-
+    # cookie authentication) along with /health and OPTIONS.
+    app.add_middleware(AuthMiddleware, store=store, settings=settings)
+
+    # Introspection handles for tests/ops: the registry and store THIS app owns.
+    app.state.anki_registry = collection_registry
+    app.state.anki_store = store
 
     # Per-user collection lifecycle (Task 3): a background task closes
     # collections idle beyond idle_timeout_minutes every minute, and shutdown
-    # closes every open collection. Same pattern as the AnkiConnect client
-    # below: capture the registry BEFORE defining the wrapper so a later
-    # create_app() cannot rebind which registry this lifespan owns.
-    # (Starlette 1.x removed add_event_handler; wrap the lifespan instead so
-    # cleanup runs after the SDK's session-manager shutdown completes.)
-    client_to_close = anki_client
+    # closes every open collection. Capture the registry BEFORE defining the
+    # wrapper so a later create_app() cannot rebind which registry this
+    # lifespan owns. (Starlette 1.x removed add_event_handler; wrap the
+    # lifespan instead so cleanup runs after the SDK's session-manager
+    # shutdown completes.)
     registry_to_close = collection_registry
     inner_lifespan = app.router.lifespan_context
 
@@ -1033,7 +1060,7 @@ def create_app(custom_settings: Optional[Settings] = None):
                 logger.exception("Idle collection sweep failed")
 
     @asynccontextmanager
-    async def lifespan_with_client_close(a):
+    async def lifespan_with_registry_close(a):
         idle_sweep_task = asyncio.create_task(_close_idle_collections_forever())
         try:
             async with inner_lifespan(a):
@@ -1043,9 +1070,8 @@ def create_app(custom_settings: Optional[Settings] = None):
             with suppress(asyncio.CancelledError):
                 await idle_sweep_task
             await registry_to_close.close_all()
-            await client_to_close.close()
 
-    app.router.lifespan_context = lifespan_with_client_close
+    app.router.lifespan_context = lifespan_with_registry_close
 
     return app
 
@@ -1079,13 +1105,7 @@ def main():
             raise SystemExit(1)
 
     logger.info("Starting Anki MCP Service on %s:%d (path: %s)", settings.mcp_host, settings.mcp_port, settings.mcp_path)
-    if settings.is_auth_enabled:
-        logger.info("Authentication enabled (legacy shared-token middleware active until the auth rewrite)")
-    else:
-        logger.warning(
-            "MCP_AUTH_TOKEN unset: the legacy middleware will reject all /mcp requests "
-            "until the per-user token auth lands (planned)."
-        )
+    logger.info("Authentication enabled (per-user MCP tokens via %s)", settings.users_file)
 
     app = create_app()
     uvicorn.run(
