@@ -2,11 +2,14 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+import html
 import logging
 from typing import Any, Dict, List, Optional
 from mcp.server.mcpserver import MCPServer
+from starlette.concurrency import run_in_threadpool
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 import uvicorn
 from pydantic import ValidationError
 
@@ -21,7 +24,17 @@ from .tools import decks as deck_tools
 from .tools import notes as note_tools
 from .tools import stats as stats_tools
 from .tools import sync as sync_tools
-from .users import UserStore
+from .users import User, UserStore
+from .webauth import (
+    SESSION_COOKIE_NAME,
+    SESSION_TTL_SECONDS,
+    LoginRateLimiter,
+    issue_csrf,
+    issue_session,
+    secure_cookies_enabled,
+    verify_csrf,
+    verify_session,
+)
 
 # Globals initialized in factory
 settings: Settings = get_settings()
@@ -29,6 +42,7 @@ logger: logging.Logger = setup_logging(settings.log_level)
 anki_client: AnkiClient = AnkiClient(settings)
 ledger: IdempotencyLedger = IdempotencyLedger(settings.idempotency_ledger_path)
 sync_manager: SyncManager = SyncManager(anki_client, ledger, settings)
+login_rate_limiter: LoginRateLimiter = LoginRateLimiter()
 
 
 def _tool_error_response(exc: Exception) -> Dict[str, Any]:
@@ -44,15 +58,106 @@ def _tool_error_response(exc: Exception) -> Dict[str, Any]:
     }
 
 
+_PAGE_CSS = """
+  body { font-family: system-ui, sans-serif; background: #f5f5f5; margin: 0;
+         display: flex; justify-content: center; padding-top: 10vh; }
+  main { background: #fff; border: 1px solid #ddd; border-radius: 6px;
+         padding: 2rem; width: 20rem; }
+  h1 { font-size: 1.25rem; margin: 0 0 0.5rem; }
+  label { display: block; margin: 0.75rem 0 0.25rem; }
+  input { width: 100%; padding: 0.4rem; box-sizing: border-box; }
+  button { margin-top: 1rem; padding: 0.45rem 1rem; cursor: pointer; }
+  .error { color: #b00020; margin-top: 1rem; }
+"""
+
+
+def _page(title: str, body: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(title)}</title>
+<style>{_PAGE_CSS}</style>
+</head>
+<body>
+<main>
+{body}
+</main>
+</body>
+</html>"""
+
+
+def _login_page(error: Optional[str] = None) -> str:
+    error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
+    return _page(
+        "Anki MCP - Sign in",
+        f"""<h1>Sign in</h1>
+<form method="post" action="/login">
+  <label for="username">Username</label>
+  <input id="username" name="username" autocomplete="username" autofocus required>
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" required>
+  <button type="submit">Sign in</button>
+</form>
+{error_html}""",
+    )
+
+
+def _index_page(username: str, csrf_token: str) -> str:
+    return _page(
+        "Anki MCP",
+        f"""<h1>Anki MCP</h1>
+<p>Logged in as <strong>{html.escape(username)}</strong></p>
+<form method="post" action="/logout">
+  <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
+  <button type="submit">Log out</button>
+</form>""",
+    )
+
+
+def _message_page(message: str) -> str:
+    return _page(
+        "Anki MCP",
+        f'<p>{html.escape(message)}</p>\n<p><a href="/login">Back to sign in</a></p>',
+    )
+
+
+class ScopedAuthMiddleware(BaseHTTPMiddleware):
+    """Legacy shared-token auth, scoped to the MCP API surface.
+
+    The web-auth routes (/, /login, /logout) authenticate with session cookies
+    and run their own CSRF checks, so the legacy bearer-token middleware must
+    not guard them; everything else keeps the exact legacy behavior (including
+    the /health and OPTIONS exemptions inside AuthMiddleware itself) until the
+    Task 5 auth rewrite replaces this split.
+
+    AuthMiddleware is constructed eagerly so its fail-closed contract (refusing
+    to build the stack without a configured token) is preserved unchanged.
+    """
+
+    WEB_AUTH_PATHS = frozenset({"/", "/login", "/logout"})
+
+    def __init__(self, app, settings: Settings):
+        super().__init__(app)
+        self._legacy = AuthMiddleware(app, settings=settings)
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        if request.url.path in self.WEB_AUTH_PATHS:
+            return await call_next(request)
+        return await self._legacy.dispatch(request, call_next)
+
+
 def create_app(custom_settings: Optional[Settings] = None):
     """Create and configure the MCP Starlette ASGI application."""
-    global settings, logger, anki_client, ledger, sync_manager
+    global settings, logger, anki_client, ledger, sync_manager, login_rate_limiter
     if custom_settings:
         settings = custom_settings
         logger = setup_logging(settings.log_level)
         anki_client = AnkiClient(settings)
         ledger = IdempotencyLedger(settings.idempotency_ledger_path)
         sync_manager = SyncManager(anki_client, ledger, settings)
+    login_rate_limiter = LoginRateLimiter()  # fresh per app: lockout state must not leak across tests/restarts
 
     mcp = MCPServer(
         name="anki-mcp",
@@ -162,8 +267,95 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     app.add_route("/health", health_endpoint, methods=["GET"])
 
-    # Attach AuthMiddleware
-    app.add_middleware(AuthMiddleware, settings=settings)
+    # -- Web authentication routes (session-cookie based; interim until the
+    # Task 5 auth rewrite unifies the middleware) ---------------------------
+    store = UserStore(settings.users_file)
+
+    def get_session_user(request: Request) -> Optional[User]:
+        """Resolve the anki_session cookie to an account, or None.
+
+        Signed-cookie validity alone is not enough: the named account must
+        still exist, so deleted users lose access immediately even with a
+        valid (stateless) cookie.
+        """
+        session_value = request.cookies.get(SESSION_COOKIE_NAME)
+        if not session_value:
+            return None
+        username = verify_session(settings.session_secret, session_value)
+        if username is None:
+            return None
+        return next((u for u in store.list_users() if u.username == username), None)
+
+    async def login_page(request: Request) -> Response:
+        if get_session_user(request) is not None:
+            return RedirectResponse("/", status_code=303)
+        return HTMLResponse(_login_page())
+
+    async def login_submit(request: Request) -> Response:
+        form = await request.form()
+        username = str(form.get("username", ""))
+        password = str(form.get("password", ""))
+        ip = request.client.host if request.client else ""
+        # Brute-force gate first: a locked key is rejected before any password
+        # work happens, and the page reveals nothing about the account.
+        if not login_rate_limiter.check(username, ip):
+            logger.warning("Login rate-limited for %r from %s", username, ip)
+            return HTMLResponse(
+                _message_page("Too many failed attempts. Please try again later."),
+                status_code=429,
+            )
+        valid = False
+        if username:
+            # scrypt is CPU-bound; keep it off the event loop.
+            valid = await run_in_threadpool(store.verify_password, username, password)
+        if valid:
+            login_rate_limiter.record_success(username, ip)
+            response = RedirectResponse("/", status_code=303)
+            response.set_cookie(
+                SESSION_COOKIE_NAME,
+                issue_session(settings.session_secret, username),
+                max_age=SESSION_TTL_SECONDS,
+                path="/",
+                httponly=True,
+                samesite="strict",
+                secure=secure_cookies_enabled(),
+            )
+            logger.info("Web session issued for %r from %s", username, ip)
+            return response
+        login_rate_limiter.record_failure(username, ip)
+        # Generic message: identical for unknown usernames and wrong passwords.
+        return HTMLResponse(_login_page("Invalid username or password."), status_code=401)
+
+    async def index_page(request: Request) -> Response:
+        user = get_session_user(request)
+        if user is None:
+            return RedirectResponse("/login", status_code=303)
+        session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        return HTMLResponse(_index_page(user.username, issue_csrf(session_value)))
+
+    async def logout_submit(request: Request) -> Response:
+        session_value = request.cookies.get(SESSION_COOKIE_NAME)
+        user = get_session_user(request)
+        if user is None or not session_value:
+            return RedirectResponse("/login", status_code=303)
+        form = await request.form()
+        if not verify_csrf(session_value, str(form.get("csrf_token", ""))):
+            return HTMLResponse(
+                _message_page("Invalid or missing CSRF token."), status_code=403
+            )
+        response = RedirectResponse("/login", status_code=303)
+        response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+        logger.info("Web session ended for %r", user.username)
+        return response
+
+    app.add_route("/login", login_page, methods=["GET"])
+    app.add_route("/login", login_submit, methods=["POST"])
+    app.add_route("/", index_page, methods=["GET"])
+    app.add_route("/logout", logout_submit, methods=["POST"])
+
+    # Legacy shared-token auth for the MCP surface, bypassed for the web routes
+    # above (which carry their own session-cookie authentication).
+    app.add_middleware(ScopedAuthMiddleware, settings=settings)
 
     # Close the shared AnkiConnect HTTP client on app shutdown.
     # (Starlette 1.x removed add_event_handler; wrap the lifespan instead so the
