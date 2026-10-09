@@ -75,6 +75,13 @@ def test_malformed_session_values_rejected(value):
     assert verify_session(SECRET, value) is None
 
 
+def test_non_ascii_session_segments_rejected_not_raised():
+    # Crafted cookie with a non-ASCII segment: the contract is None, never a
+    # UnicodeEncodeError escaping the auth layer (was a 500 pre-fix).
+    assert verify_session(SECRET, "AAAA|ö\xff|n|AAAA") is None
+    assert verify_session(SECRET, "AAAA|123|nön|AAAA") is None
+
+
 # ---------------------------------------------------------------------------
 # CSRF primitives
 # ---------------------------------------------------------------------------
@@ -100,6 +107,13 @@ def test_csrf_token_bound_to_its_session():
 def test_csrf_against_malformed_session_value_is_false():
     assert verify_csrf("garbage", issue_csrf(issue_session(SECRET, "alice"))) is False
     assert verify_csrf(issue_session(SECRET, "alice"), "") is False
+
+
+def test_csrf_non_ascii_token_rejected_not_raised():
+    cookie = issue_session(SECRET, "alice")
+    # Non-ASCII form value must compare False, not raise TypeError (was a 500 pre-fix).
+    assert verify_csrf(cookie, "tökén") is False
+    assert verify_csrf(cookie, "0" * 63 + "ö") is False
 
 
 # ---------------------------------------------------------------------------

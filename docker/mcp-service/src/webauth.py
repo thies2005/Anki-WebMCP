@@ -95,10 +95,12 @@ def verify_session(session_secret: str, value: str) -> Optional[str]:
     if len(parts) != 4:
         return None
     username_b64, expiry_str, nonce, mac_b64 = parts
-    expected = _sign(derive_session_key(session_secret), username_b64, expiry_str, nonce)
     try:
+        expected = _sign(derive_session_key(session_secret), username_b64, expiry_str, nonce)
         provided_mac = _b64decode(mac_b64)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, UnicodeEncodeError):
+        # Attacker-controlled segments may contain non-ASCII; the contract is
+        # "malformed decodes to None", never an exception in the auth layer.
         return None
     if not hmac.compare_digest(expected, provided_mac):
         return None
@@ -130,13 +132,14 @@ def issue_csrf(session_value: str) -> str:
 
 def verify_csrf(session_value: str, token: str) -> bool:
     """Check a CSRF token against the session it claims to belong to."""
-    if not session_value or not token:
+    if not session_value or not isinstance(token, str) or not token:
         return False
     try:
         expected = issue_csrf(session_value)
     except (ValueError, TypeError):
         return False
-    return hmac.compare_digest(expected, token)
+    # Compare on bytes: str compare_digest rejects non-ASCII with TypeError.
+    return hmac.compare_digest(expected.encode("utf-8"), token.encode("utf-8"))
 
 
 def secure_cookies_enabled() -> bool:
