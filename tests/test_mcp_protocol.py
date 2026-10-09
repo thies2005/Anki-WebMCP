@@ -132,6 +132,28 @@ async def test_add_notes_empty_batch_returns_structured_protocol_error(
 
 
 @pytest.mark.asyncio
+async def test_search_notes_tool_schema_exposes_only_real_arguments(app_with_users):
+    """tools/list for search_notes: exactly {query, limit, offset}.
+
+    The ``ctx: Context`` parameter (and any auth state) must never leak into
+    the input schema — an SDK upgrade changing the Context exclusion would
+    otherwise surface a bogus ``ctx``/``username`` argument to clients.
+    """
+    app, settings, alice_token, _ = app_with_users
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+            headers = await _init_session(client, alice_token)
+            list_res = await client.post("/mcp", headers=headers, json={
+                "jsonrpc": "2.0", "id": 30, "method": "tools/list",
+            })
+            assert list_res.status_code == 200
+            payload = _parse_mcp_response(list_res)
+            tools = {t["name"]: t for t in payload["result"]["tools"]}
+            assert set(tools["search_notes"]["inputSchema"]["properties"]) == {"query", "limit", "offset"}
+
+
+@pytest.mark.asyncio
 async def test_search_notes_invalid_limit_returns_structured_protocol_error(
     app_with_users,
 ):

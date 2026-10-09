@@ -14,9 +14,12 @@ _PATTERNS = [
     (re.compile(r'(["\']?(?:api[_-]?key|key|token|auth|password|secret|hkey)["\']?\s*[:=]\s*["\']?)([^"\'\s,;&]+)(["\']?)', re.IGNORECASE), r'\1[REDACTED]\3'),
 ]
 
+# Secret-bearing dict keys. Generic names cover every real secret this service
+# handles (session_secret, admin_password, per-user MCP tokens, AnkiWeb
+# credentials); the deleted legacy env-var names are NOT listed.
 _SENSITIVE_KEYS = {
     "key", "apikey", "api_key", "token", "auth", "password", "secret",
-    "hkey", "authorization", "x-api-key", "mcp_auth_token", "anki_connect_api_key",
+    "hkey", "authorization", "x-api-key",
 }
 
 

@@ -550,6 +550,10 @@ def create_app(custom_settings: Optional[Settings] = None):
     # create_app()'s (same pattern as portal_registry below).
     tool_registry = collection_registry
     tool_sync_manager = sync_manager
+    # Health-probe handles, captured like the tool wrappers: THIS app's store
+    # and data dir, never a later create_app()'s.
+    health_store = user_store
+    health_data_dir = settings.data_dir
 
     mcp = MCPServer(
         name="anki-mcp",
@@ -674,9 +678,17 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # Healthcheck endpoint (exempt from authentication)
     async def health_endpoint(request: Request) -> JSONResponse:
-        # Schema-compatible with the AnkiConnect era: with collections served
-        # locally by the registry there is no remote client to probe, so the
-        # service reports healthy whenever it is up (status_code is always 200).
+        # Real but CHEAP probes — this runs per healthcheck (Docker/K8s hit it
+        # every few seconds), so no collection I/O and no temp files:
+        #   (a) the users store must be readable: a corrupt/dead store breaks
+        #       authentication for every account (list_users is an in-memory
+        #       read under the store's lock);
+        #   (b) the data dir must be writable: per-user collections, ledgers,
+        #       and backups all live under it (os.access is the cheap,
+        #       allocation-free probe; a missing dir reports not-writable).
+        # Collections are served in-process by the registry, so there is no
+        # remote AnkiConnect client to probe: anki_connected stays a compat key
+        # that is always true.
         payload = {
             "status": "healthy",
             "service": "anki-mcp",
@@ -684,6 +696,18 @@ def create_app(custom_settings: Optional[Settings] = None):
             "maintenance_mode": tool_sync_manager.maintenance_mode,
             "auth_enabled": True,  # per-user token auth is unconditional now
         }
+        problems: List[str] = []
+        try:
+            health_store.list_users()
+        except Exception as e:
+            logger.warning("Health probe: user store unavailable: %s", e)
+            problems.append("user store unavailable")
+        if not os.access(health_data_dir, os.W_OK):
+            logger.warning("Health probe: data dir %r is missing or not writable", health_data_dir)
+            problems.append("data directory not writable")
+        if problems:
+            payload["status"] = "degraded"
+            return JSONResponse(payload, status_code=503)
         return JSONResponse(payload, status_code=200)
 
     app.add_route("/health", health_endpoint, methods=["GET"])

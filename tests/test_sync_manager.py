@@ -6,6 +6,7 @@ sync is covered in test_collections.py); mutation tests run against REAL
 per-user collections in a tmp data dir.
 """
 
+import asyncio
 import os
 
 import pytest
@@ -26,6 +27,15 @@ def add_basic_note(col, front, back="back"):
     note["Back"] = back
     col.add_note(note, col.decks.id("Default"))
     return note.id
+
+
+async def note_count(reg, username: str) -> int:
+    """Number of notes in the user's collection (via the registry's thread)."""
+
+    def _count(col):
+        return len(col.find_notes("*"))
+
+    return await reg.run(username, _count)
 
 
 @pytest_asyncio.fixture
@@ -175,6 +185,25 @@ async def test_sync_idempotent_replay(env, monkeypatch):
     assert second["data"] == {"output": "ok"}
 
 
+@pytest.mark.asyncio
+async def test_maintenance_mode_rejects_sync_now(env, monkeypatch):
+    """Same gate as the mutation path: skipped-shaped response, no sync, no ledger write."""
+    reg, store, manager = env
+    manager.set_maintenance_mode(True)
+    calls = await _patch_sync_user(monkeypatch, reg, {"success": True, "output": "ok"})
+
+    res = await manager.sync_now("alice", idempotency_key="sync-maint")
+
+    assert res["success"] is False
+    assert res["sync_status"]["pre_sync"] == "skipped"
+    assert res["sync_status"]["post_sync"] == "skipped"
+    assert res["message"] == "Worker is currently in maintenance mode; writes are paused."
+    assert res["warnings"] == []
+    assert calls == []  # no sync attempted
+    # The idempotency key was not consumed by the rejected request
+    assert await reg.ledger("alice").get("sync-maint") is None
+
+
 # -- mutation write-safety ----------------------------------------------------------
 
 
@@ -239,6 +268,79 @@ async def test_mutation_idempotent_replay_runs_once(env):
     assert second.success is True
     assert second.data == first.data
     assert any("Idempotent operation replay" in w for w in second.warnings)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_key_mutations_apply_once(env):
+    """Two concurrent calls sharing an idempotency key: exactly one applies.
+
+    The ledger check → mutate → record sequence must be atomic per user, so
+    the second caller — which starts its ledger check while the first's slow
+    mutation is still in flight — sees the committed record and replays it
+    instead of double-applying.
+    """
+    reg, store, manager = env
+    counter = {"n": 0}
+
+    async def slow_mutation():
+        counter["n"] += 1
+        # Yield mid-mutation so the second caller's ledger check runs NOW —
+        # without the per-user lock it would miss (nothing recorded yet).
+        await asyncio.sleep(0.05)
+        return await reg.run("alice", add_basic_note, f"front-{counter['n']}")
+
+    results = await asyncio.gather(
+        manager.execute_mutation(
+            "alice", operation_name="add_notes", mutation_fn=slow_mutation, idempotency_key="race-key"
+        ),
+        manager.execute_mutation(
+            "alice", operation_name="add_notes", mutation_fn=slow_mutation, idempotency_key="race-key"
+        ),
+    )
+
+    # Exactly one caller applied the mutation; the other replayed the cached
+    # committed result (same assertions as the sequential replay test).
+    assert counter["n"] == 1
+    committed = [r for r in results if not r.warnings]
+    replayed = [r for r in results if any("Idempotent operation replay" in w for w in r.warnings)]
+    assert len(committed) == 1
+    assert len(replayed) == 1
+    assert committed[0].success is True
+    assert committed[0].local_status == "committed"
+    assert replayed[0].success is True
+    assert replayed[0].data == committed[0].data
+    # And only ONE note exists in the collection
+    found = await note_count(reg, "alice")
+    assert found == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_mutations_different_users_not_serialized(env):
+    """The same-key lock is per user: different users' mutations overlap."""
+    reg, store, manager = env
+    in_flight = {"count": 0, "max": 0}
+
+    def make_mutation(username):
+        async def mutation():
+            in_flight["count"] += 1
+            in_flight["max"] = max(in_flight["max"], in_flight["count"])
+            await asyncio.sleep(0.05)
+            result = await reg.run(username, add_basic_note, f"front-{username}")
+            in_flight["count"] -= 1
+            return result
+
+        return mutation
+
+    await asyncio.gather(
+        manager.execute_mutation("alice", operation_name="op", mutation_fn=make_mutation("alice")),
+        manager.execute_mutation("bob", operation_name="op", mutation_fn=make_mutation("bob")),
+    )
+
+    # Both mutations were in flight at the same time — a global lock would
+    # report max == 1.
+    assert in_flight["max"] == 2
+    assert await note_count(reg, "alice") == 1
+    assert await note_count(reg, "bob") == 1
 
 
 @pytest.mark.asyncio

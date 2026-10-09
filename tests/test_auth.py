@@ -61,6 +61,42 @@ async def test_health_endpoint_exempt_from_auth(client):
     assert data["auth_enabled"] is True
     assert data["status"] == "healthy"
     assert "maintenance_mode" in data
+    # The payload schema is the compat contract: exactly these keys.
+    assert set(data) == {"status", "service", "anki_connected", "maintenance_mode", "auth_enabled"}
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint_degraded_when_data_dir_missing(temp_ledger_file, tmp_path, store):
+    """A missing/unwritable data dir cannot host collections -> 503 degraded."""
+    settings = Settings(
+        session_secret=SECRET,
+        data_dir=str(tmp_path / "does-not-exist"),
+        users_file=str(tmp_path / "users.json"),
+        idempotency_ledger_path=temp_ledger_file,
+    )
+    app = create_app(settings)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+        res = await client.get("/health")
+    assert res.status_code == 503
+    data = res.json()
+    assert data["status"] == "degraded"
+    # Same payload keys as the healthy response
+    assert set(data) == {"status", "service", "anki_connected", "maintenance_mode", "auth_enabled"}
+    assert data["anki_connected"] is True  # compat key stays true
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint_degraded_when_user_store_dead(app, store, monkeypatch):
+    """A dead user store breaks auth for every account -> 503 degraded."""
+    def broken():
+        raise ValueError("User store is unreadable or corrupt")
+
+    # The health endpoint probes the same store instance the app exposes.
+    monkeypatch.setattr(app.state.anki_store, "list_users", broken)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+        res = await client.get("/health")
+    assert res.status_code == 503
+    assert res.json()["status"] == "degraded"
 
 
 @pytest.mark.asyncio

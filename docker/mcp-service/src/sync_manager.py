@@ -7,12 +7,16 @@ Two responsibilities survive the AnkiConnect removal (Task 5):
    (``registry.ledger(username)``). Pre-/post-mutation AnkiConnect syncs are
    GONE: mutations now write the user's local collection only, so the
    response's ``sync_status`` stays fully ``"skipped"`` (the response schema
-   is unchanged for MCP-client compatibility). Operation serialization is the
-   registry's per-user lock — the legacy global asyncio.Lock would needlessly
-   serialize different users against each other.
-2. ``sync_now`` — the explicit ``sync_collection`` tool. Reads the user's
-   AnkiWeb credentials from the account record (raising BEFORE any ledger
-   write when they are missing), then delegates to
+   is unchanged for MCP-client compatibility). The ledger check → mutate →
+   record sequence runs under a per-user asyncio lock in THIS class: the
+   registry's per-user lock alone serializes only the mutation itself, which
+   would let two concurrent callers sharing one idempotency key both miss in
+   the ledger and double-apply. Per-user granularity — different users are
+   never serialized against each other.
+2. ``sync_now`` — the explicit ``sync_collection`` tool. Shares the
+   maintenance gate (a skipped-shaped response, mirrored from the mutation
+   path), then reads the user's AnkiWeb credentials from the account record
+   (raising BEFORE any ledger write when they are missing), and delegates to
    ``registry.sync_user(username, email, password, on_step=...)``.
 
 Ambiguous-outcome rule: a network-layer failure DURING the sync transfer is
@@ -22,6 +26,7 @@ would permanently poison the key while the true outcome is unknowable) and a
 warning explains this to the client.
 """
 
+import asyncio
 import logging
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -49,6 +54,12 @@ class SyncManager:
         self.store = store
         self.settings = settings or get_settings()
         self._maintenance_mode = self.settings.maintenance_mode
+        # Per-user asyncio locks serializing the ledger check → mutate → record
+        # sequence of execute_mutation (same-key replay safety). Locks are
+        # created lazily under the small guard; the guard never covers the
+        # mutation itself, and different users get different locks.
+        self._locks_guard = asyncio.Lock()
+        self._mutation_locks: Dict[str, asyncio.Lock] = {}
 
     @property
     def maintenance_mode(self) -> bool:
@@ -101,6 +112,18 @@ class SyncManager:
         ``idempotency_key`` is accepted for replay/ledger semantics but the
         MCP surface passes none (the tool takes no arguments, unchanged).
         """
+        if self._maintenance_mode:
+            # Same gate as the mutation path, translated to this method's dict
+            # response shape: everything skipped, no sync attempted, no ledger
+            # write (the key is not consumed).
+            logger.warning("Rejected sync for %r: worker is in maintenance mode", username)
+            return {
+                "success": False,
+                "sync_status": SyncStatus(pre_sync="skipped", post_sync="skipped").model_dump(),
+                "message": "Worker is currently in maintenance mode; writes are paused.",
+                "warnings": [],
+            }
+
         email, password = self._user_credentials(username)
         warnings: List[str] = []
         ledger = self.registry.ledger(username)
@@ -178,6 +201,24 @@ class SyncManager:
 
     # -- mutation write-safety -----------------------------------------------------
 
+    async def _user_mutation_lock(self, username: str) -> asyncio.Lock:
+        """The per-user lock making the check → mutate → record sequence atomic.
+
+        Two concurrent callers sharing ONE idempotency key would otherwise both
+        miss in the ledger (the first has not recorded yet) and double-apply:
+        the registry's per-user lock serializes only the mutation itself, not
+        the surrounding ledger check and record. Locks are created lazily under
+        the guard so concurrent first-time callers share one lock per username;
+        different users get different locks and are never serialized against
+        each other.
+        """
+        async with self._locks_guard:
+            lock = self._mutation_locks.get(username)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._mutation_locks[username] = lock
+            return lock
+
     async def execute_mutation(
         self,
         username: str,
@@ -188,9 +229,10 @@ class SyncManager:
         """Execute a state-mutating operation with per-user write-safety semantics:
 
         1. Check maintenance mode.
-        2. Check the user's idempotency ledger for duplicate requests.
+        2. Under the user's mutation lock: check the user's idempotency ledger
+           for duplicate requests.
         3. Apply the mutation to the user's local collection (the registry's
-           per-user lock serializes concurrent writers).
+           per-user lock serializes concurrent writers on the collection file).
         4. Commit record to the idempotency ledger.
         5. Return the schema-compatible MutationResponse (sync_status stays
            fully "skipped": explicit sync is a separate tool now).
@@ -206,65 +248,66 @@ class SyncManager:
                 error="Worker is currently in maintenance mode; writes are paused.",
             )
 
-        ledger = self.registry.ledger(username)
+        async with await self._user_mutation_lock(username):
+            ledger = self.registry.ledger(username)
 
-        if idempotency_key:
-            existing = await ledger.get(idempotency_key)
-            if existing:
-                status = existing.get("status")
-                if status == "committed":
-                    logger.info("Idempotency hit for key '%s': returning cached committed response", idempotency_key)
-                    return MutationResponse(
-                        success=True,
-                        local_status="committed",
-                        sync_status=SyncStatus(pre_sync="skipped", post_sync="skipped"),
-                        data=existing.get("data"),
-                        warnings=[_REPLAY_WARNING.format(existing.get("timestamp"))],
-                    )
-                if status == "failed":
-                    logger.info("Idempotency hit for key '%s': returning cached failure", idempotency_key)
-                    return MutationResponse(
-                        success=False,
-                        local_status="failed",
-                        sync_status=SyncStatus(pre_sync="skipped", post_sync="skipped"),
-                        error=existing.get("error", "Previous attempt with this idempotency key failed."),
-                        warnings=[_REPLAY_WARNING.format(existing.get("timestamp"))],
-                    )
+            if idempotency_key:
+                existing = await ledger.get(idempotency_key)
+                if existing:
+                    status = existing.get("status")
+                    if status == "committed":
+                        logger.info("Idempotency hit for key '%s': returning cached committed response", idempotency_key)
+                        return MutationResponse(
+                            success=True,
+                            local_status="committed",
+                            sync_status=SyncStatus(pre_sync="skipped", post_sync="skipped"),
+                            data=existing.get("data"),
+                            warnings=[_REPLAY_WARNING.format(existing.get("timestamp"))],
+                        )
+                    if status == "failed":
+                        logger.info("Idempotency hit for key '%s': returning cached failure", idempotency_key)
+                        return MutationResponse(
+                            success=False,
+                            local_status="failed",
+                            sync_status=SyncStatus(pre_sync="skipped", post_sync="skipped"),
+                            error=existing.get("error", "Previous attempt with this idempotency key failed."),
+                            warnings=[_REPLAY_WARNING.format(existing.get("timestamp"))],
+                        )
 
-        local_data: Any = None
-        try:
-            logger.info("Applying local mutation for '%s' (user %r)...", operation_name, username)
-            local_data = await mutation_fn()
-            local_status = "committed"
-        except Exception as e:
-            local_status = "failed"
-            err_msg = str(e)
-            logger.error("Local mutation '%s' failed: %s", operation_name, err_msg)
+            local_data: Any = None
+            try:
+                logger.info("Applying local mutation for '%s' (user %r)...", operation_name, username)
+                local_data = await mutation_fn()
+                local_status = "committed"
+            except Exception as e:
+                local_status = "failed"
+                err_msg = str(e)
+                logger.error("Local mutation '%s' failed: %s", operation_name, err_msg)
+                if idempotency_key:
+                    try:
+                        await ledger.record_failure(idempotency_key, err_msg)
+                    except Exception as ledger_exc:
+                        logger.error("Failed to record idempotency failure for key '%s': %s", idempotency_key, ledger_exc)
+                        warnings.append(_LEDGER_WRITE_WARNING)
+                return MutationResponse(
+                    success=False,
+                    local_status=local_status,
+                    sync_status=SyncStatus(),
+                    error=err_msg,
+                    warnings=warnings,
+                )
+
             if idempotency_key:
                 try:
-                    await ledger.record_failure(idempotency_key, err_msg)
-                except Exception as ledger_exc:
-                    logger.error("Failed to record idempotency failure for key '%s': %s", idempotency_key, ledger_exc)
+                    await ledger.record_success(idempotency_key, local_data)
+                except Exception as e:
+                    logger.error("Failed to commit idempotency record for key '%s': %s", idempotency_key, e)
                     warnings.append(_LEDGER_WRITE_WARNING)
+
             return MutationResponse(
-                success=False,
+                success=True,
                 local_status=local_status,
                 sync_status=SyncStatus(),
-                error=err_msg,
+                data=local_data,
                 warnings=warnings,
             )
-
-        if idempotency_key:
-            try:
-                await ledger.record_success(idempotency_key, local_data)
-            except Exception as e:
-                logger.error("Failed to commit idempotency record for key '%s': %s", idempotency_key, e)
-                warnings.append(_LEDGER_WRITE_WARNING)
-
-        return MutationResponse(
-            success=True,
-            local_status=local_status,
-            sync_status=SyncStatus(),
-            data=local_data,
-            warnings=warnings,
-        )

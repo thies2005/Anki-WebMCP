@@ -13,7 +13,7 @@ STRINGS at the storage layer while ``note.tags`` is a List[str] property;
 """
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from anki.errors import NotFoundError
 from anki.notes import Note
@@ -113,9 +113,13 @@ def _is_first_field_duplicate(col, model, deck_name: str, fields: Dict[str, str]
     value = (fields.get(first_field_name) or "").strip()
     if not value:
         return False
+    # The combined-quoted term "field:value" is the one Anki search form that
+    # survives field names AND values containing spaces, quotes, and colons
+    # (probed against the wheel: ``Field:"value"`` silently misses when the
+    # field name has a space, and ``"Field":"value"`` is a SearchError).
     query = (
         f'deck:"{_escape_search_term(deck_name)}" '
-        f'{first_field_name}:"{_escape_search_term(value)}"'
+        f'"{_escape_search_term(first_field_name)}:{_escape_search_term(value)}"'
     )
     return len(col.find_notes(query)) > 0
 
@@ -160,7 +164,7 @@ async def add_notes(
     registry,
     username: str,
     notes: List[NoteInput],
-    idempotency_key: str = None,
+    idempotency_key: Optional[str] = None,
     allow_duplicates: bool = False,
 ) -> MutationResponse:
     """Create one or more notes with duplicate prevention and per-user idempotency."""

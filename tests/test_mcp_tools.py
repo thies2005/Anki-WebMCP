@@ -253,6 +253,72 @@ async def test_add_notes_duplicates_scoped_to_deck(env):
 
 
 @pytest.mark.asyncio
+async def test_add_notes_duplicate_value_with_quotes_and_spaces(env):
+    """A first-field value containing spaces and double quotes is still found.
+
+    The search term is the combined-quoted ``"field:value"`` form with embedded
+    quotes escaped (``\\"``); the duplicate failure message stays byte-identical
+    to the plain-value case.
+    """
+    reg, manager = env
+    tricky = 'He said "hello world" loudly'
+    await reg.run("alice", add_basic_note, tricky, "a")
+
+    notes = [NoteInput(deck_name="Default", model_name="Basic", fields={"Front": tricky, "Back": "b"})]
+    res = await note_tools.add_notes(manager, reg, "alice", notes, allow_duplicates=False)
+    assert res.success is False
+    assert res.local_status == "failed"
+    # Byte-identical to the plain-value duplicate failure
+    assert res.error == (
+        "Duplicate check failed: note index(es) [0] would create duplicate cards. "
+        "Set allow_duplicates=True if duplicates are intended."
+    )
+
+    # allow_duplicates=True goes through and really creates the second copy
+    res2 = await note_tools.add_notes(manager, reg, "alice", notes, allow_duplicates=True)
+    assert res2.success is True
+    count = await reg.run("alice", lambda col: len(col.find_notes("*")))
+    assert count == 2
+
+
+@pytest.mark.asyncio
+async def test_add_notes_duplicate_spaced_field_name_detected(env):
+    """A model whose FIRST FIELD NAME contains a space is searched correctly.
+
+    ``Field:"value"`` silently misses when the field name is unquoted (parsed
+    as separate terms); the combined-quoted ``"field:value"`` term handles it.
+    """
+    reg, manager = env
+
+    def _make_model(col):
+        mm = col.models
+        m = mm.new(name="Spaced")
+        mm.add_field(m, mm.new_field(name="Question Text"))
+        mm.add_field(m, mm.new_field(name="Answer"))
+        t = mm.new_template("Card 1")
+        t["qfmt"] = "{{Question Text}}"
+        t["afmt"] = "{{Answer}}"
+        mm.add_template(m, t)
+        mm.add(m)
+
+    await reg.run("alice", _make_model)
+
+    fields = {"Question Text": "what now", "Answer": "this"}
+    first = await note_tools.add_notes(
+        manager, reg, "alice", [NoteInput(deck_name="Default", model_name="Spaced", fields=fields)]
+    )
+    assert first.success is True
+
+    dup = await note_tools.add_notes(
+        manager, reg, "alice",
+        [NoteInput(deck_name="Default", model_name="Spaced", fields=dict(fields))],
+        allow_duplicates=False,
+    )
+    assert dup.success is False
+    assert "Duplicate check failed" in dup.error
+
+
+@pytest.mark.asyncio
 async def test_add_notes_unknown_model_lists_available(env):
     reg, manager = env
     notes = [NoteInput(deck_name="Default", model_name="No Such Model", fields={"Front": "q"})]
