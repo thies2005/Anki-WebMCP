@@ -1,11 +1,22 @@
 """Multi-user account store for the headless Anki MCP service.
 
-Accounts live in a single JSON file (default ``${DATA_DIR}/users.json``). Only
-derived secret material is persisted: scrypt password hashes and sha256 token
-hashes. Raw MCP tokens and raw passwords are surfaced once at creation time
-and never stored, so the file alone grants nothing to an attacker.
+Accounts live in a single JSON file (default ``${DATA_DIR}/users.json``). Raw
+passwords are never persisted (scrypt hashes only). MCP tokens are persisted
+twice by design:
+
+- ``token_hash`` (sha256): what ``authenticate_token`` verifies against — the
+  constant-time auth path never touches plaintext.
+- ``token_plaintext`` (standard base64 of the raw token): the token portal must
+  RE-display the token on demand, so hash-only storage is not an option; a
+  must-redisplay secret cannot get one-way/scrypt-grade protection. Storing it
+  reversibly in the store file is the accepted trade-off: the file is already
+  0600, lives on the service's data volume, and its bytes are therefore
+  equivalent in sensitivity to the raw tokens themselves. Records created
+  before ``token_plaintext`` existed simply leave it empty; the portal shows
+  "regenerate to view" for them.
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -91,6 +102,21 @@ def hash_token(raw_token: str) -> str:
     return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
 
 
+def _encode_token(raw_token: str) -> str:
+    """base64 form of a raw MCP token for the ``token_plaintext`` field (see module docstring)."""
+    return base64.b64encode(raw_token.encode("utf-8")).decode("ascii")
+
+
+def _decode_token(encoded: str) -> Optional[str]:
+    """Inverse of _encode_token; None when the stored value is absent/corrupt."""
+    if not encoded:
+        return None
+    try:
+        return base64.b64decode(encoded.encode("ascii"), validate=True).decode("utf-8")
+    except (ValueError, TypeError, UnicodeError):
+        return None
+
+
 def _burn_scrypt(password: str) -> None:
     """Do scrypt work against a throwaway hash to flatten timing for unknown users."""
     global _dummy_password_hash
@@ -101,12 +127,18 @@ def _burn_scrypt(password: str) -> None:
 
 @dataclass
 class User:
-    """A single account record. Secrets are stored only in derived form."""
+    """A single account record. Passwords are stored only in derived form.
+
+    ``token_plaintext`` is the reversible base64 form of the MCP token (see the
+    module docstring for why it exists); empty for records created before the
+    field was introduced.
+    """
 
     username: str
     password_hash: str  # format: scrypt$N$r$p$salt_hex$hash_hex
     token_hash: str  # sha256 hex of the raw MCP token
     role: str  # "admin" | "user"
+    token_plaintext: str = ""  # base64 of the raw MCP token; "" for legacy records
     ankiweb_email: str = ""
     ankiweb_password: str = ""
     created_at: float = field(default_factory=time.time)
@@ -156,6 +188,7 @@ class UserStore:
                     password_hash=record["password_hash"],
                     token_hash=record["token_hash"],
                     role=record["role"],
+                    token_plaintext=record.get("token_plaintext", ""),
                     ankiweb_email=record.get("ankiweb_email", ""),
                     ankiweb_password=record.get("ankiweb_password", ""),
                     created_at=float(record.get("created_at", 0.0)),
@@ -204,9 +237,34 @@ class UserStore:
     # -- queries -------------------------------------------------------------
 
     def list_users(self) -> List[User]:
-        """All account records, as copies. Raw tokens are never stored, so none are exposed."""
+        """All account records, as copies. Raw passwords are never stored; the
+        copies carry ``token_plaintext`` if present, so callers must treat them
+        as secret-bearing."""
         with self._lock:
             return [replace(user) for user in self._users.values()]
+
+    def get(self, username: str) -> Optional[User]:
+        """One account record as a copy, or None when the username is unknown.
+
+        Copy semantics mirror list_users: callers can never mutate the store's
+        internal state through the returned record.
+        """
+        with self._lock:
+            user = self._users.get(username)
+            return replace(user) if user is not None else None
+
+    def peek_token(self, username: str) -> Optional[str]:
+        """Return the account's RAW MCP token, or None when unavailable.
+
+        Reads the reversibly-stored ``token_plaintext`` field (see module
+        docstring). Returns None for unknown usernames and for legacy records
+        created before the field existed — the portal renders "regenerate to
+        view" for those. Authentication NEVER depends on this method.
+        """
+        with self._lock:
+            user = self._users.get(username)
+            encoded = user.token_plaintext if user is not None else ""
+        return _decode_token(encoded)
 
     def verify_password(self, username: str, password: str) -> bool:
         with self._lock:
@@ -243,7 +301,9 @@ class UserStore:
     def create_user(self, username: str, password: str, role: str = "user") -> Tuple[User, str]:
         """Create an account; returns ``(user, raw_token)``.
 
-        The raw token is returned exactly once and only its sha256 is stored.
+        The raw token is returned exactly once by this method's return value,
+        but it IS stored (base64 in ``token_plaintext``) so the portal can
+        re-display it; only its sha256 is used for authentication.
         Raises ValueError on duplicate username, invalid username, or invalid role.
         """
         _validate_username(username)
@@ -258,6 +318,7 @@ class UserStore:
                 password_hash=hash_password(password),
                 token_hash=hash_token(raw_token),
                 role=role,
+                token_plaintext=_encode_token(raw_token),
             )
             self._users[username] = user
             self._save_atomic()
@@ -265,11 +326,16 @@ class UserStore:
         return user, raw_token
 
     def regenerate_token(self, username: str) -> str:
-        """Issue a new raw MCP token for the account, invalidating the old one."""
+        """Issue a new raw MCP token for the account, invalidating the old one.
+
+        The raw value is returned for the one-time reveal and stored reversibly
+        (token_plaintext) for later portal display; auth keeps using token_hash.
+        """
         raw_token = secrets.token_urlsafe(TOKEN_BYTES)
         with self._lock:
             user = self._get_locked(username)
             user.token_hash = hash_token(raw_token)
+            user.token_plaintext = _encode_token(raw_token)
             self._save_atomic()
         logger.info("Regenerated MCP token for %r", username)
         return raw_token
@@ -288,6 +354,19 @@ class UserStore:
             user.ankiweb_password = password
             self._save_atomic()
         logger.info("Updated stored AnkiWeb credentials for %r", username)
+
+    def set_role(self, username: str, role: str) -> None:
+        """Promote/demote an account between ``"admin"`` and ``"user"``.
+
+        Raises ValueError for unknown usernames or an invalid role.
+        """
+        if role not in ROLES:
+            raise ValueError(f"Invalid role {role!r}: must be one of {ROLES}")
+        with self._lock:
+            user = self._get_locked(username)
+            user.role = role
+            self._save_atomic()
+        logger.info("Set role of %r to %r", username, role)
 
     def delete_user(self, username: str) -> bool:
         """Remove the account record only; data directories are NOT touched here."""

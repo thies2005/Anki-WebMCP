@@ -194,6 +194,9 @@ def _make_settings(temp_ledger_file, tmp_path) -> Settings:
         mcp_auth_token="secure-token",
         idempotency_ledger_path=temp_ledger_file,
         session_secret=SECRET,
+        # Task 4's portal opens real per-user collections under data_dir on
+        # GET /, so it must not fall back to the ambient default (/data).
+        data_dir=str(tmp_path),
         users_file=str(users_file),
     )
 
