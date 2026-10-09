@@ -36,7 +36,7 @@ jobs:
           cache-dependency-path: docker/mcp-service/requirements.txt
 
       - name: Install dependencies
-        run: pip install -r docker/mcp-service/requirements.txt pytest pytest-asyncio respx
+        run: pip install -r docker/mcp-service/requirements.txt pytest pytest-asyncio
 
       - name: Run test suite
         run: python -m pytest tests/ -q
