@@ -100,6 +100,14 @@ class CollectionRegistry:
         self.max_open_collections = int(max_open_collections)
         self.max_concurrent_syncs = int(max_concurrent_syncs)
         self.backup_retention = int(backup_retention)
+        # Retention < 1 would mean "delete every backup", including the one
+        # sync just wrote; fail loud like Settings does for the same env var.
+        if self.backup_retention < 1:
+            raise ValueError(f"backup_retention must be >= 1, got {self.backup_retention}")
+        if self.max_open_collections < 1:
+            raise ValueError(f"max_open_collections must be >= 1, got {self.max_open_collections}")
+        if self.max_concurrent_syncs < 1:
+            raise ValueError(f"max_concurrent_syncs must be >= 1, got {self.max_concurrent_syncs}")
         # Test seam: the idle sweep compares against this many seconds.
         self._idle_seconds = self.idle_timeout_minutes * 60.0
         self._users: Dict[str, _UserState] = {}
@@ -169,9 +177,14 @@ class CollectionRegistry:
         """True if ``exc`` indicates the handle was closed underneath us.
 
         ``col.close()`` sets ``db = None``; the wheel raises
-        ``InvalidInput("CollectionNotOpen")`` for subsequent use. We check the
-        handle state first and the message as a fallback (covers a backend
-        that died without the attribute being cleared).
+        ``InvalidInput("CollectionNotOpen")`` for subsequent use. The handle
+        check is authoritative; the message substring is a best-effort
+        fallback for a backend that died without the attribute being cleared.
+        Trade-off: an application exception whose text merely CONTAINS
+        "CollectionNotOpen" on a healthy handle would also be classified
+        stale and re-run ``fn`` once. Task 5's tool fns must therefore not
+        surface raw collection-layer exception text as user-supplied input to
+        this discriminator.
         """
         if getattr(col, "db", None) is None:
             return True
