@@ -120,3 +120,45 @@ def test_main_refuses_empty_user_store_without_bootstrap(monkeypatch, tmp_path):
     assert exc_info.value.code == 1
     # Fail-closed: the refusal path must not create the store file or its directory.
     assert not os.path.exists(users_file)
+
+
+@pytest.mark.asyncio
+async def test_first_boot_bootstrap_visible_to_serving_app(monkeypatch, tmp_path):
+    """Regression (found in container smoke): first boot must leave the SERVING
+    app's user store holding the bootstrapped admin.
+
+    The production path is main() bootstrap -> create_app() with NO custom
+    settings, which captures the module-global user_store. An earlier version
+    bootstrapped through a local UserStore, so the app authenticated against
+    the import-time (empty) store and login 401'd until a restart.
+    """
+    import httpx
+    import pytest_asyncio  # noqa: F401  (ensures the plugin is active)
+
+    from src import main as main_module
+
+    users_file = str(tmp_path / "users.json")
+    boot_settings = Settings(
+        session_secret="first-boot-secret",
+        data_dir=str(tmp_path),
+        users_file=users_file,
+        admin_username="root",
+        admin_password="first-boot-pw",
+    )
+    # Simulate the real import-time state: a module-global store over an empty file.
+    monkeypatch.setattr(main_module, "settings", boot_settings)
+    monkeypatch.setattr(main_module, "user_store", __import__("src.users", fromlist=["UserStore"]).UserStore(users_file))
+
+    main_module._bootstrap_first_admin(boot_settings)
+
+    # The serving app is created exactly as main() creates it: no custom settings.
+    app = main_module.create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        res = await client.post(
+            "/login", data={"username": "root", "password": "first-boot-pw"}
+        )
+    assert res.status_code == 303, (
+        "first-boot admin must be able to log in through the serving app "
+        f"(got {res.status_code})"
+    )

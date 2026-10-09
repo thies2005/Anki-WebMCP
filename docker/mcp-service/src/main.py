@@ -1100,6 +1100,35 @@ def create_app(custom_settings: Optional[Settings] = None):
     return app
 
 
+def _bootstrap_first_admin(app_settings: Settings) -> None:
+    """Fail-closed first-boot admin bootstrap, operating on the module-global store.
+
+    MUST rebind the module global (not build a local UserStore): create_app()
+    captures ``user_store`` when called without custom_settings — the production
+    path — so a bootstrap through a local instance would leave the serving app
+    with the import-time (empty on first boot) store. Regression-tested by
+    test_first_boot_bootstrap_visible_to_serving_app.
+    """
+    global user_store
+    user_store = UserStore(app_settings.users_file)
+    if not user_store.list_users():
+        if app_settings.admin_username and app_settings.admin_password:
+            try:
+                user_store.bootstrap_admin(app_settings.admin_username, app_settings.admin_password)
+            except ValueError as e:
+                logger.error("FATAL: cannot bootstrap the initial admin account: %s", e)
+                raise SystemExit(1)
+            logger.info("Bootstrapped initial admin account %r", app_settings.admin_username)
+        else:
+            logger.error(
+                "FATAL: no user accounts exist in %s and no bootstrap credentials are set. "
+                "Set both ADMIN_USERNAME and ADMIN_PASSWORD to create the initial admin "
+                "on first start.",
+                app_settings.users_file,
+            )
+            raise SystemExit(1)
+
+
 def main():
     """Start uvicorn server, refusing unsafe configuration and bootstrapping the first admin."""
     problems = validate_deployment_config(settings)
@@ -1110,26 +1139,10 @@ def main():
 
     # Fail-closed bootstrap: a service with zero user accounts can never
     # authenticate anybody, so it must not come up.
-    user_store = UserStore(settings.users_file)
-    if not user_store.list_users():
-        if settings.admin_username and settings.admin_password:
-            try:
-                user_store.bootstrap_admin(settings.admin_username, settings.admin_password)
-            except ValueError as e:
-                logger.error("FATAL: cannot bootstrap the initial admin account: %s", e)
-                raise SystemExit(1)
-            logger.info("Bootstrapped initial admin account %r", settings.admin_username)
-        else:
-            logger.error(
-                "FATAL: no user accounts exist in %s and no bootstrap credentials are set. "
-                "Set both ADMIN_USERNAME and ADMIN_PASSWORD to create the initial admin "
-                "on first start.",
-                settings.users_file,
-            )
-            raise SystemExit(1)
+    _bootstrap_first_admin(settings)
 
     logger.info("Starting Anki MCP Service on %s:%d (path: %s)", settings.mcp_host, settings.mcp_port, settings.mcp_path)
-    logger.info("Authentication enabled (per-user MCP tokens via %s)", settings.users_file)
+    logger.info("Authentication enabled (per-user MCP tokens via /data/users.json)")
 
     app = create_app()
     uvicorn.run(
