@@ -1,10 +1,13 @@
 """Recovery CLI for the user account store (forgot-password / account audit).
 
 Minimal offline tool — the service itself has no "reset by email" path. Run it
-inside the container so it sees the data volume:
+inside the container so it sees the data volume (stop the service first, see
+below; ``run --rm`` creates a throwaway container instead of exec'ing into the
+stopped one):
 
-    docker compose exec anki-mcp python -m src.useradmin list
-    docker compose exec anki-mcp python -m src.useradmin reset-password alice
+    docker compose run --rm anki-mcp python -m src.useradmin list
+    docker compose run --rm anki-mcp python -m src.useradmin reset-password alice
+    docker compose run --rm anki-mcp python -m src.useradmin set-role alice admin
 
 The store path comes from --users-file or the USERS_FILE environment variable,
 defaulting to /data/users.json (the container path).
@@ -12,7 +15,8 @@ defaulting to /data/users.json (the container path).
 IMPORTANT: stop the service first (``docker compose stop anki-mcp``). The
 running service loads the store once at startup and writes its in-memory copy
 back atomically on every account change, so external edits made while it runs
-are invisible to it and will be overwritten by its next save.
+are invisible to it and will be overwritten by its next save. Start it again
+with ``docker compose start anki-mcp``.
 """
 
 import argparse
@@ -77,6 +81,29 @@ def cmd_reset_password(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_set_role(args: argparse.Namespace) -> int:
+    store = _open_store(args)
+    if args.role not in ("admin", "user"):
+        print(f"ERROR: role must be 'admin' or 'user', got {args.role!r}.", file=sys.stderr)
+        return 1
+    users = store.list_users()
+    if args.username not in {u.username for u in users}:
+        print(f"ERROR: unknown username: {args.username!r}", file=sys.stderr)
+        return 1
+    if args.role != "admin" and not any(
+        u.role == "admin" and u.username != args.username for u in users
+    ):
+        print(
+            f"ERROR: cannot demote {args.username!r}: it is the last admin account. "
+            "Promote another account to admin first.",
+            file=sys.stderr,
+        )
+        return 1
+    store.set_role(args.username, args.role)
+    print(f"Role of {args.username!r} set to {args.role}.")
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m src.useradmin",
@@ -85,7 +112,7 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--users-file",
         default="",
-        help="Path to users.json (default: $USERS_FILE or %(default)s).",
+        help="Path to users.json (default: the USERS_FILE env var, else /data/users.json).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -94,10 +121,18 @@ def main(argv=None) -> int:
     p_reset = sub.add_parser("reset-password", help="Set a new password for an account.")
     p_reset.add_argument("username", help="Account to update.")
 
+    p_role = sub.add_parser(
+        "set-role", help="Set an account's role (admin|user) — the lockout recovery path."
+    )
+    p_role.add_argument("username", help="Account to update.")
+    p_role.add_argument("role", choices=["admin", "user"], help="New role.")
+
     args = parser.parse_args(argv)
     if args.command == "list":
         return cmd_list(args)
-    return cmd_reset_password(args)
+    if args.command == "reset-password":
+        return cmd_reset_password(args)
+    return cmd_set_role(args)
 
 
 if __name__ == "__main__":

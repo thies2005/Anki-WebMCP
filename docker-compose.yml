@@ -23,14 +23,19 @@ services:
       - MAX_CONCURRENT_SYNCS=${MAX_CONCURRENT_SYNCS:-2}
       - BACKUP_RETENTION=${BACKUP_RETENTION:-5}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Set true when serving HTTPS through a reverse proxy so session/flash
+      # cookies carry the Secure attribute.
+      - FORCE_SECURE_COOKIES=${FORCE_SECURE_COOKIES:-false}
     volumes:
       - mcp_data:/data
     ports:
-      # Port 8000 serves /mcp, the token portal, and /admin. For a purely local
-      # setup, bind to loopback instead: "127.0.0.1:8000:8000". For public
-      # exposure, keep TLS termination in front (see the exposure-mode override
-      # files: Cloudflare Tunnel or Coolify HTTPS reverse proxy).
-      - "8000:8000"
+      # Secure by default: bind to loopback only, so the portal/admin (which
+      # serve tokens and credentials) are never exposed to the LAN unprotected.
+      # To expose the port (e.g. on your LAN), add your own compose overlay
+      # overriding `ports:` — the `!override` pattern in the cloudflare/coolify
+      # files shows how. The README's recommended exposure modes (Cloudflare
+      # tunnel / reverse proxy) are unaffected by this binding.
+      - "127.0.0.1:8000:8000"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 30s

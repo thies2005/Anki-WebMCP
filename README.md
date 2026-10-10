@@ -328,11 +328,13 @@ All tools operate on the **authenticated user's** collection — the token decid
    - Unknown paths require a valid token; only `/health` and the web-session routes are exempt.
 4. **Web Sessions**:
    - Signed, `HttpOnly`, `SameSite=Strict` session cookies; every state-changing form carries a CSRF token bound to the session.
+   - When the portal is served over HTTPS through a reverse proxy, set `FORCE_SECURE_COOKIES=true` so session and flash cookies carry the `Secure` attribute (never sent over plain HTTP).
    - Deleting an account invalidates its token immediately (auth checks the store on every MCP request).
 5. **Documented trade-offs (read before exposing publicly)**:
    - The portal **re-displays the raw MCP token** on demand, so tokens are stored **reversibly** in `users.json` — a must-redisplay secret cannot be hash-only. The file is `0600` on the service's volume, whose bytes are therefore token-grade sensitive. Records from before this field existed show "regenerate to view" until the token is regenerated.
    - **AnkiWeb credentials are also stored at rest** in the same `users.json` (the service must be able to sync unattended). Same file, same caveats: anyone who can read the volume can read them.
    - The service enforces a **single writer per collection**: do not open the same `/data/users/<name>/collection.anki2` from another Anki instance.
+   - **Rate limiting is keyed by (username, source IP) with a proxy caveat**: the service scopes lockouts by `request.client.host`. Behind a reverse proxy or Cloudflare tunnel that address is the proxy's IP, so lockout is effectively per-username — anyone who knows a username can keep its login locked (15 min per run of 5 failures). Directly exposed instances get true per-IP scoping.
    - **HTTPS is required in front of the portal** for any non-localhost access (logins and tokens cross the wire). Use the Cloudflare or Coolify exposure modes, or your own TLS reverse proxy.
    - `/health` is intentionally unauthenticated; it reports only liveness/degradation state, never collection data.
    - In Cloudflare Tunnel mode, ingress rules live in the Cloudflare dashboard — route only port 8000.
@@ -357,7 +359,7 @@ All tools operate on the **authenticated user's** collection — the token decid
 - **Tool errors mention collection locks**: another process is writing the same `collection.anki2` (second replica, or a desktop Anki pointed at the volume). The service enforces one writer per collection — remove the competing writer.
 - **Sync warnings about credentials / auth**: the user's AnkiWeb credentials are missing or were rejected — re-enter them in the portal (Credentials) and sync again.
 - **A retry unexpectedly says `Previous attempt with this idempotency key failed`**: the key was recorded as `failed` after an ambiguous loss. Use a new idempotency key; old entries age out of the 1000-entry ledger.
-- **`Bind for 0.0.0.0:8000 failed: port already allocated`**: another service holds the port — change the published port in `docker-compose.yml`.
+- **`Bind for 127.0.0.1:8000 failed: port already allocated`**: another service holds the port — change the published port in `docker-compose.yml`.
 - **After upgrading the image, older Anki clients complain**: the pinned `anki` wheel version defines the collection schema; see the upgrade notes in [Operations](#operations).
 
 ---

@@ -401,3 +401,83 @@ async def test_set_role_with_invalid_role_rejected(client):
     )
     assert res.status_code == 400
     assert "Could not set role" in res.text
+
+
+# ---------------------------------------------------------------------------
+# Last-admin guard (final review): demoting or deleting the sole admin is a
+# one-misclick total lockout of the admin surface — the routes must refuse.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cannot_demote_last_admin(client):
+    _login(client, "root")  # root is the only admin in the fixture store
+    page = await client.get("/admin")
+    csrf = _csrf_from(page.text)
+    res = await client.post(
+        "/admin/set-role", data={"csrf_token": csrf, "username": "root", "role": "user"}
+    )
+    assert res.status_code == 400
+    assert "last admin" in res.text
+
+
+@pytest.mark.asyncio
+async def test_cannot_delete_last_admin(client, tmp_path):
+    _login(client, "root")
+    page = await client.get("/admin")
+    csrf = _csrf_from(page.text)
+    res = await client.post(
+        "/admin/delete-user",
+        data={
+            "csrf_token": csrf,
+            "username": "root",
+            "confirm_username": "root",
+        },
+    )
+    assert res.status_code == 400
+    assert "last admin" in res.text
+    disk_store = await _fresh_store(tmp_path)
+    assert disk_store.get("root") is not None
+
+
+@pytest.mark.asyncio
+async def test_demoting_deleting_non_last_admin_still_works(client, tmp_path):
+    _login(client, "root")
+    # Promote alice so root is no longer the last admin.
+    page = await client.get("/admin")
+    csrf = _csrf_from(page.text)
+    res = await client.post(
+        "/admin/set-role", data={"csrf_token": csrf, "username": "alice", "role": "admin"}
+    )
+    assert res.status_code == 303
+
+    # Now demoting root must succeed.
+    page = await client.get("/admin")
+    csrf = _csrf_from(page.text)
+    res = await client.post(
+        "/admin/set-role", data={"csrf_token": csrf, "username": "root", "role": "user"}
+    )
+    assert res.status_code == 303
+    disk_store = await _fresh_store(tmp_path)
+    assert disk_store.get("root").role == "user"
+    assert disk_store.get("alice").role == "admin"
+
+    # Deleting a non-last admin must succeed too. Re-login as alice (the only
+    # admin now — root was just demoted), promote root back, then delete alice.
+    _login(client, "alice")
+    page = await client.get("/admin")
+    csrf = _csrf_from(page.text)
+    res = await client.post(
+        "/admin/set-role", data={"csrf_token": csrf, "username": "root", "role": "admin"}
+    )
+    assert res.status_code == 303
+    page = await client.get("/admin")
+    csrf = _csrf_from(page.text)
+    res = await client.post(
+        "/admin/delete-user",
+        data={"csrf_token": csrf, "username": "alice", "confirm_username": "alice"},
+    )
+    assert res.status_code == 303
+    disk_store = await _fresh_store(tmp_path)
+    assert disk_store.get("alice") is None
+    assert disk_store.get("root").role == "admin"

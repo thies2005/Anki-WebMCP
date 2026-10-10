@@ -720,6 +720,12 @@ def create_app(custom_settings: Optional[Settings] = None):
     # create_app()'s (same pattern as registry_to_close further down).
     portal_registry = collection_registry
 
+    # Same capture pattern for the settings object: the handlers below must
+    # sign/verify cookies and archive data dirs with THIS app's settings, so a
+    # later create_app(custom_settings=...) rebind of the module global cannot
+    # reach into already-serving apps.
+    app_settings = settings
+
     def get_session_user(request: Request) -> Optional[User]:
         """Resolve the anki_session cookie to an account, or None.
 
@@ -731,7 +737,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         session_value = request.cookies.get(SESSION_COOKIE_NAME)
         if not session_value:
             return None
-        username = verify_session(settings.session_secret, session_value)
+        username = verify_session(app_settings.session_secret, session_value)
         if username is None:
             return None
         return store.get(username)
@@ -757,7 +763,7 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     def _peek_flash(request: Request) -> Optional[Tuple[str, str]]:
         raw = request.cookies.get(FLASH_COOKIE_NAME)
-        return verify_flash(settings.session_secret, raw) if raw else None
+        return verify_flash(app_settings.session_secret, raw) if raw else None
 
     def _clear_flash(response: Response) -> None:
         response.delete_cookie(FLASH_COOKIE_NAME, path="/", secure=secure_cookies_enabled())
@@ -766,7 +772,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         response = RedirectResponse(url, status_code=303)
         response.set_cookie(
             FLASH_COOKIE_NAME,
-            issue_flash(settings.session_secret, message, kind),
+            issue_flash(app_settings.session_secret, message, kind),
             max_age=FLASH_TTL_SECONDS,
             path="/",
             httponly=True,
@@ -805,7 +811,7 @@ def create_app(custom_settings: Optional[Settings] = None):
             response = RedirectResponse("/", status_code=303)
             response.set_cookie(
                 SESSION_COOKIE_NAME,
-                issue_session(settings.session_secret, username),
+                issue_session(app_settings.session_secret, username),
                 max_age=SESSION_TTL_SECONDS,
                 path="/",
                 httponly=True,
@@ -999,6 +1005,20 @@ def create_app(custom_settings: Optional[Settings] = None):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
         username = str(form.get("username", "")).strip()
         role = str(form.get("role", ""))
+        # Last-admin guard: count admins from the store BEFORE applying, so a
+        # demotion can never remove the only admin account (the service would
+        # be unadministerable; recovery would need the offline useradmin CLI).
+        target = store.get(username)
+        if (
+            target is not None
+            and target.role == "admin"
+            and role != "admin"
+            and sum(1 for u in store.list_users() if u.role == "admin") <= 1
+        ):
+            return _bad_request(
+                f"Cannot demote {username}: it is the last admin account. "
+                "Promote another account to admin first."
+            )
         try:
             await run_in_threadpool(store.set_role, username, role)
         except ValueError as e:
@@ -1021,12 +1041,22 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _bad_request(
                 "Deletion not confirmed: type the account's username exactly to confirm."
             )
-        if store.get(username) is None:
+        target = store.get(username)
+        if target is None:
             return _bad_request(f"Unknown user: {username}")
+        # Last-admin guard, counted from the store BEFORE any change: deleting
+        # the only admin would leave the service unadministerable (recovery
+        # would need the offline useradmin CLI). Checked before archiving so a
+        # refused deletion moves no data either.
+        if target.role == "admin" and sum(1 for u in store.list_users() if u.role == "admin") <= 1:
+            return _bad_request(
+                f"Cannot delete {username}: it is the last admin account. "
+                "Promote another account to admin first."
+            )
         try:
             # Archive FIRST: if the rename fails, the account record stays put
             # rather than losing a user whose data could not be moved aside.
-            archive_path = _archive_user_data(settings.data_dir, username)
+            archive_path = _archive_user_data(app_settings.data_dir, username)
         except (OSError, ValueError) as e:
             logger.error("Failed to archive data directory for %r: %s", username, e)
             return _bad_request(f"Deletion failed while archiving data: {e}")

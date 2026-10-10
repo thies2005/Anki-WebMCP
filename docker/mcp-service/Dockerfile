@@ -9,9 +9,10 @@ LABEL org.opencontainers.image.description="Headless multi-user Anki MCP server 
 
 WORKDIR /app
 
-# Install curl for healthchecks
+# Install curl for healthchecks; tzdata so the documented TZ env var works for
+# non-UTC zones (created-at timestamps, log times).
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl && \
+    apt-get install -y --no-install-recommends curl tzdata && \
     rm -rf /var/lib/apt/lists/*
 
 # Install python dependencies

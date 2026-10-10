@@ -1,4 +1,29 @@
-"""Persistent idempotency ledger for operation deduplication across restarts."""
+"""Persistent idempotency ledger for operation deduplication across restarts.
+
+The headless service runs one ledger PER USER, at
+``<data_dir>/ledgers/<username>/ledger.json`` (managed by
+:class:`src.collections.CollectionRegistry.ledger`). Each write mutation
+carrying an ``idempotency_key`` follows a per-user, lock-serialized cycle:
+
+    1. Check the key in this ledger; a committed record replays the cached
+       result, a failed record rejects the retry (no re-apply).
+    2. Apply the mutation locally under the user's collection lock.
+    3. Commit the record to this ledger (flushed atomically to disk).
+
+AnkiWeb synchronization is EXPLICIT and separate (``sync_collection`` / the
+portal's Sync button) — mutations never auto-sync. If an explicit sync drops
+mid-transfer with an unknown outcome, the outcome is surfaced as
+``outcome_unknown`` and NO record is written for the key (ambiguous-outcome
+no-record semantics): a poisoned record could hide a half-applied mutation, so
+the caller is told to verify collection state before retrying. Deterministic
+failures (e.g. duplicate rejection) do persist a ``failed`` record.
+
+GROWTH LIMIT:
+The ledger keeps at most MAX_ENTRIES (default 1000) most-recent keys,
+evicting the oldest first, so the file cannot grow without bound.
+Single-instance assumption: the lock is process-internal; run exactly
+one mcp-service replica per ledger file.
+"""
 
 import asyncio
 from datetime import datetime, timezone
@@ -16,25 +41,21 @@ MAX_ENTRIES = 1000
 class IdempotencyLedger:
     """Thread- and coroutine-safe persistent store for idempotency keys.
 
-    CRASH-WINDOW LIMITATION DOCUMENTATION:
-    The mutation lifecycle follows:
-      1. Pre-sync with AnkiWeb.
-      2. Execute local write in Anki Desktop (Anki commits to its SQLite database).
-      3. Commit record to this Idempotency Ledger (flushed atomically to disk).
-      4. Post-sync with AnkiWeb.
+    One instance per user, persisted at ``<data_dir>/ledgers/<username>/ledger.json``
+    (see the module docstring for the check -> mutate -> record cycle and the
+    ambiguous-outcome no-record semantics for explicit syncs).
 
-    If the worker crashes or loses power between step 2 (Anki DB write) and step 3
-    (ledger commit), the ledger will not contain the key upon restart. On retry:
+    CRASH-WINDOW LIMITATION DOCUMENTATION:
+    The record is committed only AFTER the collection write completes (step 3
+    above), so a crash or power loss between the collection write and the
+    ledger commit leaves no record. On retry the mutation re-applies:
       - For notes, Anki's built-in first-field duplicate checking ('canAddNotes') will
         detect and reject accidental duplicate creation if allowDuplicate is False.
       - If duplicates were explicitly allowed, a duplicated note could be created in this
         narrow crash window.
 
-    GROWTH LIMIT:
-    The ledger keeps at most MAX_ENTRIES (default 1000) most-recent keys,
-    evicting the oldest first, so the file cannot grow without bound.
-    Single-instance assumption: the lock is process-internal; run exactly
-    one mcp-service replica per ledger file.
+    GROWTH LIMIT and the single-instance assumption: see the module docstring
+    (at most MAX_ENTRIES most-recent keys; process-internal lock).
     """
 
     def __init__(self, file_path: str, max_entries: int = MAX_ENTRIES):

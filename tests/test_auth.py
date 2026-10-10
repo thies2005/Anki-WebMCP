@@ -237,3 +237,31 @@ async def test_regenerated_token_replaces_old_one(app, store):
                 json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
             )
             assert new_res.status_code != 401
+
+
+# -- route/exempt parity (final review): lock the allowlist against drift ------------
+
+
+@pytest.mark.asyncio
+async def test_web_route_table_matches_auth_exempt_set(app):
+    """Every registered web route must be in the middleware's exempt set.
+
+    The allowlist fails CLOSED on unknown paths (401), so a new web route
+    added without updating WEB_AUTH_PATHS would 401 the whole web UI — this
+    parity test turns that silent drift into a loud failure. /mcp and
+    /health must never be in the exempt set.
+    """
+    from starlette.routing import Route
+
+    from src.auth import WEB_AUTH_PATHS
+
+    web_paths = {
+        r.path for r in app.routes if isinstance(r, Route) and r.path not in ("/mcp", "/health")
+    }
+    assert web_paths == set(WEB_AUTH_PATHS), (
+        f"route/exempt drift: routes not exempt (would 401): "
+        f"{sorted(web_paths - set(WEB_AUTH_PATHS))}; exempt entries with no route: "
+        f"{sorted(set(WEB_AUTH_PATHS) - web_paths)}"
+    )
+    assert "/mcp" not in WEB_AUTH_PATHS
+    assert "/health" not in WEB_AUTH_PATHS
