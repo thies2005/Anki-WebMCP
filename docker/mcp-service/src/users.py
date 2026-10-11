@@ -147,6 +147,13 @@ class User:
     # rejected. Bumped by set_password so a password reset evicts outstanding
     # sessions. 0.0 (legacy records, no reset yet) accepts every cookie.
     sessions_invalid_before: float = 0.0
+    # Token/grant-revocation epoch: OAuth refresh grants (src/oauth.py) issued
+    # BEFORE this value are rejected at rotation. Bumped by regenerate_token
+    # so regenerating the MCP token also evicts outstanding connector grants
+    # (they would otherwise keep minting the fresh token forever). Password
+    # resets evict grants too, via sessions_invalid_before above. 0.0 accepts
+    # every grant (legacy records).
+    tokens_invalid_before: float = 0.0
 
 
 class UserStore:
@@ -201,6 +208,9 @@ class UserStore:
                     # existed simply start with "no revocation" (0.0).
                     sessions_invalid_before=float(
                         record.get("sessions_invalid_before", 0.0)
+                    ),
+                    tokens_invalid_before=float(
+                        record.get("tokens_invalid_before", 0.0)
                     ),
                 )
             except (KeyError, TypeError, ValueError) as e:
@@ -349,14 +359,18 @@ class UserStore:
 
         The raw value is returned for the one-time reveal and stored reversibly
         (token_plaintext) for later portal display; auth keeps using token_hash.
+        Regeneration also stamps the token epoch: OAuth refresh grants issued
+        before now are rejected at their next rotation, so a leaked connector
+        grant cannot keep minting the fresh token.
         """
         raw_token = secrets.token_urlsafe(TOKEN_BYTES)
         with self._lock:
             user = self._get_locked(username)
             user.token_hash = hash_token(raw_token)
             user.token_plaintext = _encode_token(raw_token)
+            user.tokens_invalid_before = time.time()
             self._save_atomic()
-        logger.info("Regenerated MCP token for %r", username)
+        logger.info("Regenerated MCP token for %r (older OAuth grants invalidated)", username)
         return raw_token
 
     def set_password(self, username: str, new_password: str) -> None:

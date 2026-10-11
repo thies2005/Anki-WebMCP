@@ -19,9 +19,26 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from .config import Settings, get_settings
+from .oauth import public_base_url
 from .users import UserStore
 
 logger = logging.getLogger("anki_mcp.auth")
+
+# OAuth 2.1 endpoints (src/oauth.py) are exempt as well: discovery metadata is
+# public by design, /register mints only a client record, /oauth/authorize
+# enforces the portal session cookie itself, and /oauth/token authenticates
+# through PKCE-proven codes and rotating refresh tokens instead of bearer
+# tokens. Kept as a separate named set so the route/exempt parity test can
+# pin both groups against the registered route table.
+OAUTH_AUTH_PATHS = frozenset(
+    {
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-authorization-server",
+        "/register",
+        "/oauth/authorize",
+        "/oauth/token",
+    }
+)
 
 # Web routes authenticate with session cookies and run their own CSRF checks
 # (Task 2/4), so the bearer-token middleware must not guard them. Kept as an
@@ -40,8 +57,22 @@ WEB_AUTH_PATHS = frozenset(
         "/admin/regenerate-token",
         "/admin/set-role",
         "/admin/delete-user",
+        *OAUTH_AUTH_PATHS,
     }
 )
+
+
+def _bearer_challenge(request: Request) -> str:
+    """RFC 9728 WWW-Authenticate challenge for a rejected MCP request.
+
+    OAuth-capable clients (claude.ai connectors) read ``resource_metadata``
+    from this header to discover the authorization server that can mint them
+    a token; plain API-key clients ignore the extra parameter harmlessly.
+    """
+    return (
+        "Bearer resource_metadata="
+        f'"{public_base_url(request)}/.well-known/oauth-protected-resource"'
+    )
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -75,7 +106,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return JSONResponse(
                 status_code=401,
                 content={"error": "Unauthorized: Missing authentication token (Authorization: Bearer <token> or X-API-Key)"},
-                headers={"WWW-Authenticate": "Bearer"},
+                headers={"WWW-Authenticate": _bearer_challenge(request)},
             )
 
         # sha256 + in-memory scan (no I/O, no scrypt): safe to run inline.
@@ -85,7 +116,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return JSONResponse(
                 status_code=401,
                 content={"error": "Unauthorized: Invalid authentication token"},
-                headers={"WWW-Authenticate": "Bearer"},
+                headers={"WWW-Authenticate": _bearer_challenge(request)},
             )
 
         # Travel with the ASGI scope (scope["state"]) into the MCP SDK's

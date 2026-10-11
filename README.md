@@ -253,9 +253,15 @@ Git-based deploys work too: add the resource from this repository with the compo
 AI clients connect over the **Remote Streamable HTTP transport** at `/mcp`. **Every user uses their own token** from the portal — the token identifies which collection the tools operate on. Both `Authorization: Bearer <token>` and `X-API-Key: <token>` headers are accepted.
 
 ### Claude.ai (custom connector)
-Settings -> Connectors -> Add custom connector:
-- **URL**: `https://anki-mcp.yourdomain.com/mcp`
-- **Authentication**: add the header `Authorization: Bearer <user-token-from-portal>`
+claude.ai connectors only support OAuth authentication, and the service implements the MCP authorization spec for exactly that (OAuth 2.1 authorization-code + PKCE, RFC 7591 dynamic client registration, rotating refresh tokens):
+
+1. Settings -> Connectors -> **Add custom connector**:
+   - **URL**: `https://anki-mcp.yourdomain.com/mcp`
+   - **Authentication**: **OAuth 2.0** — leave "Use Claude's published identity"; no client credentials needed.
+2. Click **Connect**: Claude opens the service's sign-in page. Sign in as the user whose collection Claude should operate on and click **Allow** on the consent screen.
+3. The connector's access token **is** that user's MCP token; tools run against that user's collection only.
+
+**Revoking a connector:** regenerate the user's MCP token in the portal (outstanding connector grants die at their next refresh), or change the user's password. Both also evict all of the user's grants issued before the change.
 
 ### Claude Desktop
 
@@ -326,10 +332,15 @@ All tools operate on the **authenticated user's** collection — the token decid
    - `Authorization: Bearer <token>` and `X-API-Key: <token>` are the only accepted transports for the token (never query parameters).
    - Unknown paths require a valid token; only `/health` and the web-session routes are exempt.
 4. **Web Sessions**:
-   - Signed, `HttpOnly`, `SameSite=Strict` session cookies; every state-changing form carries a CSRF token bound to the session.
+   - Signed, `HttpOnly` session cookies; every state-changing form carries a CSRF token bound to the session. The session cookie is `SameSite=Lax` (not strict) so the OAuth authorize flow — a cross-site top-level GET from the connector's host (e.g. claude.ai) — sees an existing session; cross-site POSTs never carry the cookie, and the login/consent forms are CSRF-protected on top.
    - When the portal is served over HTTPS through a reverse proxy, set `FORCE_SECURE_COOKIES=true` so session and flash cookies carry the `Secure` attribute (never sent over plain HTTP).
    - Deleting an account invalidates its token immediately (auth checks the store on every MCP request).
-5. **Documented trade-offs (read before exposing publicly)**:
+5. **OAuth authorization server** (for claude.ai custom connectors):
+   - RFC 7591 dynamic registration is open but bounded: at most 250 client records, name/URI fields length-capped, request bodies capped at 64 KiB before parsing (the OAuth endpoints are reachable without a token by design).
+   - Authorization codes are single-use, 60-second, PKCE-S256-bound, in-memory only. Refresh tokens are persisted only as sha256 hashes, capped at 10 per user, and rotated on every use — replaying one burns it.
+   - The consent screen requires a live portal session (account must exist and predate no revocation epoch) and shows the redirect destination's host, since the client name is attacker-choosable under open registration.
+   - Grant eviction: changing the user's password or regenerating the user's MCP token rejects all of that user's outstanding grants at their next refresh — a leaked connector cannot keep minting fresh tokens.
+6. **Documented trade-offs (read before exposing publicly)**:
    - The portal **re-displays the raw MCP token** on demand, so tokens are stored **reversibly** in `users.json` — a must-redisplay secret cannot be hash-only. The file is `0600` on the service's volume, whose bytes are therefore token-grade sensitive. Records from before this field existed show "regenerate to view" until the token is regenerated.
    - **AnkiWeb credentials are also stored at rest** in the same `users.json` (the service must be able to sync unattended). Same file, same caveats: anyone who can read the volume can read them.
    - The service enforces a **single writer per collection**: do not open the same `/data/users/<name>/collection.anki2` from another Anki instance.
@@ -337,7 +348,7 @@ All tools operate on the **authenticated user's** collection — the token decid
    - **HTTPS is required in front of the portal** for any non-localhost access (logins and tokens cross the wire). Use the Cloudflare or Coolify exposure modes, or your own TLS reverse proxy.
    - `/health` is intentionally unauthenticated; it reports only liveness/degradation state, never collection data.
    - In Cloudflare Tunnel mode, ingress rules live in the Cloudflare dashboard — route only port 8000.
-6. **Log Redaction**: automatic filters mask Authorization headers, bearer tokens, passwords, API keys, and AnkiWeb credentials before writing to container logs.
+7. **Log Redaction**: automatic filters mask Authorization headers, bearer tokens, passwords, API keys, and AnkiWeb credentials before writing to container logs.
 
 ---
 

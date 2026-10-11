@@ -395,7 +395,10 @@ async def test_login_success_sets_signed_cookie_and_redirects(client):
     assert f"{SESSION_COOKIE_NAME}=" in set_cookie
     lowered = set_cookie.lower()
     assert "httponly" in lowered
-    assert "samesite=strict" in lowered
+    # Lax (not strict): the OAuth authorize flow arrives as a cross-site
+    # top-level GET from the connector host; strict would force a re-login on
+    # every connector link. Cross-site POSTs still never carry the cookie.
+    assert "samesite=lax" in lowered
     assert "path=/" in lowered
     # The issued cookie must verify under the same session secret.
     cookie_value = client.cookies.get(SESSION_COOKIE_NAME)

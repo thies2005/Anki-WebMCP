@@ -24,6 +24,7 @@ from .collections import CollectionRegistry
 from .config import Settings, get_settings, load_or_create_session_secret, validate_deployment_config
 from .logging_util import setup_logging
 from .models import AddNotesInput, AddTagsInput, GetNoteInput, SearchNotesInput, UpdateNoteFieldsInput
+from .oauth import OAuthStore, add_oauth_routes
 from .sync_manager import SyncManager
 from .tools import decks as deck_tools
 from .tools import notes as note_tools
@@ -293,13 +294,35 @@ def _page(title: str, body: str, css: str = _PAGE_CSS, main_class: str = "") -> 
 </html>"""
 
 
-def _login_page(error: Optional[str] = None, prelogin_token: str = "") -> str:
+def _safe_next(candidate: object) -> Optional[str]:
+    """A validated same-origin return path for post-login redirects, or None.
+
+    Only site-absolute paths qualify ("/…", never "//…" or scheme-ful URLs),
+    so a `next` parameter can never turn /login into an open redirector. Used
+    by the OAuth authorize flow to send a freshly signed-in user back to the
+    consent screen instead of stranding them on the portal home.
+    """
+    if not isinstance(candidate, str) or not candidate.startswith("/"):
+        return None
+    if candidate.startswith("//") or len(candidate) > 512 or "\\" in candidate:
+        return None
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in candidate):
+        return None
+    return candidate
+
+
+def _login_page(
+    error: Optional[str] = None, prelogin_token: str = "", next_path: Optional[str] = None
+) -> str:
     error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
+    next_input = (
+        f'\n  <input type="hidden" name="next" value="{html.escape(next_path)}">' if next_path else ""
+    )
     return _page(
         "Anki MCP - Sign in",
         f"""<h1>Sign in</h1>
 <form method="post" action="/login">
-  <input type="hidden" name="{PRELOGIN_FIELD_NAME}" value="{html.escape(prelogin_token)}">
+  <input type="hidden" name="{PRELOGIN_FIELD_NAME}" value="{html.escape(prelogin_token)}">{next_input}
   <label for="username">Username</label>
   <input id="username" name="username" autocomplete="username" autofocus required>
   <label for="password">Password</label>
@@ -958,17 +981,21 @@ def create_app(custom_settings: Optional[Settings] = None):
     def _bad_request(message: str, back_href: str = "/admin", back_label: str = "Back to admin") -> HTMLResponse:
         return HTMLResponse(_message_page(message, back_href, back_label), status_code=400)
 
-    def _login_form_response(error: Optional[str] = None, status_code: int = 200) -> HTMLResponse:
+    def _login_form_response(
+        error: Optional[str] = None, status_code: int = 200, next_path: Optional[str] = None
+    ) -> HTMLResponse:
         """Render the login form together with a FRESH prelogin CSRF pair.
 
         The nonce|MAC value goes into the hidden form field and into the
         anki_prelogin cookie (HttpOnly, SameSite=strict, path=/login) — the
         browser must echo both back on POST. Re-issued on every render,
         including the 401 re-render, so a mistyped password does not strand
-        the user with a stale pair.
+        the user with a stale pair. ``next_path`` (already validated by
+        _safe_next) rides along as a hidden field so the OAuth consent flow
+        survives a failed first attempt.
         """
         token = _issue_prelogin(app_settings.session_secret)
-        response = HTMLResponse(_login_page(error, token), status_code=status_code)
+        response = HTMLResponse(_login_page(error, token, next_path), status_code=status_code)
         response.set_cookie(
             PRELOGIN_COOKIE_NAME,
             token,
@@ -981,9 +1008,10 @@ def create_app(custom_settings: Optional[Settings] = None):
         return response
 
     async def login_page(request: Request) -> Response:
+        nxt = _safe_next(request.query_params.get("next"))
         if get_session_user(request) is not None:
-            return RedirectResponse("/", status_code=303)
-        return _login_form_response()
+            return RedirectResponse(nxt or "/", status_code=303)
+        return _login_form_response(next_path=nxt)
 
     async def login_submit(request: Request) -> Response:
         # Body cap BEFORE the form parse: starlette's per-field caps do not
@@ -993,6 +1021,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         if _body_too_large(request):
             return HTMLResponse(_message_page("Request body too large."), status_code=413)
         form = await request.form()
+        nxt = _safe_next(form.get("next"))
         # Login CSRF first — ahead of the rate limiter and any password work:
         # a cross-site forged POST can neither read the prelogin cookie (Same-
         # Site=strict + HttpOnly) nor know the form field value, so it is
@@ -1028,22 +1057,32 @@ def create_app(custom_settings: Optional[Settings] = None):
                 valid = await run_in_threadpool(store.verify_password, username, password)
         if valid:
             login_rate_limiter.record_success(username, ip)
-            response = RedirectResponse("/", status_code=303)
+            response = RedirectResponse(nxt or "/", status_code=303)
             response.set_cookie(
                 SESSION_COOKIE_NAME,
                 issue_session(app_settings.session_secret, username),
                 max_age=SESSION_TTL_SECONDS,
                 path="/",
                 httponly=True,
-                samesite="strict",
+                # Lax (not strict): the OAuth authorize flow arrives as a
+                # cross-site TOP-LEVEL GET from the connector's host (e.g.
+                # claude.ai), and strict would withhold the session cookie
+                # there — every connector link would force a fresh login. Lax
+                # still withholds the cookie on cross-site POSTs, and every
+                # state-changing form carries a session-bound CSRF token, so
+                # the CSRF posture is unchanged.
+                samesite="lax",
                 secure=secure_cookies_enabled(),
             )
             logger.info("Web session issued for %r from %s", username, ip)
             return response
         login_rate_limiter.record_failure(username, ip)
         # Generic message: identical for unknown usernames and wrong passwords.
-        # The retry form ships with a fresh prelogin pair.
-        return _login_form_response("Invalid username or password.", status_code=401)
+        # The retry form ships with a fresh prelogin pair (and the pending
+        # next-path, so an OAuth flow survives a mistyped password).
+        return _login_form_response(
+            "Invalid username or password.", status_code=401, next_path=nxt
+        )
 
     async def index_page(request: Request) -> Response:
         user, err = _require_session(request)
@@ -1370,6 +1409,15 @@ def create_app(custom_settings: Optional[Settings] = None):
     app.add_route("/admin/set-role", admin_set_role, methods=["POST"])
     app.add_route("/admin/delete-user", admin_delete_user, methods=["POST"])
 
+    # -- OAuth 2.1 authorization server (claude.ai custom connectors) ---------
+    # Discovery, dynamic client registration, the consent-gated authorize
+    # flow, and the token endpoint live in src/oauth.py. The store is
+    # constructed HERE (never at module scope), exactly once per app and
+    # bound to this app's settings/data dir — same capture discipline as
+    # portal_registry/app_settings above.
+    oauth_store = OAuthStore(os.path.join(app_settings.data_dir, "oauth_state.json"))
+    add_oauth_routes(app, oauth_store, user_store, app_settings)
+
     # Per-user token auth for the MCP surface; the web routes above are in the
     # middleware's explicit exempt allowlist (they carry their own session-
     # cookie authentication) along with /health and OPTIONS.
@@ -1378,6 +1426,7 @@ def create_app(custom_settings: Optional[Settings] = None):
     # Introspection handles for tests/ops: the registry and store THIS app owns.
     app.state.anki_registry = collection_registry
     app.state.anki_store = store
+    app.state.anki_oauth_store = oauth_store
 
     # Per-user collection lifecycle (Task 3): a background task closes
     # collections idle beyond idle_timeout_minutes every minute, and shutdown
