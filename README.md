@@ -336,6 +336,8 @@ All tools operate on the **authenticated user's** collection — the token decid
 | `list_media_files` | `limit?: int (default 200)` | Lists media filenames (sorted), capped at the requested limit. |
 | `preview_note_type_change` | `new_note_type: string`<br>`note_ids?: list[int]`<br>`query?: string` (exactly one of note_ids/query) | Read-only preview of a note-type change: old/new type names, the resolved field/template mapping, and warnings listing every old field whose content would be discarded and every old template whose cards would be deleted. Run this before `change_note_type`. |
 | `change_note_type` | `new_note_type: string`<br>`note_ids?: list[int]` (1-2000) or `query?: string`<br>`field_map?: map`<br>`template_map?: map`<br>`confirm: bool`<br>`idempotency_key?: string` | Moves notes to another note type with an explicit field/template mapping (new name → old name, or null to discard; omitted maps use the positional default). Unmapped old content is **discarded** and cards regenerate on the new type. *Destructive — see note below.* |
+| `find_and_replace` | `search: string`<br>`replacement?: string` (0-10000)<br>`note_ids?: list[int]` (1-2000) or `query?: string`<br>`regex?: bool`<br>`field_name?: string`<br>`match_case?: bool` | Bulk find-and-replace across the fields of many notes at once (selections may span note types; `field_name` restricts to one field and is passed through without existence checks). Like `update_note_fields`, a plain content edit — no confirm gate, no snapshot. Reports the changed-note count next to the selection size, so zero-match no-ops are visible. |
+| `find_duplicates` | `field_name: string`<br>`search?: string`<br>`limit?: int (1-500, default 100)`<br>`offset?: int` | Read-only duplicate report: groups notes sharing a value in `field_name` (matched case-insensitively across note types, HTML-stripped; empty values never group), optionally narrowed by an Anki search prefilter. Returns the total group count and one page of `{field_value, note_ids}` groups. |
 
 *Destructive tools* (`rename_deck`, `delete_deck`, `delete_notes`, `change_note_type`) require `confirm=true` **and always create a snapshot in `backups/` first** — if the snapshot fails, the operation is aborted (fail-closed), so every destructive change stays reversible from the portal's Version history. Raw SQL execution and arbitrary add-on passthrough remain deliberately omitted to preserve collection integrity.
 
@@ -443,7 +445,7 @@ PYTHONPATH=docker/mcp-service pytest tests/ -v
 - [x] Service starts fail-closed: refuses to run without `SESSION_SECRET`, and without bootstrap credentials on an empty store.
 - [x] Streamable HTTP MCP server on port 8000 requires a valid per-user bearer token.
 - [x] Per-user isolation verified at protocol level: two users' sessions on one instance see only their own notes and collections.
-- [x] All 28 MCP tools execute against real per-user collections with per-user locking and ledger-backed idempotency (destructive ones snapshot-or-abort).
+- [x] All 30 MCP tools execute against real per-user collections with per-user locking and ledger-backed idempotency (destructive ones snapshot-or-abort).
 - [x] `/health` reports 200 healthy and 503 degraded (users store unavailable / data dir not writable).
 
 ---

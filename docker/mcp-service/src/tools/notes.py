@@ -13,8 +13,9 @@ STRINGS at the storage layer while ``note.tags`` is a List[str] property;
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+import anki.lang
 from anki.consts import MODEL_CLOZE
 from anki.errors import NotFoundError
 from anki.notes import Note
@@ -24,6 +25,14 @@ from ..models import MutationResponse, NoteInput, SyncStatus
 from ..sync_manager import SyncManager
 
 logger = logging.getLogger("anki_mcp.tools.notes")
+
+# Every other tool here is a pure backend call, so the service never needed
+# the wheel's Python-side i18n — but find_dupes is implemented in Python and
+# routes its HTML stripping through the module-global ``anki.lang.current_i18n``
+# (None unless anki.lang.set_lang ran; probed on the wheel: find_dupes raises
+# ``AttributeError`` without it). Initialize once at import, idempotently.
+if anki.lang.current_i18n is None:
+    anki.lang.set_lang("en")
 
 
 def _note_summary(col, note) -> Dict[str, Any]:
@@ -469,19 +478,30 @@ def _raise_if_selection_is_mixed(col, mids: set) -> None:
     )
 
 
-def _resolve_change_selection(col, note_ids: Optional[List[int]], query: Optional[str]) -> List[int]:
-    """Resolve the selection to deduplicated note IDs of ONE note type.
+def _resolve_note_selection(
+    col,
+    note_ids: Optional[List[int]],
+    query: Optional[str],
+    missing_prefix: str,
+) -> Tuple[List[int], set]:
+    """Resolve a note_ids-XOR-query selection to deduplicated note IDs.
 
-    Both branches enforce the one-note-type rule via
-    ``_raise_if_selection_is_mixed`` before returning.
+    Shared by change_note_type (which adds the one-note-type rule on top) and
+    find_and_replace (which allows a selection spanning note types). Both
+    branches verify existence BEFORE any backend mutation: a bad selection
+    must fail the request in Python, never as a backend error (the registry
+    would mistake an ``InvalidInput`` for a stale handle and re-run the
+    closure once). Returns ``(nids, mids)`` — the note-type ids collected
+    along the way, so a caller enforcing a per-type rule never re-queries the
+    notes table.
     """
     if query is not None:
         # Client-controlled search string: %r-escape in errors/logs (CWE-117).
         nids = list(col.find_notes(query))
         if not nids:
             raise CollectionToolError(f"No notes matched query {query!r}; nothing to change.")
-        # Set-based mixed-type check over note.mid in bounded IN-chunks (no
-        # per-ID get_note for large query results).
+        # Collect note.mid in bounded IN-chunks (SQLite caps host parameters,
+        # and there is no per-ID get_note for large query results).
         mids: set = set()
         for start in range(0, len(nids), _QUERY_CHUNK):
             chunk = nids[start : start + _QUERY_CHUNK]
@@ -489,8 +509,7 @@ def _resolve_change_selection(col, note_ids: Optional[List[int]], query: Optiona
             mids.update(
                 col.db.list(f"SELECT DISTINCT mid FROM notes WHERE id IN ({placeholders})", *chunk)
             )
-        _raise_if_selection_is_mixed(col, mids)
-        return nids
+        return nids, mids
     # Dedupe preserving order: a repeated ID would inflate the changed count
     # and reappear twice in reports.
     nids = list(dict.fromkeys(int(nid) for nid in note_ids))
@@ -499,8 +518,19 @@ def _resolve_change_selection(col, note_ids: Optional[List[int]], query: Optiona
     found = {row[0]: row[1] for row in rows}
     missing = [nid for nid in nids if nid not in found]
     if missing:
-        raise CollectionToolError(f"Cannot change note type: note(s) not found: {missing}")
-    _raise_if_selection_is_mixed(col, set(found.values()))
+        raise CollectionToolError(f"{missing_prefix}: note(s) not found: {missing}")
+    return nids, set(found.values())
+
+
+def _resolve_change_selection(col, note_ids: Optional[List[int]], query: Optional[str]) -> List[int]:
+    """Resolve the selection to deduplicated note IDs of ONE note type.
+
+    ``_resolve_note_selection`` does the shared resolution; both of its
+    branches are checked against the one-note-type rule via
+    ``_raise_if_selection_is_mixed`` before returning here.
+    """
+    nids, mids = _resolve_note_selection(col, note_ids, query, "Cannot change note type")
+    _raise_if_selection_is_mixed(col, mids)
     return nids
 
 
@@ -732,3 +762,105 @@ async def change_note_type(
         mutation_fn=_mutation,
         idempotency_key=idempotency_key,
     )
+
+
+# -- mass editing -------------------------------------------------------------------
+
+
+async def find_and_replace(
+    sync_manager: SyncManager,
+    registry,
+    username: str,
+    search: str,
+    replacement: str,
+    note_ids: Optional[List[int]] = None,
+    query: Optional[str] = None,
+    regex: bool = False,
+    field_name: Optional[str] = None,
+    match_case: bool = False,
+) -> MutationResponse:
+    """Bulk find-and-replace over the selected notes' fields.
+
+    Same class as update_note_fields: a plain content edit of notes the user
+    already owns, reversible through the portal's ordinary snapshot/restore
+    machinery, so — unlike the structural, content-discarding change_note_type
+    — no confirm gate and no dedicated snapshot precede it. The selection may
+    span note types, and ``field_name`` is therefore passed to the backend
+    unvalidated (a selection-wide name check is impossible; an unknown name
+    simply matches nothing).
+    """
+    logger.info(
+        "Executing find_and_replace for %r: search=%r, replacement=%r, regex=%r, "
+        "field_name=%r, match_case=%r (%d note id(s), query=%r)",
+        username, search, replacement, regex, field_name, match_case,
+        len(note_ids) if note_ids else 0, query,
+    )
+
+    def _replace(col) -> Dict[str, Any]:
+        # Existence + dedupe only (shared resolver): mixed note types are the
+        # point of a mass edit, so no single-notetype check here.
+        nids, _mids = _resolve_note_selection(col, note_ids, query, "Cannot find and replace")
+        # One backend operation over the whole selection; ``count`` is the
+        # number of CHANGED notes (verified wheel API), so reporting the
+        # selection size next to it keeps a zero-match no-op visible as
+        # changed=0 rather than looking like a lost request.
+        result = col.find_and_replace(
+            note_ids=nids,
+            search=search,
+            replacement=replacement,
+            regex=regex,
+            field_name=field_name,
+            match_case=match_case,
+        )
+        return {
+            "changed": int(result.count),
+            "selected": len(nids),
+            "field_name": field_name,
+            "regex": regex,
+            "match_case": match_case,
+        }
+
+    async def _mutation() -> Dict[str, Any]:
+        return await registry.run(username, _replace)
+
+    return await sync_manager.execute_mutation(
+        username,
+        operation_name="find_and_replace",
+        mutation_fn=_mutation,
+    )
+
+
+async def find_duplicates(
+    registry,
+    username: str,
+    field_name: str,
+    search: str = "",
+    limit: int = 100,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """Report notes sharing a value in ``field_name`` (read-only duplicate report).
+
+    The wheel's ``find_dupes`` matches the field name case-insensitively
+    across note types, compares HTML-stripped values, and skips empty values;
+    groups come back as ``(value, [note_ids])`` with the full member list.
+    ``search`` is an optional Anki query prefilter narrowing which notes are
+    examined.
+    """
+    # Client-controlled values are logged %r (repr escapes newlines/control
+    # chars) so one tool call can never author multiple log lines (CWE-117).
+    logger.info(
+        "Executing find_duplicates for %r: field_name=%r, search=%r, limit=%d, offset=%d",
+        username, field_name, search, limit, offset,
+    )
+
+    def _dupes(col) -> Dict[str, Any]:
+        groups = col.find_dupes(field_name, search)
+        return {
+            "total_groups": len(groups),
+            "duplicates": [
+                {"field_value": value, "note_ids": [int(nid) for nid in nids]}
+                for value, nids in groups[offset : offset + limit]
+            ],
+        }
+
+    return await registry.run(username, _dupes)

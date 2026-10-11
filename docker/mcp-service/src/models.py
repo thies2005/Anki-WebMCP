@@ -150,6 +150,20 @@ def _reject_control_chars(value: str, what: str) -> str:
     return value
 
 
+def _reject_control_chars_keep_line_breaks(value: str, what: str) -> str:
+    """Free-text rule where newlines/tabs are legitimate note content; every
+    other control character is refused (companion to _reject_control_chars)."""
+    if any((ord(c) < 32 and c not in "\n\r\t") or ord(c) == 127 for c in value):
+        raise ValueError(f"{what} must not contain control characters (newlines and tabs are allowed).")
+    return value
+
+
+def _exactly_one_selection(note_ids: Optional[List[int]], query: Optional[str]) -> None:
+    """Shared note_ids-XOR-query rule (preview/change_note_type, find_and_replace)."""
+    if (note_ids is None) == (query is None):
+        raise ValueError("Provide exactly one of note_ids or query.")
+
+
 # -- deck tools -----------------------------------------------------------------
 
 
@@ -333,8 +347,7 @@ class _NoteTypeChangeInputBase(BaseModel):
 
     @model_validator(mode="after")
     def exactly_one_selection(self) -> "_NoteTypeChangeInputBase":
-        if (self.note_ids is None) == (self.query is None):
-            raise ValueError("Provide exactly one of note_ids or query.")
+        _exactly_one_selection(self.note_ids, self.query)
         return self
 
 
@@ -361,6 +374,87 @@ class ChangeNoteTypeInput(_NoteTypeChangeInputBase):
         max_length=256,
         description="Optional unique key to prevent duplicate changes on network retries",
     )
+
+
+class FindAndReplaceInput(BaseModel):
+    """Input parameters for find_and_replace tool (bulk content edit, not destructive)."""
+
+    search: str = Field(
+        ...,
+        min_length=1,
+        max_length=1000,
+        description="Text to find (a regular expression when regex=true)",
+    )
+    replacement: str = Field(
+        "",
+        max_length=10000,
+        description="Replacement text; with regex=true, $1, $2, ... reference capture groups (Rust regex syntax). Empty deletes every match",
+    )
+    note_ids: Optional[List[int]] = Field(
+        None,
+        description="Note IDs to edit (1-2000 per request); mutually exclusive with query",
+    )
+    query: Optional[str] = Field(
+        None,
+        description="Anki search selecting the notes to edit, e.g. 'deck:Default' or 'tag:vocab'; mutually exclusive with note_ids",
+    )
+    regex: bool = Field(False, description="Treat search (and $N references in replacement) as a regular expression")
+    field_name: Optional[str] = Field(
+        None,
+        description="Restrict the replace to this field name (matched across note types); omit to replace in every field. Passed through WITHOUT existence validation: selections may span note types, and an unknown name simply matches nothing",
+    )
+    match_case: bool = Field(False, description="Case-sensitive matching (default: case-insensitive)")
+
+    @field_validator("search", "replacement")
+    @classmethod
+    def validate_text(cls, v: str) -> str:
+        # Newlines and tabs are legitimate note content; other control
+        # characters are refused (shared free-text rule).
+        return _reject_control_chars_keep_line_breaks(v, "Search and replacement text")
+
+    @field_validator("note_ids")
+    @classmethod
+    def validate_ids(cls, v: Optional[List[int]]) -> Optional[List[int]]:
+        if v is None:
+            return v
+        # Same bound as the note-type change: find_and_replace is ONE backend
+        # operation over the whole selection, so per-request cost does not
+        # grow per ID the way per-item mutations (delete/tag) do.
+        if not (1 <= len(v) <= 2000):
+            raise ValueError("Select between 1 and 2000 note IDs per request.")
+        for nid in v:
+            if nid <= 0:
+                raise ValueError("Note IDs must be positive integers.")
+        return v
+
+    @model_validator(mode="after")
+    def exactly_one_selection(self) -> "FindAndReplaceInput":
+        _exactly_one_selection(self.note_ids, self.query)
+        return self
+
+
+class FindDuplicatesInput(BaseModel):
+    """Input parameters for find_duplicates tool (read-only)."""
+
+    field_name: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="Field whose identical values define duplicate groups (matched case-insensitively across note types)",
+    )
+    search: str = Field(
+        "",
+        description="Optional Anki query prefilter narrowing which notes are examined, e.g. 'deck:Default'",
+    )
+    limit: int = Field(100, ge=1, le=500, description="Max duplicate groups to return (1-500, default 100)")
+    offset: int = Field(0, ge=0, description="Pagination offset over the groups (default 0)")
+
+    @field_validator("field_name")
+    @classmethod
+    def validate_field_name(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Field name must not be empty.")
+        return _reject_control_chars(v, "Field name")
 
 
 # -- card tools ----------------------------------------------------------------------

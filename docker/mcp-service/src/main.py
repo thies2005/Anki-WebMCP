@@ -38,7 +38,9 @@ from .models import (
     CreateNoteTypeInput,
     DeleteDeckInput,
     DeleteNotesInput,
+    FindAndReplaceInput,
     FindCardsInput,
+    FindDuplicatesInput,
     GetCardInput,
     GetMediaInput,
     GetNoteInput,
@@ -1441,6 +1443,71 @@ def create_app(custom_settings: Optional[Settings] = None):
                 parsed.field_map, parsed.template_map, parsed.confirm, parsed.idempotency_key,
             )
             return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 29. find_and_replace
+    @mcp.tool(
+        description="Find and replace text across the fields of many notes at once, selected by "
+        "note IDs or an Anki query (selections may span note types). search is plain text or, with "
+        "regex=true, a regular expression whose capture groups the replacement can reference as "
+        "$1, $2, ... (Rust regex syntax); match_case makes matching case-sensitive. field_name "
+        "restricts the replace to that one field (omit it for all fields) — the name is NOT "
+        "checked for existence because a selection-wide check is impossible and an unknown name "
+        "simply matches nothing. Like update_note_fields this is a plain content edit: no confirm "
+        "gate and no snapshot."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
+    )
+    async def find_and_replace(
+        search: str,
+        replacement: str = "",
+        note_ids: Optional[List[int]] = None,
+        query: Optional[str] = None,
+        regex: bool = False,
+        field_name: Optional[str] = None,
+        match_case: bool = False,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = FindAndReplaceInput(
+                search=search, replacement=replacement, note_ids=note_ids, query=query,
+                regex=regex, field_name=field_name, match_case=match_case,
+            )
+            res = await note_tools.find_and_replace(
+                tool_sync_manager, tool_registry, username,
+                parsed.search, parsed.replacement, parsed.note_ids, parsed.query,
+                parsed.regex, parsed.field_name, parsed.match_case,
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 30. find_duplicates
+    @mcp.tool(
+        description="Report duplicate notes (read-only): groups notes that share the same value in "
+        "field_name (matched case-insensitively across note types, HTML-stripped; empty values "
+        "never group), optionally narrowed by an Anki search prefilter. Returns the total group "
+        "count and one requested page of {field_value, note_ids} groups — useful to clean up "
+        "before or after a mass edit."
+    )
+    async def find_duplicates(
+        field_name: str,
+        search: str = "",
+        limit: int = 100,
+        offset: int = 0,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = FindDuplicatesInput(field_name=field_name, search=search, limit=limit, offset=offset)
+            return await note_tools.find_duplicates(
+                tool_registry, username, parsed.field_name, parsed.search, parsed.limit, parsed.offset
+            )
         except Exception as e:
             return _tool_error_response(e)
 

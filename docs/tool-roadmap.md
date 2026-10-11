@@ -20,15 +20,24 @@ integrity.
       operation, ledger-backed idempotency). Both tools share one map
       resolver so the preview always equals what the mutation would do.
 
-## Phase 2 — Mass-edit pair
+## Phase 2 — Mass-edit pair (DONE)
 
-- [ ] `find_and_replace` — bulk search/replace over note fields
-      (`col.find_and_replace`: note_ids or query, search, replacement,
-      regex, field_name, match_case). Confirm-gated with a fail-closed
-      snapshot when the scope exceeds a trivial size.
-- [ ] `find_duplicates` — duplicate report via `col.find_dupes` (read-only;
+- [x] `find_and_replace` — bulk search/replace over note fields
+      (`col.find_and_replace`: note_ids or query — shared resolver with
+      change_note_type minus its single-note-type constraint —, search,
+      replacement, regex (Rust `$1` capture references), field_name
+      (passed through without existence checks: selections may span note
+      types), match_case). Shipped as a plain content edit in the
+      update_note_fields class — no confirm gate and no snapshot: nothing is
+      deleted or discarded, and reversibility comes from the portal's
+      ordinary snapshot machinery. The response reports the backend's changed
+      count next to the selection size, so zero-match no-ops are visible.
+- [x] `find_duplicates` — duplicate report via `col.find_dupes` (read-only;
       returns duplicate groups for a field so an agent can clean up before
-      or after a mass edit).
+      or after a mass edit; optional Anki search prefilter, paginated
+      groups). The wheel's find_dupes is a Python-side implementation whose
+      HTML stripping needs `anki.lang.current_i18n`, so the notes tools
+      module initializes it once (nothing else in the service needed i18n).
 
 ## Phase 3 — Note-type control set
 

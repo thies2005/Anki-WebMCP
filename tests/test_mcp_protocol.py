@@ -278,13 +278,14 @@ async def test_initialize_result_carries_sync_guidance_instructions(app_with_use
             assert "AnkiWeb" in instructions
 
 
-# Every tool that changes collection state (16 as of change_note_type); each
+# Every tool that changes collection state (17 as of find_and_replace); each
 # description must tell the model that the change is local until
 # sync_collection runs.
 MUTATING_TOOLS = {
     "add_notes", "update_note_fields", "add_tags", "remove_tags",
     "create_deck", "rename_deck", "delete_deck", "delete_notes",
-    "create_note_type", "change_note_type", "suspend_cards", "unsuspend_cards",
+    "create_note_type", "change_note_type", "find_and_replace",
+    "suspend_cards", "unsuspend_cards",
     "set_due_date", "move_cards", "answer_card", "store_media_file",
 }
 
