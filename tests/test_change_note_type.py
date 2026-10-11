@@ -218,6 +218,65 @@ async def test_duplicate_old_targets_fail_before_any_write(env):
     assert _backup_reasons(reg, "lars") == []
 
 
+@pytest.mark.asyncio
+async def test_unmapped_template_cards_are_deleted_and_mapped_card_kept(env):
+    """The destructive core of template discard, pinned to observed backend
+    behavior (probed on anki==26.9.3): the mapped old template's card is kept
+    WITH its identity (no regeneration), the unmapped template's card is
+    really deleted, and the preview warning states that fate verbatim."""
+    reg, manager = env
+
+    def _setup(col):
+        mm = col.models
+        src = mm.new(name="SrcTwo")
+        for field_name in ("Front", "Back"):
+            mm.add_field(src, mm.new_field(field_name))
+        t1 = mm.new_template("Card 1")
+        t1["qfmt"], t1["afmt"] = "{{Front}}", "{{FrontSide}}\n<hr id=answer>\n{{Back}}"
+        mm.add_template(src, t1)
+        t2 = mm.new_template("Card 2")
+        t2["qfmt"], t2["afmt"] = "{{Back}}", "{{FrontSide}}\n<hr id=answer>\n{{Front}}"
+        mm.add_template(src, t2)
+        mm.add(src)
+        _make_note_type(col, "TgtOne", ["Front", "Back"])
+        return _add_note_of(col, "SrcTwo", {"Front": "frage", "Back": "antwort"})
+
+    nid = await reg.run("victor", _setup)
+    before = await reg.run("victor", lambda col: [
+        {"id": int(c.id), "ord": int(c.ord), "template": c.template()["name"]}
+        for c in col.get_note(nid).cards()
+    ])
+    assert {(c["template"], c["ord"]) for c in before} == {("Card 1", 0), ("Card 2", 1)}
+    mapped_id = next(c["id"] for c in before if c["template"] == "Card 1")
+    unmapped_id = next(c["id"] for c in before if c["template"] == "Card 2")
+
+    # Preview BEFORE the change: the unmapped template's warning is verbatim.
+    preview = await note_tools.preview_note_type_change(reg, "victor", "TgtOne", note_ids=[nid])
+    assert preview["template_map"] == {"Card 1": "Card 1"}
+    assert (
+        "Template 'Card 2' of 'SrcTwo' has no mapping: cards generated from it are deleted."
+        in preview["warnings"]
+    )
+
+    res = await note_tools.change_note_type(
+        manager, reg, "victor", "TgtOne", note_ids=[nid],
+        template_map={"Card 1": "Card 1"}, confirm=True,
+    )
+    assert res.success is True, res.error
+
+    after = await reg.run("victor", lambda col: [
+        {"id": int(c.id), "ord": int(c.ord), "template": c.template()["name"]}
+        for c in col.get_note(nid).cards()
+    ])
+    # 2 -> 1: the kept card is the MAPPED template's card, identity retained
+    # (probed: the wheel keeps the mapped card's id rather than regenerating).
+    assert after == [{"id": mapped_id, "ord": 0, "template": "Card 1"}]
+    assert unmapped_id not in [c["id"] for c in after]
+    # Really gone from the card index, not just the note's card list.
+    found = (await card_tools.find_cards(reg, "victor", "deck:Default"))["cards"]
+    assert [c["card_id"] for c in found] == [mapped_id]
+
+
 # -- name/selection errors ---------------------------------------------------------
 
 
@@ -294,6 +353,40 @@ async def test_mixed_note_type_selection_is_a_clean_error(env):
     assert res.success is False and res.local_status == "failed"
     assert "multiple note types" in res.error
     assert _backup_reasons(reg, "olaf") == []
+
+
+@pytest.mark.asyncio
+async def test_mixed_query_selection_is_a_clean_error_before_any_backend_call(env):
+    """The QUERY selection path must run the same Python-side mixed-type
+    check as the note_ids path: deck:Default spans two note types, and the
+    clean CollectionToolError must fire before get_single_notetype_of_notes
+    (whose backend InvalidInput the registry would misread as a stale handle,
+    reopening the collection and re-running the closure)."""
+    reg, manager = env
+    await _setup_vocab_user(reg, "ulf")
+
+    def _add_basic(col):
+        note = Note(col, col.models.by_name("Basic"))
+        note["Front"] = "plain"
+        note["Back"] = "simple"
+        col.add_note(note, col.decks.id("Default"))
+        return int(note.id)
+
+    await reg.run("ulf", _add_basic)
+
+    with pytest.raises(CollectionToolError) as exc:
+        await note_tools.preview_note_type_change(reg, "ulf", "TgtVocab", query="deck:Default")
+    message = str(exc.value)
+    assert "multiple note types" in message
+    assert "SrcVocab" in message and "Basic" in message
+
+    res = await note_tools.change_note_type(
+        manager, reg, "ulf", "TgtVocab", query="deck:Default", confirm=True
+    )
+    assert res.success is False and res.local_status == "failed"
+    assert "multiple note types" in res.error
+    # No snapshot: the check fires before anything reaches the backend.
+    assert _backup_reasons(reg, "ulf") == []
 
 
 # -- cloze ------------------------------------------------------------------------

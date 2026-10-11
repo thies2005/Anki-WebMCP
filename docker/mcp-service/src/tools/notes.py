@@ -444,21 +444,52 @@ async def create_note_type(
 # -- note-type changing -------------------------------------------------------------
 
 
+# Chunk size for the query path's IN-queries: find_notes results are
+# unbounded and SQLite caps host parameters (999 on old builds), so the
+# selection is checked in bounded batches — still one indexed pass, never a
+# per-ID get_note.
+_QUERY_CHUNK = 500
+
+
+def _raise_if_selection_is_mixed(col, mids: set) -> None:
+    """Refuse a selection spanning several note types (both selection paths).
+
+    Python-side, BEFORE any backend call: a mixed selection makes
+    ``get_single_notetype_of_notes`` raise ``InvalidInput`` with EMPTY args —
+    the exact signature ``CollectionRegistry._is_stale`` reads as a closed
+    handle (it would close/reopen the collection and re-run the closure once)
+    — and the empty message tells the caller nothing.
+    """
+    if len(mids) <= 1:
+        return
+    names = sorted(col.models.get(mid)["name"] for mid in mids)
+    raise CollectionToolError(
+        f"Selection spans multiple note types ({', '.join(names)}); "
+        "change each note type in a separate call."
+    )
+
+
 def _resolve_change_selection(col, note_ids: Optional[List[int]], query: Optional[str]) -> List[int]:
     """Resolve the selection to deduplicated note IDs of ONE note type.
 
-    The mixed-type check happens HERE in Python instead of by catching the
-    backend's error: a mixed selection makes ``get_single_notetype_of_notes``
-    raise ``InvalidInput`` with EMPTY args — the exact signature
-    ``CollectionRegistry._is_stale`` reads as a closed handle (it would reopen
-    the collection and re-run the closure once) — and the empty message tells
-    the caller nothing. One bounded ``notes`` query answers both questions.
+    Both branches enforce the one-note-type rule via
+    ``_raise_if_selection_is_mixed`` before returning.
     """
     if query is not None:
         # Client-controlled search string: %r-escape in errors/logs (CWE-117).
         nids = list(col.find_notes(query))
         if not nids:
             raise CollectionToolError(f"No notes matched query {query!r}; nothing to change.")
+        # Set-based mixed-type check over note.mid in bounded IN-chunks (no
+        # per-ID get_note for large query results).
+        mids: set = set()
+        for start in range(0, len(nids), _QUERY_CHUNK):
+            chunk = nids[start : start + _QUERY_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            mids.update(
+                col.db.list(f"SELECT DISTINCT mid FROM notes WHERE id IN ({placeholders})", *chunk)
+            )
+        _raise_if_selection_is_mixed(col, mids)
         return nids
     # Dedupe preserving order: a repeated ID would inflate the changed count
     # and reappear twice in reports.
@@ -469,12 +500,7 @@ def _resolve_change_selection(col, note_ids: Optional[List[int]], query: Optiona
     missing = [nid for nid in nids if nid not in found]
     if missing:
         raise CollectionToolError(f"Cannot change note type: note(s) not found: {missing}")
-    if len(set(found.values())) > 1:
-        names = sorted(col.models.get(mid)["name"] for mid in set(found.values()))
-        raise CollectionToolError(
-            f"Selection spans multiple note types ({', '.join(names)}); "
-            "change each note type in a separate call."
-        )
+    _raise_if_selection_is_mixed(col, set(found.values()))
     return nids
 
 
