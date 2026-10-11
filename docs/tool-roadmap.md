@@ -39,18 +39,40 @@ integrity.
       HTML stripping needs `anki.lang.current_i18n`, so the notes tools
       module initializes it once (nothing else in the service needed i18n).
 
-## Phase 3 — Note-type control set
+## Phase 3 — Note-type control set (DONE, tools 31–41)
 
-- [ ] `get_note_type` — full detail for one note type: field ordinals,
+- [x] `get_note_type` — full detail for one note type: field ordinals,
       template `qfmt`/`afmt`, CSS, type (standard/cloze), sort field, and
       use count.
-- [ ] `update_note_type` — rename / CSS / template edits / sort field via
-      `models.update_dict` (confirm + snapshot when the schema changes).
-- [ ] Field operations — add / remove / rename / reposition fields.
-- [ ] Template operations — add / remove / reposition card templates.
-- [ ] `delete_note_type` — only when `use_count == 0` (confirm + snapshot).
-- [ ] `restore_notetype_to_stock` — reset a modified stock note type
-      (confirm + snapshot).
+- [x] `update_note_type` — rename / CSS / template edits / sort field via
+      `models.update_dict` (no snapshot: rendering-level edits only — the
+      roadmap's earlier "confirm + snapshot when the schema changes" was
+      resolved as: renames and CSS/template/sort edits delete nothing, so
+      they ship in the `create_note_type` class; only the removal tools
+      below snapshot). Renames are collision-checked via
+      `models.id_for_name` first — `update_dict`'s
+      `ensure_name_unique` would otherwise silently mangle the name.
+- [x] Field operations — `add_note_type_field` (append or insert at a
+      0-based position), `remove_note_type_field` (confirm +
+      `pre-remove-note-type-field` snapshot; last remaining field refused),
+      `rename_note_type_field` (collision-checked), and
+      `reposition_note_type_field` (Python-side bounds check — the wheel's
+      `list.insert` would silently clamp).
+- [x] Template operations — `add_note_type_template` /
+      `remove_note_type_template` (confirm + `pre-remove-note-type-template`
+      snapshot; last template refused; response reports the card count the
+      removal deletes) / `reposition_note_type_template`.
+- [x] `delete_note_type` — only when `use_count == 0` (a used type is
+      refused with its count before the snapshot; confirm +
+      `pre-delete-note-type` snapshot).
+- [x] `restore_note_type_to_stock` — reset a modified stock note type
+      (confirm + `pre-restore-note-type-stock` snapshot). `force_kind`
+      maps the `anki.stdmodels.StockNotetypeKind` names; probed wheel
+      semantics: the field/template LIST is replaced wholesale, so content
+      under mismatched stock fields is lost, and the raw backend call does
+      not evict the wheel's Python notetype cache — the tool clears it, or
+      every later read on the open handle would serve the pre-restore
+      schema.
 
 ## Phase 4 — Scheduling and organization
 

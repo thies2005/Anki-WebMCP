@@ -31,12 +31,15 @@ from .config import Settings, get_settings, load_or_create_session_secret, valid
 from .logging_util import setup_logging
 from .models import (
     AddNotesInput,
+    AddNoteTypeFieldInput,
+    AddNoteTypeTemplateInput,
     AddTagsInput,
     AnswerCardInput,
     ChangeNoteTypeInput,
     CreateDeckInput,
     CreateNoteTypeInput,
     DeleteDeckInput,
+    DeleteNoteTypeInput,
     DeleteNotesInput,
     FindAndReplaceInput,
     FindCardsInput,
@@ -44,18 +47,27 @@ from .models import (
     GetCardInput,
     GetMediaInput,
     GetNoteInput,
+    GetNoteTypeInput,
     ListMediaInput,
     MoveCardsInput,
     PreviewNoteTypeChangeInput,
+    RemoveNoteTypeFieldInput,
+    RemoveNoteTypeTemplateInput,
     RemoveTagsInput,
     RenameDeckInput,
+    RenameNoteTypeFieldInput,
+    RepositionNoteTypeFieldInput,
+    RepositionNoteTypeTemplateInput,
+    RestoreNoteTypeToStockInput,
     ReviewQueueInput,
     SearchNotesInput,
     SetDueDateInput,
     StoreMediaInput,
     SuspendCardsInput,
     TemplateInput,
+    TemplateUpdateInput,
     UpdateNoteFieldsInput,
+    UpdateNoteTypeInput,
 )
 from .oauth import OAuthStore, add_oauth_routes
 from .sync_manager import SyncManager
@@ -63,6 +75,7 @@ from .tools import cards as cards_tools
 from .tools import decks as deck_tools
 from .tools import media as media_tools
 from .tools import notes as note_tools
+from .tools import notetypes as notetype_tools
 from .tools import stats as stats_tools
 from .tools import sync as sync_tools
 from .users import USERNAME_RE, User, UserStore
@@ -1508,6 +1521,302 @@ def create_app(custom_settings: Optional[Settings] = None):
             return await note_tools.find_duplicates(
                 tool_registry, username, parsed.field_name, parsed.search, parsed.limit, parsed.offset
             )
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 31. get_note_type
+    @mcp.tool(
+        description="Show full detail for one note type (read-only): id, standard/cloze type, "
+        "fields with ordinals, templates with question/answer formats, CSS, sort field, and the "
+        "number of notes using it."
+    )
+    async def get_note_type(name: str, ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = GetNoteTypeInput(name=name)
+            return await notetype_tools.get_note_type(tool_registry, username, parsed.name)
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 32. update_note_type
+    @mcp.tool(
+        description="Edit an existing note type: rename it (must not collide with another note "
+        "type), replace its CSS, edit existing card templates (rename / question / answer), and "
+        "set the sort field. Rendering-level edits only — fields and templates are neither added "
+        "nor removed, and no note content changes."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
+    )
+    async def update_note_type(
+        name: str,
+        new_name: Optional[str] = None,
+        css: Optional[str] = None,
+        template_updates: Optional[List[Dict[str, Any]]] = None,
+        sort_field: Optional[str] = None,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed_updates = (
+                [TemplateUpdateInput(**u) for u in template_updates]
+                if template_updates is not None
+                else None
+            )
+            parsed = UpdateNoteTypeInput(
+                name=name, new_name=new_name, css=css,
+                template_updates=parsed_updates, sort_field=sort_field,
+            )
+            res = await notetype_tools.update_note_type(
+                tool_sync_manager, tool_registry, username,
+                parsed.name, parsed.new_name, parsed.css, parsed.template_updates, parsed.sort_field,
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 33. add_note_type_field
+    @mcp.tool(
+        description="Add a new empty field to a note type, appended at the end or inserted at a "
+        "0-based position. Existing notes get an empty value for it."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
+    )
+    async def add_note_type_field(
+        note_type: str,
+        field_name: str,
+        position: Optional[int] = None,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = AddNoteTypeFieldInput(note_type=note_type, field_name=field_name, position=position)
+            res = await notetype_tools.add_note_type_field(
+                tool_sync_manager, tool_registry, username,
+                parsed.note_type, parsed.field_name, parsed.position,
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 34. remove_note_type_field
+    @mcp.tool(
+        description="Remove a field from a note type. DESTRUCTIVE: the field's content is deleted "
+        "on EVERY note of the type, and the last remaining field cannot be removed. Requires "
+        "confirm=true; a pre-remove-note-type-field snapshot backup is taken first and the removal "
+        "is aborted if it fails."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
+    )
+    async def remove_note_type_field(
+        note_type: str,
+        field_name: str,
+        confirm: bool = False,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = RemoveNoteTypeFieldInput(note_type=note_type, field_name=field_name, confirm=confirm)
+            res = await notetype_tools.remove_note_type_field(
+                tool_sync_manager, tool_registry, username,
+                parsed.note_type, parsed.field_name, parsed.confirm,
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 35. rename_note_type_field
+    @mcp.tool(
+        description="Rename a field of a note type (template references to the old name are NOT "
+        "rewritten — update templates afterwards if needed). The new name must not collide with "
+        "another field of the same type."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
+    )
+    async def rename_note_type_field(
+        note_type: str,
+        field_name: str,
+        new_name: str,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = RenameNoteTypeFieldInput(
+                note_type=note_type, field_name=field_name, new_name=new_name,
+            )
+            res = await notetype_tools.rename_note_type_field(
+                tool_sync_manager, tool_registry, username,
+                parsed.note_type, parsed.field_name, parsed.new_name,
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 36. reposition_note_type_field
+    @mcp.tool(
+        description="Move a field of a note type to a new 0-based position (0..field count - 1); "
+        "every note keeps its values, only the field order changes."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
+    )
+    async def reposition_note_type_field(
+        note_type: str,
+        field_name: str,
+        index: int,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = RepositionNoteTypeFieldInput(note_type=note_type, field_name=field_name, index=index)
+            res = await notetype_tools.reposition_note_type_field(
+                tool_sync_manager, tool_registry, username,
+                parsed.note_type, parsed.field_name, parsed.index,
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 37. add_note_type_template
+    @mcp.tool(
+        description="Add a card template (name, question format, answer format) to a note type, "
+        "appended at the end or inserted at a 0-based position. Cards for existing notes are "
+        "generated by Anki's usual template logic."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
+    )
+    async def add_note_type_template(
+        note_type: str,
+        name: str,
+        front: str,
+        back: str,
+        position: Optional[int] = None,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = AddNoteTypeTemplateInput(
+                note_type=note_type,
+                template=TemplateInput(name=name, front=front, back=back),
+                position=position,
+            )
+            res = await notetype_tools.add_note_type_template(
+                tool_sync_manager, tool_registry, username,
+                parsed.note_type, parsed.template, parsed.position,
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 38. remove_note_type_template
+    @mcp.tool(
+        description="Remove a card template from a note type. DESTRUCTIVE: the cards generated by "
+        "that template are deleted, and the last remaining template cannot be removed. Requires "
+        "confirm=true; a pre-remove-note-type-template snapshot backup is taken first and the "
+        "removal is aborted if it fails."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
+    )
+    async def remove_note_type_template(
+        note_type: str,
+        template_name: str,
+        confirm: bool = False,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = RemoveNoteTypeTemplateInput(
+                note_type=note_type, template_name=template_name, confirm=confirm,
+            )
+            res = await notetype_tools.remove_note_type_template(
+                tool_sync_manager, tool_registry, username,
+                parsed.note_type, parsed.template_name, parsed.confirm,
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 39. reposition_note_type_template
+    @mcp.tool(
+        description="Move a card template of a note type to a new 0-based position "
+        "(0..template count - 1); existing cards follow their template."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
+    )
+    async def reposition_note_type_template(
+        note_type: str,
+        template_name: str,
+        index: int,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = RepositionNoteTypeTemplateInput(
+                note_type=note_type, template_name=template_name, index=index,
+            )
+            res = await notetype_tools.reposition_note_type_template(
+                tool_sync_manager, tool_registry, username,
+                parsed.note_type, parsed.template_name, parsed.index,
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 40. delete_note_type
+    @mcp.tool(
+        description="Delete an UNUSED note type (zero notes). DESTRUCTIVE: requires confirm=true; "
+        "a pre-delete-note-type snapshot backup is taken first and the deletion is aborted if it "
+        "fails. Note types with notes on them are refused — change or delete those notes first."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
+    )
+    async def delete_note_type(name: str, confirm: bool = False, ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = DeleteNoteTypeInput(name=name, confirm=confirm)
+            res = await notetype_tools.delete_note_type(
+                tool_sync_manager, tool_registry, username, parsed.name, parsed.confirm,
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 41. restore_note_type_to_stock
+    @mcp.tool(
+        description="Reset a modified note type to the stock defaults (fields, templates, and CSS "
+        "are all replaced by the stock type's — notes keep values only where a stock field lines "
+        "up, so content under mismatched stock fields can be lost). force_kind picks which stock "
+        "type: 'basic', 'basic_and_reversed', 'basic_optional_reversed', 'basic_typing', 'cloze', "
+        "or 'image_occlusion'; omit it to use the type's original stock kind. DESTRUCTIVE: "
+        "requires confirm=true; a pre-restore-note-type-stock snapshot backup is taken first and "
+        "the restore is aborted if it fails."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
+    )
+    async def restore_note_type_to_stock(
+        name: str,
+        force_kind: Optional[str] = None,
+        confirm: bool = False,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = RestoreNoteTypeToStockInput(name=name, force_kind=force_kind, confirm=confirm)
+            res = await notetype_tools.restore_note_type_to_stock(
+                tool_sync_manager, tool_registry, username,
+                parsed.name, parsed.force_kind, parsed.confirm,
+            )
+            return res.model_dump()
         except Exception as e:
             return _tool_error_response(e)
 

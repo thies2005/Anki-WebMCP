@@ -159,8 +159,22 @@ async def test_search_notes_tool_schema_exposes_only_real_arguments(app_with_use
                 "new_note_type", "note_ids", "query", "field_map", "template_map",
                 "confirm", "idempotency_key",
             }
-            # The read-only preview never carries the local-until-synced suffix.
+            # The note-type control set exposes exactly its real arguments —
+            # in particular no ``ctx`` leak and no auth state.
+            assert set(tools["get_note_type"]["inputSchema"]["properties"]) == {"name"}
+            assert set(tools["update_note_type"]["inputSchema"]["properties"]) == {
+                "name", "new_name", "css", "template_updates", "sort_field",
+            }
+            assert set(tools["remove_note_type_field"]["inputSchema"]["properties"]) == {
+                "note_type", "field_name", "confirm",
+            }
+            assert set(tools["restore_note_type_to_stock"]["inputSchema"]["properties"]) == {
+                "name", "force_kind", "confirm",
+            }
+            # The read-only preview never carries the local-until-synced suffix,
+            # and neither does the read-only note-type detail tool.
             assert "sync_collection" not in tools["preview_note_type_change"]["description"]
+            assert "sync_collection" not in tools["get_note_type"]["description"]
 
 
 @pytest.mark.asyncio
@@ -278,13 +292,18 @@ async def test_initialize_result_carries_sync_guidance_instructions(app_with_use
             assert "AnkiWeb" in instructions
 
 
-# Every tool that changes collection state (17 as of find_and_replace); each
-# description must tell the model that the change is local until
+# Every tool that changes collection state (27 as of the note-type control
+# set); each description must tell the model that the change is local until
 # sync_collection runs.
 MUTATING_TOOLS = {
     "add_notes", "update_note_fields", "add_tags", "remove_tags",
     "create_deck", "rename_deck", "delete_deck", "delete_notes",
     "create_note_type", "change_note_type", "find_and_replace",
+    "update_note_type", "add_note_type_field", "remove_note_type_field",
+    "rename_note_type_field", "reposition_note_type_field",
+    "add_note_type_template", "remove_note_type_template",
+    "reposition_note_type_template", "delete_note_type",
+    "restore_note_type_to_stock",
     "suspend_cards", "unsuspend_cards",
     "set_due_date", "move_cards", "answer_card", "store_media_file",
 }

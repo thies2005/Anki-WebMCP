@@ -457,6 +457,262 @@ class FindDuplicatesInput(BaseModel):
         return _reject_control_chars(v, "Field name")
 
 
+# -- note-type control tools -------------------------------------------------------
+
+
+def validate_note_type_name(name: str) -> str:
+    """Shared note-type-name rule for the note-type control input models."""
+    s = name.strip()
+    if not s:
+        raise ValueError("Note type name must not be empty.")
+    return _reject_control_chars(s, "Note type name")
+
+
+class GetNoteTypeInput(BaseModel):
+    """Input parameters for get_note_type tool (read-only)."""
+    name: str = Field(..., min_length=1, max_length=100, description="Existing note type name, e.g. 'Basic'")
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        return validate_note_type_name(v)
+
+
+class TemplateUpdateInput(BaseModel):
+    """One template edit inside update_note_type's template_updates list."""
+    template: str = Field(..., min_length=1, max_length=5000, description="Name of the EXISTING template to edit")
+    new_name: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=5000,
+        description="Rename the template (must not collide with another template of the same type)",
+    )
+    front: Optional[str] = Field(None, min_length=1, max_length=5000, description="New question template (qfmt)")
+    back: Optional[str] = Field(None, min_length=1, max_length=5000, description="New answer template (afmt)")
+
+    @field_validator("template", "new_name", "front", "back")
+    @classmethod
+    def no_control_chars(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return _reject_control_chars(v, "Template parts")
+
+
+class UpdateNoteTypeInput(BaseModel):
+    """Input parameters for update_note_type tool."""
+    name: str = Field(..., min_length=1, max_length=100, description="Existing note type name to edit")
+    new_name: Optional[str] = Field(
+        None, min_length=1, max_length=100, description="Rename the note type (must not already exist)"
+    )
+    css: Optional[str] = Field(
+        None,
+        max_length=65536,
+        description="Replacement styling (CSS) for the note type's cards",
+    )
+    template_updates: Optional[List[TemplateUpdateInput]] = Field(
+        None,
+        description="Edits to existing templates (1-20 per request); each names an existing template",
+    )
+    sort_field: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=100,
+        description="Field name to sort by (becomes the first field for new-note ordering)",
+    )
+
+    @field_validator("name", "new_name")
+    @classmethod
+    def validate_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return validate_note_type_name(v)
+
+    @field_validator("sort_field")
+    @classmethod
+    def validate_sort_field(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if not v.strip():
+            raise ValueError("Sort field name must not be empty.")
+        return _reject_control_chars(v, "Sort field name")
+
+    @field_validator("css")
+    @classmethod
+    def validate_css(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        # Stylesheets are legitimately multi-line: newlines stay allowed.
+        return _reject_control_chars_keep_line_breaks(v, "CSS")
+
+    @field_validator("template_updates")
+    @classmethod
+    def validate_template_updates(cls, v: Optional[List[TemplateUpdateInput]]) -> Optional[List[TemplateUpdateInput]]:
+        if v is not None and not (1 <= len(v) <= 20):
+            raise ValueError("Provide between 1 and 20 template updates (or omit the list).")
+        return v
+
+    @model_validator(mode="after")
+    def at_least_one_change(self) -> "UpdateNoteTypeInput":
+        if self.new_name is None and self.css is None and self.template_updates is None and self.sort_field is None:
+            raise ValueError("Provide at least one of new_name, css, template_updates, or sort_field.")
+        return self
+
+
+class AddNoteTypeFieldInput(BaseModel):
+    """Input parameters for add_note_type_field tool."""
+    note_type: str = Field(..., min_length=1, max_length=100, description="Existing note type name")
+    field_name: str = Field(..., min_length=1, max_length=100, description="Name of the new field (must not already exist)")
+    position: Optional[int] = Field(
+        None,
+        description="0-based insertion position; omit (or the field count) appends the field at the end",
+    )
+
+    @field_validator("note_type")
+    @classmethod
+    def validate_note_type(cls, v: str) -> str:
+        return validate_note_type_name(v)
+
+    @field_validator("field_name")
+    @classmethod
+    def validate_field_name(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Field name must not be empty.")
+        return _reject_control_chars(v, "Field name")
+
+
+class RemoveNoteTypeFieldInput(BaseModel):
+    """Input parameters for remove_note_type_field tool (destructive: snapshots first)."""
+    note_type: str = Field(..., min_length=1, max_length=100, description="Existing note type name")
+    field_name: str = Field(..., min_length=1, max_length=100, description="Existing field of the note type")
+    confirm: bool = Field(
+        False,
+        description="Must be true to actually remove (the field's content is deleted on EVERY note of the type; "
+        "a pre-remove-note-type-field snapshot is taken first)",
+    )
+
+    @field_validator("note_type")
+    @classmethod
+    def validate_note_type(cls, v: str) -> str:
+        return validate_note_type_name(v)
+
+    @field_validator("field_name")
+    @classmethod
+    def validate_field_name(cls, v: str) -> str:
+        return _reject_control_chars(v, "Field name")
+
+
+class RenameNoteTypeFieldInput(BaseModel):
+    """Input parameters for rename_note_type_field tool."""
+    note_type: str = Field(..., min_length=1, max_length=100, description="Existing note type name")
+    field_name: str = Field(..., min_length=1, max_length=100, description="Existing field of the note type")
+    new_name: str = Field(..., min_length=1, max_length=100, description="New field name (must not collide within the type)")
+
+    @field_validator("note_type", "new_name")
+    @classmethod
+    def validate_names(cls, v: str) -> str:
+        return validate_note_type_name(v)
+
+
+class RepositionNoteTypeFieldInput(BaseModel):
+    """Input parameters for reposition_note_type_field tool."""
+    note_type: str = Field(..., min_length=1, max_length=100, description="Existing note type name")
+    field_name: str = Field(..., min_length=1, max_length=100, description="Existing field of the note type")
+    index: int = Field(..., description="New 0-based position for the field (0..field count - 1)")
+
+    @field_validator("note_type")
+    @classmethod
+    def validate_note_type(cls, v: str) -> str:
+        return validate_note_type_name(v)
+
+
+class AddNoteTypeTemplateInput(BaseModel):
+    """Input parameters for add_note_type_template tool."""
+    note_type: str = Field(..., min_length=1, max_length=100, description="Existing note type name")
+    template: TemplateInput = Field(..., description="The template to add (name must not already exist)")
+    position: Optional[int] = Field(
+        None,
+        description="0-based insertion position; omit (or the template count) appends the template at the end",
+    )
+
+    @field_validator("note_type")
+    @classmethod
+    def validate_note_type(cls, v: str) -> str:
+        return validate_note_type_name(v)
+
+
+class RemoveNoteTypeTemplateInput(BaseModel):
+    """Input parameters for remove_note_type_template tool (destructive: snapshots first)."""
+    note_type: str = Field(..., min_length=1, max_length=100, description="Existing note type name")
+    template_name: str = Field(..., min_length=1, max_length=5000, description="Existing template of the note type")
+    confirm: bool = Field(
+        False,
+        description="Must be true to actually remove (cards generated by the template are deleted; "
+        "a pre-remove-note-type-template snapshot is taken first)",
+    )
+
+    @field_validator("note_type")
+    @classmethod
+    def validate_note_type(cls, v: str) -> str:
+        return validate_note_type_name(v)
+
+
+class RepositionNoteTypeTemplateInput(BaseModel):
+    """Input parameters for reposition_note_type_template tool."""
+    note_type: str = Field(..., min_length=1, max_length=100, description="Existing note type name")
+    template_name: str = Field(..., min_length=1, max_length=5000, description="Existing template of the note type")
+    index: int = Field(..., description="New 0-based position for the template (0..template count - 1)")
+
+    @field_validator("note_type")
+    @classmethod
+    def validate_note_type(cls, v: str) -> str:
+        return validate_note_type_name(v)
+
+
+class DeleteNoteTypeInput(BaseModel):
+    """Input parameters for delete_note_type tool (destructive: snapshots first)."""
+    name: str = Field(..., min_length=1, max_length=100, description="Existing note type name (must have zero notes)")
+    confirm: bool = Field(
+        False,
+        description="Must be true to actually delete (a pre-delete-note-type snapshot is taken first)",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        return validate_note_type_name(v)
+
+
+class RestoreNoteTypeToStockInput(BaseModel):
+    """Input parameters for restore_note_type_to_stock tool (destructive: snapshots first)."""
+    name: str = Field(..., min_length=1, max_length=100, description="Existing note type name")
+    force_kind: Optional[str] = Field(
+        None,
+        max_length=100,
+        description="Which stock type to restore to ('basic', 'basic_and_reversed', 'basic_optional_reversed', "
+        "'basic_typing', 'cloze', 'image_occlusion'); omit to use the type's original stock kind",
+    )
+    confirm: bool = Field(
+        False,
+        description="Must be true to actually restore (fields/templates/CSS are replaced by the stock defaults; "
+        "a pre-restore-note-type-stock snapshot is taken first)",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        return validate_note_type_name(v)
+
+    @field_validator("force_kind")
+    @classmethod
+    def validate_force_kind(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        s = v.strip().lower()
+        if not s:
+            raise ValueError("force_kind must not be empty (omit it to use the original stock kind).")
+        return _reject_control_chars(s, "force_kind")
+
+
 # -- card tools ----------------------------------------------------------------------
 
 
