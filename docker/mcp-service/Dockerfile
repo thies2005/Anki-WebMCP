@@ -1,7 +1,7 @@
 # Anki MCP Service Dockerfile
 # Single headless multi-user service: MCP endpoint, token portal, and admin UI
 # on one port. Collections are served in-process via the official `anki` wheel.
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 LABEL maintainer="Antigravity"
 LABEL org.opencontainers.image.title="Anki MCP Service"

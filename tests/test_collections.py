@@ -829,3 +829,12 @@ async def test_sync_user_still_takes_a_pre_sync_backup(make_registry, monkeypatc
     assert seen == [("sage", "pre-sync")]
     entries = reg.list_backups("sage")
     assert [entry["reason"] for entry in entries] == ["pre-sync"]
+
+
+def test_runtime_has_stdlib_zstd_for_restore():
+    """Restore reads the wheel's zstd-compressed collection.anki21b backup
+    member, which needs the stdlib compression.zstd module (Python 3.14+).
+    This pins the runtime floor: the Docker image and CI must never regress
+    to a Python where restore dies at runtime (caught by CI after the Docker
+    image was still 3.12 while local dev was 3.14)."""
+    from compression import zstd  # noqa: F401

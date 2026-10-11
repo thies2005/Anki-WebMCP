@@ -44,7 +44,7 @@
 ## Prerequisites
 
 - **Docker Engine 24+ and Docker Compose v2.24+** (the exposure-mode override files use the `!override` compose tag, which requires 2.24+).
-- **amd64 or arm64 host** — both are supported natively: the pinned `anki` wheel ships `manylinux_2_35` builds for x86_64 and aarch64 on the multi-arch `python:3.12-slim` base.
+- **amd64 or arm64 host** — both are supported natively: the pinned `anki` wheel ships `manylinux_2_35` builds for x86_64 and aarch64 on the multi-arch `python:3.14-slim` base (3.14 required: snapshot restore reads the wheel's zstd-compressed backup member via the stdlib `compression.zstd` module).
 - ~450 MB image and roughly **150–350 MB RAM per open collection** (the pool keeps at most `MAX_OPEN_COLLECTIONS` collections open, LRU-bounded).
 - A free host port `8000` (configurable mapping).
 - A Cloudflare account with a Zero Trust tunnel (only for Exposure Mode 1).
@@ -82,7 +82,7 @@ One containerized service and an optional exposure gateway:
 
 ### Component Details
 1. **`anki-mcp`** (the only service):
-   - Python 3.12 on `python:3.12-slim`, running the official MCP SDK (`mcp`) and the official **`anki` wheel 26.9.3** — collections are real Anki collections opened in-process, no separate app, no X11, no add-ons.
+   - Python 3.14 on `python:3.14-slim`, running the official MCP SDK (`mcp`) and the official **`anki` wheel 26.9.3** — collections are real Anki collections opened in-process, no separate app, no X11, no add-ons.
    - Serves **three surfaces on port 8000**: the Streamable HTTP MCP endpoint at `/mcp`, the user **token portal** at `/`, and the **admin UI** at `/admin`.
    - Data layout on the `/data` volume:
      ```
