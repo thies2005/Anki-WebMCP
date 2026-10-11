@@ -21,13 +21,15 @@ from src.logging_util import RedactingFormatter
 from src.ledger import MAX_KEY_LEN
 from src.models import AddNotesInput, NoteInput
 from src.sync_manager import SyncManager
+from src.users import UserStore
 
 
 @pytest_asyncio.fixture
 async def env(tmp_path):
     """Registry + sync manager over a shared tmp data_dir (no collection needed)."""
     reg = CollectionRegistry(data_dir=str(tmp_path))
-    manager = SyncManager(reg, None)
+    # Real (empty) user store: the mutation path reads it for the local-only nudge
+    manager = SyncManager(reg, UserStore(str(tmp_path / "users.json")))
     yield reg, manager
     await reg.close_all()
 

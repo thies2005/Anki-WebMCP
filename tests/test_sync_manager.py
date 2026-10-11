@@ -301,7 +301,9 @@ async def test_concurrent_same_key_mutations_apply_once(env):
     # Exactly one caller applied the mutation; the other replayed the cached
     # committed result (same assertions as the sequential replay test).
     assert counter["n"] == 1
-    committed = [r for r in results if not r.warnings]
+    # The local-only nudge warning rides on both responses now, so discriminate
+    # by the replay marker rather than by emptiness of the warnings list.
+    committed = [r for r in results if not any("Idempotent operation replay" in w for w in r.warnings)]
     replayed = [r for r in results if any("Idempotent operation replay" in w for w in r.warnings)]
     assert len(committed) == 1
     assert len(replayed) == 1
@@ -361,3 +363,75 @@ async def test_maintenance_mode_rejects_mutation(env):
     assert "maintenance mode" in res.error
     assert called["v"] is False
     assert res.sync_status.pre_sync == "skipped"
+
+
+# -- local-only nudge on committed mutations -----------------------------------------
+
+
+def _has_sync_nudge(res) -> bool:
+    return any("sync_collection" in w for w in res.warnings)
+
+
+@pytest.mark.asyncio
+async def test_committed_mutation_warns_changes_stay_local(env):
+    """Alice has AnkiWeb credentials: a committed mutation must tell the model
+    that the change is local only and sync_collection is needed to push it."""
+    reg, store, manager = env
+
+    async def mutation():
+        return await reg.run("alice", add_basic_note, "nudge-front", "back")
+
+    res = await manager.execute_mutation("alice", operation_name="add_notes", mutation_fn=mutation)
+
+    assert res.success is True
+    assert _has_sync_nudge(res)
+
+
+@pytest.mark.asyncio
+async def test_committed_mutation_without_credentials_gives_no_sync_nudge(env):
+    """No AnkiWeb credentials saved: sync_collection would only fail, so the
+    nudge must not direct the model into a dead end."""
+    reg, store, manager = env
+
+    async def mutation():
+        return await reg.run("no_creds", add_basic_note, "nudge-front", "back")
+
+    res = await manager.execute_mutation("no_creds", operation_name="add_notes", mutation_fn=mutation)
+
+    assert res.success is True
+    assert not _has_sync_nudge(res)
+    assert res.warnings == []
+
+
+@pytest.mark.asyncio
+async def test_failed_mutation_gives_no_sync_nudge(env):
+    reg, store, manager = env
+
+    async def failing():
+        raise ValueError("Invalid field Front")
+
+    res = await manager.execute_mutation("alice", operation_name="add_notes", mutation_fn=failing)
+
+    assert res.success is False
+    assert not _has_sync_nudge(res)
+
+
+@pytest.mark.asyncio
+async def test_replayed_mutation_also_carries_sync_nudge(env):
+    """A retry replaying the cached committed result still needs the nudge —
+    the caller of the retry may never have seen the original response."""
+    reg, store, manager = env
+
+    async def mutation():
+        return await reg.run("alice", add_basic_note, "replay-nudge", "back")
+
+    first = await manager.execute_mutation(
+        "alice", operation_name="add_notes", mutation_fn=mutation, idempotency_key="nudge-replay"
+    )
+    second = await manager.execute_mutation(
+        "alice", operation_name="add_notes", mutation_fn=mutation, idempotency_key="nudge-replay"
+    )
+
+    assert first.success and second.success
+    assert any("Idempotent operation replay" in w for w in second.warnings)
+    assert _has_sync_nudge(second)

@@ -30,6 +30,7 @@ from src.models import (
     TemplateInput,
 )
 from src.sync_manager import SyncManager
+from src.users import UserStore
 from src.tools import cards as card_tools
 from src.tools import decks as deck_tools
 from src.tools import media as media_tools
@@ -48,7 +49,8 @@ def add_basic_note(col, front, back="back", deck="Default"):
 async def env(tmp_path):
     """Registry + sync manager over a shared tmp data_dir."""
     reg = CollectionRegistry(data_dir=str(tmp_path))
-    manager = SyncManager(reg, None)
+    # Real (empty) user store: the mutation path reads it for the local-only nudge
+    manager = SyncManager(reg, UserStore(str(tmp_path / "users.json")))
     yield reg, manager
     await reg.close_all()
 

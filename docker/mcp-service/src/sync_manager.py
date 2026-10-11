@@ -39,6 +39,10 @@ logger = logging.getLogger("anki_mcp.sync_manager")
 
 _REPLAY_WARNING = "Idempotent operation replay. Returned cached result from {}."
 _LEDGER_WRITE_WARNING = "Failed to write to persistent idempotency ledger."
+_UNSYNCED_CHANGES_WARNING = (
+    "Changes committed locally only. Call sync_collection to push them to "
+    "AnkiWeb and pull remote changes."
+)
 
 
 class SyncManager:
@@ -89,6 +93,18 @@ class SyncManager:
                 "save them in the web portal before syncing."
             )
         return user.ankiweb_email, user.ankiweb_password
+
+    def _sync_nudge(self, username: str) -> Optional[str]:
+        """The local-only warning appended to committed mutation responses.
+
+        None when the account has no saved AnkiWeb credentials — sync_collection
+        would only fail for them, so there is nothing actionable to point the
+        calling model at.
+        """
+        user = self.store.get_user(username)
+        if user is None or not (user.ankiweb_email and user.ankiweb_password):
+            return None
+        return _UNSYNCED_CHANGES_WARNING
 
     @staticmethod
     def _on_step(username: str) -> Callable[[str], None]:
@@ -261,12 +277,16 @@ class SyncManager:
                         # %r + truncate: the key is client-controlled and must
                         # never split or bloat a log record (CWE-117).
                         logger.info("Idempotency hit for key %r: returning cached committed response", idempotency_key[:64])
+                        replay_warnings = [_REPLAY_WARNING.format(existing.get("timestamp"))]
+                        nudge = self._sync_nudge(username)
+                        if nudge:
+                            replay_warnings.append(nudge)
                         return MutationResponse(
                             success=True,
                             local_status="committed",
                             sync_status=SyncStatus(pre_sync="skipped", post_sync="skipped"),
                             data=existing.get("data"),
-                            warnings=[_REPLAY_WARNING.format(existing.get("timestamp"))],
+                            warnings=replay_warnings,
                         )
                     if status == "failed":
                         logger.info("Idempotency hit for key %r: returning cached failure", idempotency_key[:64])
@@ -307,6 +327,10 @@ class SyncManager:
                 except Exception as e:
                     logger.error("Failed to commit idempotency record for key '%s': %s", idempotency_key, e)
                     warnings.append(_LEDGER_WRITE_WARNING)
+
+            nudge = self._sync_nudge(username)
+            if nudge:
+                warnings.append(nudge)
 
             return MutationResponse(
                 success=True,

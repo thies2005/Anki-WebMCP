@@ -87,6 +87,25 @@ COLLECTION_IDLE_SWEEP_SECONDS = 60.0
 # summarised in one muted "+N older" line (they stay downloadable on disk).
 BACKUP_LIST_LIMIT = 20
 
+# Standing guidance returned in the MCP initialize handshake. Connected models
+# (claude.ai, Perplexity, ...) never see the server's source; without this
+# they have no way to learn that mutations stay local until sync_collection.
+SERVER_INSTRUCTIONS = (
+    "Mutating tools (notes, decks, cards, tags, note types, media, answering "
+    "reviews) write to this server's local copy of the Anki collection only - "
+    "nothing reaches AnkiWeb automatically. After finishing a batch of changes, "
+    "call sync_collection to push them to AnkiWeb and pull changes made on "
+    "other devices; call it before reading when data from other devices must "
+    "be current. sync_collection requires AnkiWeb credentials saved in the web "
+    "portal's account settings."
+)
+
+# Appended to every mutating tool's description so the local-only rule also
+# reaches clients that ignore the initialize instructions.
+LOCAL_UNTIL_SYNCED_SUFFIX = (
+    " Changes stay local until sync_collection pushes them to AnkiWeb."
+)
+
 # Globals initialized in factory
 settings: Settings = get_settings()
 logger: logging.Logger = setup_logging(settings.log_level)
@@ -951,6 +970,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         name="anki-mcp",
         version="1.0.0",
         description="Self-hosted Anki Desktop Model Context Protocol (MCP) server",
+        instructions=SERVER_INSTRUCTIONS,
     )
 
     # 1. list_decks
@@ -1000,7 +1020,12 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 5. sync_collection
-    @mcp.tool(description="Trigger explicit synchronization with official AnkiWeb.")
+    @mcp.tool(
+        description="Two-way sync with official AnkiWeb: pushes local changes and pulls remote ones. "
+        "Call this after a batch of mutating tools (their changes stay local until then), and before "
+        "reads when data from other devices must be current. Requires AnkiWeb credentials saved in "
+        "the web portal."
+    )
     async def sync_collection(ctx: Context) -> Dict[str, Any]:
         username = _username_from_context(ctx)
         if username is None:
@@ -1013,6 +1038,7 @@ def create_app(custom_settings: Optional[Settings] = None):
     # 6. add_notes
     @mcp.tool(
         description="Add notes to the collection with duplicate prevention and per-user idempotency."
+                     + LOCAL_UNTIL_SYNCED_SUFFIX
     )
     async def add_notes(
         notes: List[Dict[str, Any]],
@@ -1035,7 +1061,7 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 7. update_note_fields
-    @mcp.tool(description="Update fields on an existing note.")
+    @mcp.tool(description="Update fields on an existing note." + LOCAL_UNTIL_SYNCED_SUFFIX)
     async def update_note_fields(note_id: int, fields: Dict[str, str], ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1048,7 +1074,7 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 8. add_tags
-    @mcp.tool(description="Add tags to notes.")
+    @mcp.tool(description="Add tags to notes." + LOCAL_UNTIL_SYNCED_SUFFIX)
     async def add_tags(note_ids: List[int], tags: List[str], ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1063,6 +1089,7 @@ def create_app(custom_settings: Optional[Settings] = None):
     # 9. create_deck
     @mcp.tool(
         description="Create a deck ('Parent::Child' creates subdecks); an existing name resolves to its ID."
+                     + LOCAL_UNTIL_SYNCED_SUFFIX
     )
     async def create_deck(deck_name: str, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
@@ -1079,6 +1106,7 @@ def create_app(custom_settings: Optional[Settings] = None):
     @mcp.tool(
         description="Rename a deck (subdecks follow). DESTRUCTIVE: requires confirm=true; a "
         "pre-rename-deck snapshot backup is taken first and the rename is aborted if it fails."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
     )
     async def rename_deck(deck_id: int, new_name: str, confirm: bool = False, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
@@ -1098,6 +1126,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         description="Delete a deck, its subdecks and all their cards (the Default deck can never be "
         "deleted). DESTRUCTIVE: requires confirm=true; a pre-delete-deck snapshot backup is taken "
         "first and the deletion is aborted if it fails."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
     )
     async def delete_deck(deck_id: int, confirm: bool = False, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
@@ -1117,6 +1146,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         description="Delete notes and their cards by ID; missing IDs are reported, not fatal. "
         "DESTRUCTIVE: requires confirm=true; a pre-delete-notes snapshot backup is taken first "
         "and the deletion is aborted if it fails."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
     )
     async def delete_notes(
         note_ids: List[int],
@@ -1138,7 +1168,7 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 13. remove_tags
-    @mcp.tool(description="Remove tags from notes.")
+    @mcp.tool(description="Remove tags from notes." + LOCAL_UNTIL_SYNCED_SUFFIX)
     async def remove_tags(note_ids: List[int], tags: List[str], ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1165,6 +1195,7 @@ def create_app(custom_settings: Optional[Settings] = None):
     @mcp.tool(
         description="Create a note type from field names and card templates (omit templates for a "
         "default single template over the first two fields). Refuses an existing name."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
     )
     async def create_note_type(
         name: str,
@@ -1212,7 +1243,8 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 18. suspend_cards
-    @mcp.tool(description="Suspend cards so they leave the review queue until unsuspended.")
+    @mcp.tool(description="Suspend cards so they leave the review queue until unsuspended."
+                          + LOCAL_UNTIL_SYNCED_SUFFIX)
     async def suspend_cards(card_ids: List[int], ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1225,7 +1257,7 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 19. unsuspend_cards
-    @mcp.tool(description="Unsuspend previously suspended cards.")
+    @mcp.tool(description="Unsuspend previously suspended cards." + LOCAL_UNTIL_SYNCED_SUFFIX)
     async def unsuspend_cards(card_ids: List[int], ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1240,6 +1272,7 @@ def create_app(custom_settings: Optional[Settings] = None):
     # 20. set_due_date
     @mcp.tool(
         description="Set cards' due date to N days from today ('3') or a random range ('0-2')."
+                     + LOCAL_UNTIL_SYNCED_SUFFIX
     )
     async def set_due_date(card_ids: List[int], days: str, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
@@ -1253,7 +1286,7 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 21. move_cards
-    @mcp.tool(description="Move cards to another deck (target deck must exist).")
+    @mcp.tool(description="Move cards to another deck (target deck must exist)." + LOCAL_UNTIL_SYNCED_SUFFIX)
     async def move_cards(card_ids: List[int], deck_id: int, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1282,6 +1315,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         description="Answer a queued card with rating 1=Again, 2=Hard, 3=Good, 4=Easy (v3 scheduler). "
         "The card must currently be in the review queue; only the first 50 queued cards are "
         "considered, so a card deeper in a long queue is refused until it reaches the front."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
     )
     async def answer_card(
         card_id: int,
@@ -1306,6 +1340,7 @@ def create_app(custom_settings: Optional[Settings] = None):
     @mcp.tool(
         description="Store a media file (standard base64, max 4 MiB decoded, single-segment "
         "filename); returns the actual stored name."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
     )
     async def store_media_file(filename: str, data_base64: str, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None

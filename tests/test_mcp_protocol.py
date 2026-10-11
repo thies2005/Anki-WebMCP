@@ -231,3 +231,78 @@ async def test_user_scoping_end_to_end_two_users_isolated(app_with_users):
             assert alice_stats["summary"]["total_cards"] == 1
             assert os.path.isfile(os.path.join(settings.data_dir, "users", "alice", "collection.anki2"))
             assert os.path.isfile(os.path.join(settings.data_dir, "users", "bob", "collection.anki2"))
+
+
+# -- scenario 5: sync discoverability (instructions, descriptions, nudge) ------------
+
+
+@pytest.mark.asyncio
+async def test_initialize_result_carries_sync_guidance_instructions(app_with_users):
+    """The initialize handshake must teach clients the local-until-synced rule.
+
+    Connected models (claude.ai, Perplexity, ...) only see the server through
+    tools; without ``instructions`` naming sync_collection they cannot know a
+    separate call is required to reach AnkiWeb.
+    """
+    app, settings, alice_token, _ = app_with_users
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+            headers = {
+                "Authorization": f"Bearer {alice_token}",
+                "Accept": "application/json, text/event-stream",
+            }
+            init_res = await client.post("/mcp", headers=headers, json={
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "0"},
+                },
+            })
+            assert init_res.status_code == 200
+            result = _parse_mcp_response(init_res)["result"]
+            instructions = result.get("instructions") or ""
+            assert "sync_collection" in instructions
+            assert "AnkiWeb" in instructions
+
+
+# Every tool that changes collection state; each description must tell the
+# model that the change is local until sync_collection runs.
+MUTATING_TOOLS = {
+    "add_notes", "update_note_fields", "add_tags", "remove_tags",
+    "create_deck", "rename_deck", "delete_deck", "delete_notes",
+    "create_note_type", "suspend_cards", "unsuspend_cards",
+    "set_due_date", "move_cards", "answer_card", "store_media_file",
+}
+
+
+@pytest.mark.asyncio
+async def test_tool_descriptions_teach_local_only_semantics(app_with_users):
+    """Every mutating tool's description names sync_collection; sync_collection
+    itself explains when to call it; read-only tools stay untouched."""
+    app, settings, alice_token, _ = app_with_users
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+            headers = await _init_session(client, alice_token)
+            list_res = await client.post("/mcp", headers=headers, json={
+                "jsonrpc": "2.0", "id": 40, "method": "tools/list",
+            })
+            assert list_res.status_code == 200
+            payload = _parse_mcp_response(list_res)
+            tools = {t["name"]: t for t in payload["result"]["tools"]}
+
+            missing = sorted(
+                name for name in MUTATING_TOOLS
+                if "sync_collection" not in tools[name].get("description", "")
+            )
+            assert missing == [], f"mutating tools lacking sync guidance: {missing}"
+
+            # sync_collection explains WHEN to call it, not just that it exists
+            sync_desc = tools["sync_collection"]["description"]
+            assert "after" in sync_desc.lower()
+
+            # Read-only exemplars keep their descriptions free of the suffix
+            for readonly in ("list_decks", "search_notes", "get_note"):
+                assert "sync_collection" not in tools[readonly]["description"]
