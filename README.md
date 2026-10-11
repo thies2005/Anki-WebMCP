@@ -30,7 +30,7 @@
 ### What this is
 - **One headless service** (no GUI, no browser desktop) that owns Anki collections **in-process** via the official `anki` Python library (pinned `anki==26.9.3`).
 - **Multi-user by design**: every account gets its own collection, its own MCP token, and its own AnkiWeb credentials. Built for a household or small group (comfortable at 2–5 users; no hard cap).
-- **Web portal and admin UI** on the same port: users log in to view/copy their MCP token, enter AnkiWeb credentials, trigger a sync, and see deck stats; admins manage accounts at `/admin`.
+- **Web portal and admin UI** on the same port: users log in to view/copy their MCP token, enter AnkiWeb credentials, trigger a sync, browse their decks as a collapsible tree, and manage **Version history** snapshots; admins manage accounts at `/admin`.
 - **Official AnkiWeb Cloud Sync**, explicit and per-user.
 - **Remote Streamable HTTP MCP server** at `/mcp`, authenticated with per-user bearer tokens, for AI assistants (Claude, Cursor, custom agents).
 
@@ -89,7 +89,7 @@ One containerized service and an optional exposure gateway:
      /data/users.json                     # account store (0600)
      /data/users/<username>/collection.anki2
      /data/users/<username>/collection.media/
-     /data/users/<username>/backups/      # pre-sync snapshots (BACKUP_RETENTION)
+     /data/users/<username>/backups/      # snapshots (pre-sync / destructive / manual; BACKUP_RETENTION, default 20)
      /data/ledgers/<username>/ledger.json # per-user idempotency ledger
      /data/deleted/<username>-<timestamp> # archived on account deletion
      ```
@@ -142,7 +142,7 @@ sequenceDiagram
 - **Duplicate Prevention**: `add_notes` pre-checks each candidate against the target deck using the model's first field (exact-match search) before creating anything.
 - **Crash-Window Semantics**: ledger records are flushed atomically (`tempfile` + `fsync` + `os.replace`). If a power loss lands between the collection write and the ledger commit, the first-field duplicate check prevents accidental duplicates on retry (when `allow_duplicates` is false).
 - **Ambiguous-outcome semantics**: if a sync drops mid-flight with an unknown outcome, the response carries an outcome-UNKNOWN warning and the idempotency key is deliberately **not** recorded — verify collection state before retrying. Deterministic failures (e.g. duplicate rejection) do persist a `failed` record.
-- **Bounded state**: the ledger keeps at most 1000 recent keys (each key capped at 256 characters); at most `BACKUP_RETENTION` pre-sync backups per user; at most `MAX_OPEN_COLLECTIONS` collections open at once (idle ones close after `IDLE_TIMEOUT_MINUTES`); at most `MCP_MAX_SESSIONS` concurrent MCP sessions across all users, reaped after `MCP_SESSION_IDLE_TIMEOUT` seconds idle.
+- **Bounded state**: the ledger keeps at most 1000 recent keys (each key capped at 256 characters); at most `BACKUP_RETENTION` snapshots per user (default **20**, env-tunable) covering pre-sync, pre-destructive-change, manual, and pre-restore snapshots; at most `MAX_OPEN_COLLECTIONS` collections open at once (idle ones close after `IDLE_TIMEOUT_MINUTES`); at most `MCP_MAX_SESSIONS` concurrent MCP sessions across all users, reaped after `MCP_SESSION_IDLE_TIMEOUT` seconds idle.
 
 ---
 
@@ -203,6 +203,8 @@ Expected health output:
 3. As each user: log in at the portal, **copy your MCP token** (shown on the portal page; use it in your MCP client — see [MCP Client Integration](#mcp-client-integration)).
 4. To connect AnkiWeb, enter your **AnkiWeb email/password** under portal → Credentials, then press **Sync**. The first sync pulls your existing collection into `/data/users/<you>/`; from then on, explicit syncs move changes between this service and AnkiWeb.
 5. Reviewing happens on your normal Anki clients (desktop/AnkiDroid/AnkiMobile): sync them against the same AnkiWeb account. There is no browser-based reviewer here.
+
+**Version history** (portal): a snapshot of the collection is taken before **every sync and every destructive change** (and via the portal's *Back up now* button). The Version history section lists the newest snapshots with timestamp, reason, and size, and each can be **restored** — restoring replaces the current collection, and the replaced state is kept automatically as a `pre-restore` snapshot, so a restore is itself reversible — or **downloaded** as a `.colpkg` file. After a restore, the next AnkiWeb sync reconciles the differences; review before syncing. Snapshots exclude media files.
 
 ---
 
@@ -314,8 +316,26 @@ All tools operate on the **authenticated user's** collection — the token decid
 | `add_notes` | `notes: list[NoteInput]`<br>`idempotency_key?: string`<br>`allow_duplicates?: bool` | Creates flashcards locally with duplicate detection, per-user locking, and ledger-backed exactly-once semantics. |
 | `update_note_fields` | `note_id: int`<br>`fields: dict[str, str]` | Updates specific note fields under the per-user write lock. |
 | `add_tags` | `note_ids: list[int]`<br>`tags: list[str]` | Adds tags to one or more notes under the per-user write lock. |
+| `create_deck` | `deck_name: string` | Creates a deck (`Parent::Child` creates subdecks); an existing name resolves to its ID. |
+| `rename_deck` | `deck_id: int`<br>`new_name: string`<br>`confirm: bool` | Renames a deck (subdecks follow). *Destructive — see note below.* |
+| `delete_deck` | `deck_id: int`<br>`confirm: bool` | Deletes a deck, its subdecks and all their cards (the `Default` deck can never be deleted). *Destructive.* |
+| `delete_notes` | `note_ids: list[int]`<br>`confirm: bool`<br>`idempotency_key?: string` | Deletes notes and their cards by ID (missing IDs reported, not fatal). *Destructive.* |
+| `remove_tags` | `note_ids: list[int]`<br>`tags: list[str]` | Removes tags from notes under the per-user write lock. |
+| `list_note_types` | *none* | Lists note types with their field names and card templates. |
+| `create_note_type` | `name: string`<br>`fields: list[str]`<br>`templates?: list[Template]` | Creates a note type from fields and templates (default single template when omitted); refuses an existing name. |
+| `find_cards` | `query: string`<br>`limit?: int`<br>`offset?: int` | Search cards by Anki query with bounded pagination. |
+| `get_card` | `card_id: int` | Retrieves a card's fields, rendered question/answer, and scheduling state. |
+| `suspend_cards` | `card_ids: list[int]` | Suspends cards so they leave the review queue until unsuspended. |
+| `unsuspend_cards` | `card_ids: list[int]` | Unsuspends previously suspended cards. |
+| `set_due_date` | `card_ids: list[int]`<br>`days: string` | Sets cards' due date to N days from today (`"3"`) or a random range (`"0-2"`). |
+| `move_cards` | `card_ids: list[int]`<br>`deck_id: int` | Moves cards to another deck (target deck must exist). |
+| `get_review_queue` | `limit?: int (default 10)` | Fetches the scheduler's current review queue with capped questions. |
+| `answer_card` | `card_id: int`<br>`rating: int (1-4)`<br>`idempotency_key?: string` | Answers a queued card (`1`=Again … `4`=Easy, v3 scheduler). **Only answers cards in the review queue** (the first 50 queued cards — new and due alike); deeper cards are refused until they surface. |
+| `store_media_file` | `filename: string`<br>`data_base64: string` | Stores a media file (standard base64). **Decoded size cap: 4 MiB**; returns the actual stored name. |
+| `get_media_file` | `filename: string` | Reads a media file back as base64 (files over 4 MiB are refused). |
+| `list_media_files` | `limit?: int (default 200)` | Lists media filenames (sorted), capped at the requested limit. |
 
-*Safety restriction*: Card/note deletion, raw database execution, and arbitrary add-on passthrough are deliberately omitted to preserve collection integrity.
+*Destructive tools* (`rename_deck`, `delete_deck`, `delete_notes`) require `confirm=true` **and always create a snapshot in `backups/` first** — if the snapshot fails, the operation is aborted (fail-closed), so every destructive change stays reversible from the portal's Version history. Raw SQL execution and arbitrary add-on passthrough remain deliberately omitted to preserve collection integrity.
 
 ---
 
@@ -331,16 +351,19 @@ All tools operate on the **authenticated user's** collection — the token decid
    - Per-user tokens; only their **sha256 hashes** are used for authentication (constant-time comparison).
    - `Authorization: Bearer <token>` and `X-API-Key: <token>` are the only accepted transports for the token (never query parameters).
    - Unknown paths require a valid token; only `/health` and the web-session routes are exempt.
-4. **Web Sessions**:
+4. **MCP Write Safety**:
+   - Destructive MCP operations are **snapshot-or-abort**: `rename_deck`, `delete_deck`, and `delete_notes` require `confirm=true` and take a snapshot into the user's `backups/` **before** touching the collection — if the snapshot fails, the operation is aborted. Portal syncs and restores are snapshot-backed the same way (a restore keeps the replaced state as an automatic `pre-restore` snapshot).
+   - There is still **NO raw SQL and NO arbitrary execution** surface: every tool call goes through validated input models and registry methods only.
+5. **Web Sessions**:
    - Signed, `HttpOnly` session cookies; every state-changing form carries a CSRF token bound to the session. The session cookie is `SameSite=Lax` (not strict) so the OAuth authorize flow — a cross-site top-level GET from the connector's host (e.g. claude.ai) — sees an existing session; cross-site POSTs never carry the cookie, and the login/consent forms are CSRF-protected on top.
    - When the portal is served over HTTPS through a reverse proxy, set `FORCE_SECURE_COOKIES=true` so session and flash cookies carry the `Secure` attribute (never sent over plain HTTP).
    - Deleting an account invalidates its token immediately (auth checks the store on every MCP request).
-5. **OAuth authorization server** (for claude.ai custom connectors):
+6. **OAuth authorization server** (for claude.ai custom connectors):
    - RFC 7591 dynamic registration is open but bounded: at most 250 client records, name/URI fields length-capped, request bodies capped at 64 KiB before parsing (the OAuth endpoints are reachable without a token by design).
    - Authorization codes are single-use, 60-second, PKCE-S256-bound, in-memory only. Refresh tokens are persisted only as sha256 hashes, capped at 10 per user, and rotated on every use — replaying one burns it.
    - The consent screen requires a live portal session (account must exist and predate no revocation epoch) and shows the redirect destination's host, since the client name is attacker-choosable under open registration.
    - Grant eviction: changing the user's password or regenerating the user's MCP token rejects all of that user's outstanding grants at their next refresh — a leaked connector cannot keep minting fresh tokens.
-6. **Documented trade-offs (read before exposing publicly)**:
+7. **Documented trade-offs (read before exposing publicly)**:
    - The portal **re-displays the raw MCP token** on demand, so tokens are stored **reversibly** in `users.json` — a must-redisplay secret cannot be hash-only. The file is `0600` on the service's volume, whose bytes are therefore token-grade sensitive. Records from before this field existed show "regenerate to view" until the token is regenerated.
    - **AnkiWeb credentials are also stored at rest** in the same `users.json` (the service must be able to sync unattended). Same file, same caveats: anyone who can read the volume can read them.
    - The service enforces a **single writer per collection**: do not open the same `/data/users/<name>/collection.anki2` from another Anki instance.
@@ -348,7 +371,7 @@ All tools operate on the **authenticated user's** collection — the token decid
    - **HTTPS is required in front of the portal** for any non-localhost access (logins and tokens cross the wire). Use the Cloudflare or Coolify exposure modes, or your own TLS reverse proxy.
    - `/health` is intentionally unauthenticated; it reports only liveness/degradation state, never collection data.
    - In Cloudflare Tunnel mode, ingress rules live in the Cloudflare dashboard — route only port 8000.
-7. **Log Redaction**: automatic filters mask Authorization headers, bearer tokens, passwords, API keys, and AnkiWeb credentials before writing to container logs.
+8. **Log Redaction**: automatic filters mask Authorization headers, bearer tokens, passwords, API keys, and AnkiWeb credentials before writing to container logs.
 
 ---
 
@@ -368,6 +391,7 @@ All tools operate on the **authenticated user's** collection — the token decid
   Stop the service first: a running service holds the store in memory and would overwrite external edits on its next save.
 - **Tool errors mention collection locks**: another process is writing the same `collection.anki2` (second replica, or a desktop Anki pointed at the volume). The service enforces one writer per collection — remove the competing writer.
 - **Sync warnings about credentials / auth**: the user's AnkiWeb credentials are missing or were rejected — re-enter them in the portal (Credentials) and sync again.
+- **Restored a snapshot and now the next sync wants to change many cards**: expected. The restore replaced the local collection with an older state, so the following AnkiWeb sync reconciles the differences between the two (uploading or pulling per object). The replaced state was kept automatically as the `pre-restore` snapshot listed in Version history — if you changed your mind, restore that snapshot to get back exactly what was there before the restore, and review the outcome before syncing again.
 - **A retry unexpectedly says `Previous attempt with this idempotency key failed`**: the key was recorded as `failed` after an ambiguous loss. Use a new idempotency key; old entries age out of the 1000-entry ledger.
 - **`Bind for 127.0.0.1:8000 failed: port already allocated`**: another service holds the port — change the published port in `docker-compose.yml`.
 - **After upgrading the image, older Anki clients complain**: the pinned `anki` wheel version defines the collection schema; see the upgrade notes in [Operations](#operations).
@@ -417,7 +441,7 @@ PYTHONPATH=docker/mcp-service pytest tests/ -v
 - [x] Service starts fail-closed: refuses to run without `SESSION_SECRET`, and without bootstrap credentials on an empty store.
 - [x] Streamable HTTP MCP server on port 8000 requires a valid per-user bearer token.
 - [x] Per-user isolation verified at protocol level: two users' sessions on one instance see only their own notes and collections.
-- [x] All 8 MCP tools execute against real per-user collections with per-user locking and ledger-backed idempotency.
+- [x] All 26 MCP tools execute against real per-user collections with per-user locking and ledger-backed idempotency (destructive ones snapshot-or-abort).
 - [x] `/health` reports 200 healthy and 503 degraded (users store unavailable / data dir not writable).
 
 ---

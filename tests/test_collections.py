@@ -539,11 +539,16 @@ class _FakeSyncCollection:
         self.handshake = handshake
         self.calls = []
 
-    def create_backup(self, **kwargs):
-        pass
-
-    def await_backup_completion(self):
-        pass
+    def create_backup(self, backup_folder, force, wait_for_completion):
+        # Emulate the real backend: a backup writes backup-<ts>.colpkg into
+        # backup_folder and returns True. The registry's _backup_locked diffs
+        # the directory and renames the new file with the sync reason, so the
+        # fake must produce the file just like the wheel does.
+        os.makedirs(backup_folder, exist_ok=True)
+        name = time.strftime("backup-%Y-%m-%d-%H.%M.%S.colpkg")
+        with open(os.path.join(backup_folder, name), "w", encoding="utf-8") as f:
+            f.write("fake")
+        return True
 
     def sync_login(self, email, password, endpoint):
         self.calls.append(("login", email, endpoint))
@@ -631,3 +636,196 @@ async def test_sync_user_full_sync_direction_is_a_definitive_failure(make_regist
     assert result["success"] is False
     assert "full sync" in result["error"].lower()
     assert "outcome_unknown" not in result  # definitive refusal, not ambiguous
+
+
+# -- backup engine ---------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_backup_locked_tags_reason_and_prunes_to_retention(make_registry):
+    """_backup_locked renames the backend's plain backup-<ts>.colpkg into
+    backup-<ts>-<reason>.colpkg (timestamp prefix untouched, so lexicographic
+    order stays chronological) and prunes to backup_retention afterwards."""
+    reg = make_registry(backup_retention=2)
+    backups_dir = os.path.join(reg.data_dir, "users", "ursula", "backups")
+    os.makedirs(backups_dir)
+    # Older backups predate the new one lexicographically (real 2026 timestamps).
+    for ts in ("2020-01-01-00.00.01", "2020-01-01-00.00.02", "2020-01-01-00.00.03"):
+        with open(os.path.join(backups_dir, f"backup-{ts}.colpkg"), "w", encoding="utf-8") as f:
+            f.write("old")
+
+    await reg.run("ursula", add_basic_note, "changed", "back")  # a change, so the backend writes a file
+
+    def backup(col):
+        return reg._backup_locked(col, "ursula", "manual")
+
+    name = await reg.run("ursula", backup)
+
+    assert name.startswith("backup-") and name.endswith("-manual.colpkg")
+    assert name in os.listdir(backups_dir)  # renamed file is on disk
+
+    # Prune kept exactly the 2 newest: the newest seed plus the new backup.
+    kept = sorted(os.listdir(backups_dir))
+    assert kept == sorted(["backup-2020-01-01-00.00.03.colpkg", name])
+
+
+@pytest.mark.asyncio
+async def test_backup_locked_no_new_file_returns_newest_or_fails_loud(make_registry, monkeypatch):
+    """With no change since the last backup the backend writes no file
+    (verified against the wheel: returns False, or overwrites a same-second
+    name); _backup_locked must then return the NEWEST existing backup's name,
+    and fail loud when no backup exists at all."""
+    reg = make_registry()
+    await reg.run("walt", count_notes)  # opens collection, creates empty backups dir
+    col = reg._users["walt"].col
+    monkeypatch.setattr(col, "create_backup", lambda **kwargs: False)
+
+    def backup(col_):
+        return reg._backup_locked(col_, "walt", "pre-sync")
+
+    # Empty backups dir + no backup created: there is no name to return.
+    with pytest.raises(RuntimeError):
+        await reg.run("walt", backup)
+
+    # With an existing backup, "nothing changed" yields that backup's name.
+    seeded = "backup-2020-01-01-00.00.00-pre-sync.colpkg"
+    with open(os.path.join(reg.data_dir, "users", "walt", "backups", seeded), "w", encoding="utf-8") as f:
+        f.write("old")
+    assert await reg.run("walt", backup) == seeded
+
+
+@pytest.mark.asyncio
+async def test_backup_locked_rejects_unknown_reason(make_registry):
+    reg = make_registry()
+
+    def backup(col):
+        return reg._backup_locked(col, "petra", "because")
+
+    with pytest.raises(ValueError):
+        await reg.run("petra", backup)
+
+
+@pytest.mark.asyncio
+async def test_backup_user_rejects_bad_reason_and_username_before_any_io(make_registry):
+    reg = make_registry()
+    with pytest.raises(ValueError):
+        await reg.backup_user("yuri", "because")
+    with pytest.raises(ValueError):
+        await reg.backup_user("../evil", "manual")
+
+    # Rejected before any collection open or directory creation.
+    assert not os.path.exists(os.path.join(reg.data_dir, "users", "yuri"))
+    assert not reg.is_open("yuri")
+
+
+@pytest.mark.asyncio
+async def test_list_backups_parses_reason_and_sorts_newest_first(make_registry):
+    reg = make_registry()
+    backups_dir = os.path.join(reg.data_dir, "users", "xena", "backups")
+    os.makedirs(backups_dir)
+    files = {
+        "backup-2026-01-01-10.00.00.colpkg": "plain",
+        "backup-2026-01-02-10.00.00-pre-delete-notes.colpkg": "hyphen",
+        "backup-2026-01-03-10.00.00-manual.colpkg": "manual",
+        "backup-2020-01-01-00.00.00-pre-sync.colpkg": "old",
+        # Not a backup filename: must be invisible to the listing.
+        "not-a-backup.txt": "foreign",
+        "backup-2026-01-04-10.00.00-PRE-SYNC.colpkg": "uppercase reason",
+        "backup-2026-01-05-10.00.00-pre_sync.colpkg": "underscore reason",
+    }
+    for name, content in files.items():
+        with open(os.path.join(backups_dir, name), "w", encoding="utf-8") as f:
+            f.write(content)
+
+    listing = reg.list_backups("xena")
+
+    assert [entry["filename"] for entry in listing] == [
+        "backup-2026-01-03-10.00.00-manual.colpkg",  # newest first
+        "backup-2026-01-02-10.00.00-pre-delete-notes.colpkg",
+        "backup-2026-01-01-10.00.00.colpkg",
+        "backup-2020-01-01-00.00.00-pre-sync.colpkg",
+    ]
+    newest = listing[0]
+    assert newest["timestamp"] == "2026-01-03-10.00.00"
+    assert newest["reason"] == "manual"
+    assert newest["size_bytes"] == len("manual")
+    plain = listing[2]
+    assert plain["timestamp"] == "2026-01-01-10.00.00"
+    assert plain["reason"] == "unknown"  # no reason group in the filename
+
+    # Missing directory (user never opened): empty listing, not an error.
+    assert reg.list_backups("nobody-here") == []
+
+
+# -- restore -----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_restore_round_trip_brings_deleted_notes_back(make_registry):
+    """The full engine round-trip: snapshot -> delete -> restore -> notes back,
+    with the handle detached (next run() reopens) and a pre-restore snapshot
+    left behind so the restore itself is reversible."""
+    reg = make_registry()
+    await reg.run("nia", add_basic_note, "first", "one")
+    await reg.run("nia", add_basic_note, "second", "two")
+    snapshot = await reg.backup_user("nia", "manual")
+    assert snapshot.endswith("-manual.colpkg")
+
+    await reg.run("nia", lambda col: col.remove_notes(col.find_notes("")))
+    assert await reg.run("nia", count_notes) == 0
+
+    result = await reg.restore_backup("nia", snapshot)
+
+    assert result["restored_from"] == snapshot
+    # The open handle was detached; the next run() reopens the restored file.
+    assert not reg.is_open("nia")
+    fronts = sorted(
+        await reg.run("nia", lambda col: [col.get_note(nid).fields[0] for nid in col.find_notes("")])
+    )
+    assert fronts == ["first", "second"]
+
+    # A pre-restore snapshot was taken and is listed with its reason.
+    listing = reg.list_backups("nia")
+    assert result["pre_restore_snapshot"].endswith("-pre-restore.colpkg")
+    assert result["pre_restore_snapshot"] in [entry["filename"] for entry in listing]
+    assert "pre-restore" in [entry["reason"] for entry in listing]
+
+
+@pytest.mark.asyncio
+async def test_restore_backup_rejects_traversal_and_unknown_names(make_registry):
+    reg = make_registry()
+    snapshot = await reg.backup_user("omar", "manual")
+
+    for bad in ("../../etc/passwd", "..", "backup-2030-01-01-00.00.00-manual.colpkg", f"{snapshot}-extra"):
+        with pytest.raises(ValueError):
+            await reg.restore_backup("omar", bad)
+    with pytest.raises(ValueError):
+        await reg.restore_backup("../evil", snapshot)  # username path guard
+
+    # Rejections changed nothing: the valid backup still restores.
+    result = await reg.restore_backup("omar", snapshot)
+    assert result["restored_from"] == snapshot
+
+
+@pytest.mark.asyncio
+async def test_sync_user_still_takes_a_pre_sync_backup(make_registry, monkeypatch):
+    """Regression guard for the sync_user refactor: the pre-sync snapshot must
+    route through the shared _backup_locked path and leave a reason-tagged
+    file on disk (endpoint unreachable, so the login failure happens AFTER
+    the backup)."""
+    reg = make_registry()
+    seen = []
+    real_backup_locked = reg._backup_locked
+
+    def spy(col, username, reason):
+        seen.append((username, reason))
+        return real_backup_locked(col, username, reason)
+
+    monkeypatch.setattr(reg, "_backup_locked", spy)
+
+    result = await reg.sync_user("sage", "sage@example.com", "pw", endpoint="http://127.0.0.1:9")
+
+    assert result["success"] is False  # login failed, but the backup ran first
+    assert seen == [("sage", "pre-sync")]
+    entries = reg.list_backups("sage")
+    assert [entry["reason"] for entry in entries] == ["pre-sync"]

@@ -628,11 +628,14 @@ async def test_delete_user_with_open_collection_recreated_username_starts_fresh(
     _, new_bob_token = app.state.anki_store.create_user("bob", "bob2-pw")
 
     # Portal deck stats for the recreated account show an empty collection.
+    # (Intentional rendering change, version-history stage: the deck row is a
+    # collapsible tree leaf now, not a flat-table <tr><td> row.)
     web_client.cookies.set(SESSION_COOKIE_NAME, issue_session(SECRET, "bob"))
     portal = await web_client.get("/")
     assert portal.status_code == 200
     assert "old-bob-secret" not in portal.text
-    assert "<tr><td>Default</td><td>0</td><td>0</td><td>0</td></tr>" in portal.text
+    assert ">Default</span>" in portal.text
+    assert "0 notes &middot; 0 cards &middot; 0 due" in portal.text
 
     # MCP add_notes for the recreated account writes under users/bob (a FRESH
     # collection), never into the archived deleted/ file.
@@ -657,9 +660,10 @@ async def test_delete_user_with_open_collection_recreated_username_starts_fresh(
             ))["result"]["content"][0]["text"])
             assert search["total_matches"] == 0
 
-    # Portal now reflects the new account's own single note.
+    # Portal now reflects the new account's own single note (deck tree leaf
+    # rendering — see the comment on the empty-collection assertion above).
     portal = await web_client.get("/")
-    assert "<tr><td>Default</td><td>1</td><td>1</td><td>0</td></tr>" in portal.text
+    assert "1 notes &middot; 1 cards &middot; 0 due" in portal.text
     assert "old-bob-secret" not in portal.text
 
     # Old ledger keys are gone for the recreated account.

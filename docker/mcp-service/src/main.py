@@ -16,17 +16,48 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.context import Context
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+)
 import uvicorn
 
 from .auth import AuthMiddleware
 from .collections import CollectionRegistry
 from .config import Settings, get_settings, load_or_create_session_secret, validate_deployment_config
 from .logging_util import setup_logging
-from .models import AddNotesInput, AddTagsInput, GetNoteInput, SearchNotesInput, UpdateNoteFieldsInput
+from .models import (
+    AddNotesInput,
+    AddTagsInput,
+    AnswerCardInput,
+    CreateDeckInput,
+    CreateNoteTypeInput,
+    DeleteDeckInput,
+    DeleteNotesInput,
+    FindCardsInput,
+    GetCardInput,
+    GetMediaInput,
+    GetNoteInput,
+    ListMediaInput,
+    MoveCardsInput,
+    RemoveTagsInput,
+    RenameDeckInput,
+    ReviewQueueInput,
+    SearchNotesInput,
+    SetDueDateInput,
+    StoreMediaInput,
+    SuspendCardsInput,
+    TemplateInput,
+    UpdateNoteFieldsInput,
+)
 from .oauth import OAuthStore, add_oauth_routes
 from .sync_manager import SyncManager
+from .tools import cards as cards_tools
 from .tools import decks as deck_tools
+from .tools import media as media_tools
 from .tools import notes as note_tools
 from .tools import stats as stats_tools
 from .tools import sync as sync_tools
@@ -51,6 +82,10 @@ from .webflash import (
 
 # Interval between idle-collection sweeps (brief: close idle collections every minute).
 COLLECTION_IDLE_SWEEP_SECONDS = 60.0
+
+# Newest snapshots shown in the portal's Version history table; older ones are
+# summarised in one muted "+N older" line (they stay downloadable on disk).
+BACKUP_LIST_LIMIT = 20
 
 # Globals initialized in factory
 settings: Settings = get_settings()
@@ -273,6 +308,12 @@ _APP_CSS = """
   code { background: #f4f4f4; padding: 0.1rem 0.35rem; border-radius: 4px; overflow-wrap: anywhere; }
   pre.syncout { background: #fafafa; border: 1px solid #e3e3e3; border-radius: 4px;
                 padding: 0.6rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .decknode { border: 1px solid #e3e3e3; border-radius: 6px; margin: 0.25rem 0;
+              padding: 0.15rem 0.4rem; background: #fafafa; }
+  .decknode summary { cursor: pointer; display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: baseline; }
+  .decknode .deckname { font-weight: 600; flex: 1; }
+  .decknode .counts { color: #666; font-size: 0.9rem; }
+  .decknode .decknode { margin-left: 1.1rem; }
 """
 
 
@@ -441,28 +482,202 @@ def _collect_deck_stats(col) -> Dict[str, Any]:
     }
 
 
+def _deck_tree(decks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Nest the flat deck list into a tree keyed by the ``::`` path separator.
+
+    Each node carries the LAST path segment as its label plus own counts
+    (what the deck itself holds) and subtree counts, which start as the own
+    values and gain every descendant's on the way up in :func:`_aggregate_deck`.
+    Sibling order follows the input order (``_collect_deck_stats`` already
+    sorts case-insensitively by full name). A parent path that arrives without
+    its own entry (cannot happen in Anki, which materialises parents) still
+    gets a placeholder node so the nesting stays well-formed.
+    """
+    roots: List[Dict[str, Any]] = []
+    index: Dict[str, Dict[str, Any]] = {}
+    for deck in decks:
+        parts = str(deck["name"]).split("::")
+        parent: Optional[Dict[str, Any]] = None
+        for depth, label in enumerate(parts):
+            path = "::".join(parts[: depth + 1])
+            node = index.get(path)
+            if node is None:
+                node = {
+                    "label": label,
+                    "children": [],
+                    "own_notes": 0,
+                    "own_cards": 0,
+                    "own_due": 0,
+                    "notes": 0,
+                    "cards": 0,
+                    "due": 0,
+                }
+                index[path] = node
+                (roots if parent is None else parent["children"]).append(node)
+            parent = node
+        assert parent is not None
+        parent["own_notes"] += int(deck["notes"])
+        parent["own_cards"] += int(deck["cards"])
+        parent["own_due"] += int(deck["due"])
+        parent["notes"] += int(deck["notes"])
+        parent["cards"] += int(deck["cards"])
+        parent["due"] += int(deck["due"])
+    return roots
+
+
+def _aggregate_deck(node: Dict[str, Any]) -> None:
+    """Fold each child's subtree counts into ``node`` (in place, recursive)."""
+    for child in node["children"]:
+        _aggregate_deck(child)
+        node["notes"] += child["notes"]
+        node["cards"] += child["cards"]
+        node["due"] += child["due"]
+
+
+def _deck_node_html(node: Dict[str, Any]) -> str:
+    """One <details class="decknode"> row: last-segment name, subtree counts.
+
+    Numbers on a parent are SUBTREE aggregates (own + all descendants); when
+    the parent itself directly holds cards a muted ``(own ...)`` hint shows
+    its own numbers so the aggregate cannot be misread. Child nodes are
+    nested inside the parent's <details>, which also indents them via CSS.
+    """
+    counts = (
+        f'<span class="counts">{node["notes"]} notes &middot; {node["cards"]} cards '
+        f'&middot; {node["due"]} due</span>'
+    )
+    own = ""
+    if node["children"] and (node["own_notes"] or node["own_cards"] or node["own_due"]):
+        own = (
+            f'<span class="muted">(own {node["own_notes"]} notes, '
+            f'{node["own_cards"]} cards, {node["own_due"]} due)</span>'
+        )
+    children_html = "".join(_deck_node_html(child) for child in node["children"])
+    leaf_class = " leaf" if not node["children"] else ""
+    return (
+        f'<details class="decknode{leaf_class}">'
+        f'<summary><span class="deckname">{html.escape(node["label"])}</span>{counts}{own}</summary>'
+        f"{children_html}</details>"
+    )
+
+
 def _deck_section(stats: Optional[Dict[str, Any]]) -> str:
     if stats is None:
         return (
             '<section><h2>Decks</h2>'
             '<p class="muted">Deck statistics are unavailable right now.</p></section>'
         )
-    rows = "".join(
-        f"<tr><td>{html.escape(str(deck['name']))}</td>"
-        f"<td>{deck['notes']}</td><td>{deck['cards']}</td><td>{deck['due']}</td></tr>"
-        for deck in stats["decks"]
-    )
-    if not rows:
-        rows = '<tr><td colspan="4">No decks yet.</td></tr>'
+    roots = _deck_tree(stats["decks"])
+    for root in roots:
+        _aggregate_deck(root)
+    tree = "".join(_deck_node_html(root) for root in roots)
+    if not tree:
+        tree = '<p class="muted">No decks yet.</p>'
     due = stats["due"]
     return f"""<section>
   <h2>Decks</h2>
-  <div class="tablewrap"><table>
-    <thead><tr><th>Deck</th><th>Notes</th><th>Cards</th><th>Due</th></tr></thead>
-    <tbody>{rows}</tbody>
-  </table></div>
+  {tree}
   <p class="muted">Due now: {due['new']} new, {due['learn']} learning, {due['review']} review.</p>
 </section>"""
+
+
+def _human_size(num_bytes: int) -> str:
+    """Human-readable byte size ("1.2 MB"); anything below 1 KB stays exact."""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} TB"
+
+
+def _backup_section(csrf_token: str, backups: Optional[List[Dict[str, Any]]]) -> str:
+    """Version history: newest snapshots (When / Reason / Size) + row actions.
+
+    ``backups`` is a ``registry.list_backups`` record list (newest first) or
+    None when the listing failed — a listing failure must not take the portal
+    down, mirroring the deck-stats posture. At most BACKUP_LIST_LIMIT rows
+    render; the rest collapse into one muted "+N older" line. Filenames ride
+    in query strings, so they are URL-escaped via html.escape(quote=True).
+    """
+    if backups is None:
+        listing = '<p class="muted">Snapshot list is unavailable right now.</p>'
+    elif not backups:
+        listing = (
+            '<p class="muted">No snapshots yet &mdash; one is created before '
+            "every sync and destructive change.</p>"
+        )
+    else:
+        visible = backups[:BACKUP_LIST_LIMIT]
+        rows = "".join(
+            f"<tr><td>{html.escape(str(entry['timestamp']))}</td>"
+            f"<td><code>{html.escape(str(entry['reason']))}</code></td>"
+            f"<td>{_human_size(int(entry['size_bytes']))}</td>"
+            '<td><a href="/portal/backup/confirm?file='
+            f'{html.escape(str(entry["filename"]))}">Restore</a> '
+            '<a href="/portal/backup/download?file='
+            f'{html.escape(str(entry["filename"]))}">Download</a></td></tr>'
+            for entry in visible
+        )
+        older = len(backups) - len(visible)
+        older_note = f'<p class="muted">+{older} older</p>' if older > 0 else ""
+        listing = (
+            f"""<div class="tablewrap"><table>
+      <thead><tr><th>When</th><th>Reason</th><th>Size</th><th>Actions</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table></div>
+    {older_note}"""
+        )
+    return f"""<section>
+  <h2>Version history</h2>
+  <p>A snapshot is taken before every sync and destructive change. Restoring
+  replaces the current collection &mdash; the replaced state is kept
+  automatically as a pre-restore snapshot. Snapshots exclude media files.</p>
+  <form method="post" action="/portal/backup/create">
+    <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
+    <button type="submit">Back up now</button>
+  </form>
+  {listing}
+</section>"""
+
+
+def _backup_confirm_page(user: User, csrf_token: str, entry: Dict[str, Any]) -> str:
+    """Small confirm page for restoring one validated snapshot.
+
+    Shows the snapshot's timestamp/reason/size, warns that restoring replaces
+    the current collection (the pre-restore snapshot keeps the replaced
+    state), and carries the CSRF'd POST form with the filename hidden field.
+    """
+    filename = str(entry["filename"])
+    return _page(
+        "Anki MCP - Restore snapshot",
+        f"""{_app_header(user, csrf_token)}
+<section>
+  <h2>Restore snapshot</h2>
+  <p>You are about to restore <code>{html.escape(filename)}</code></p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>When</th><th>Reason</th><th>Size</th></tr></thead>
+    <tbody><tr>
+      <td>{html.escape(str(entry["timestamp"]))}</td>
+      <td><code>{html.escape(str(entry["reason"]))}</code></td>
+      <td>{_human_size(int(entry["size_bytes"]))}</td>
+    </tr></tbody>
+  </table></div>
+  <p class="error">Restoring replaces the CURRENT collection with this snapshot.
+  The collection as it is now is kept automatically as a pre-restore snapshot,
+  so this restore is itself reversible.</p>
+  <p>After restoring, the next AnkiWeb sync reconciles the differences with
+  AnkiWeb &mdash; review the changes before syncing.</p>
+  <form method="post" action="/portal/backup/restore">
+    <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
+    <input type="hidden" name="file" value="{html.escape(filename)}">
+    <button type="submit">Restore this snapshot</button>
+  </form>
+  <p><a href="/">Back to portal</a></p>
+</section>""",
+        css=_APP_CSS,
+        main_class="app",
+    )
 
 
 def _portal_page(
@@ -470,6 +685,7 @@ def _portal_page(
     csrf_token: str,
     flash: Optional[Tuple[str, str]],
     stats: Optional[Dict[str, Any]],
+    backups: Optional[List[Dict[str, Any]]],
     token_mask: str,
 ) -> str:
     if token_mask:
@@ -494,6 +710,7 @@ def _portal_page(
   </form>
 </section>
 {_deck_section(stats)}
+{_backup_section(csrf_token, backups)}
 <section>
   <h2>AnkiWeb credentials</h2>
   <p>Needed to synchronize with AnkiWeb. The password is stored for the sync
@@ -843,6 +1060,290 @@ def create_app(custom_settings: Optional[Settings] = None):
         except Exception as e:
             return _tool_error_response(e)
 
+    # 9. create_deck
+    @mcp.tool(
+        description="Create a deck ('Parent::Child' creates subdecks); an existing name resolves to its ID."
+    )
+    async def create_deck(deck_name: str, ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = CreateDeckInput(deck_name=deck_name)
+            res = await deck_tools.create_deck(tool_sync_manager, tool_registry, username, parsed.deck_name)
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 10. rename_deck
+    @mcp.tool(
+        description="Rename a deck (subdecks follow). DESTRUCTIVE: requires confirm=true; a "
+        "pre-rename-deck snapshot backup is taken first and the rename is aborted if it fails."
+    )
+    async def rename_deck(deck_id: int, new_name: str, confirm: bool = False, ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = RenameDeckInput(deck_id=deck_id, new_name=new_name, confirm=confirm)
+            res = await deck_tools.rename_deck(
+                tool_sync_manager, tool_registry, username, parsed.deck_id, parsed.new_name, parsed.confirm
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 11. delete_deck
+    @mcp.tool(
+        description="Delete a deck, its subdecks and all their cards (the Default deck can never be "
+        "deleted). DESTRUCTIVE: requires confirm=true; a pre-delete-deck snapshot backup is taken "
+        "first and the deletion is aborted if it fails."
+    )
+    async def delete_deck(deck_id: int, confirm: bool = False, ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = DeleteDeckInput(deck_id=deck_id, confirm=confirm)
+            res = await deck_tools.delete_deck(
+                tool_sync_manager, tool_registry, username, parsed.deck_id, parsed.confirm
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 12. delete_notes
+    @mcp.tool(
+        description="Delete notes and their cards by ID; missing IDs are reported, not fatal. "
+        "DESTRUCTIVE: requires confirm=true; a pre-delete-notes snapshot backup is taken first "
+        "and the deletion is aborted if it fails."
+    )
+    async def delete_notes(
+        note_ids: List[int],
+        confirm: bool = False,
+        idempotency_key: Optional[str] = None,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = DeleteNotesInput(note_ids=note_ids, confirm=confirm, idempotency_key=idempotency_key)
+            res = await note_tools.delete_notes(
+                tool_sync_manager, tool_registry, username,
+                parsed.note_ids, parsed.confirm, parsed.idempotency_key,
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 13. remove_tags
+    @mcp.tool(description="Remove tags from notes.")
+    async def remove_tags(note_ids: List[int], tags: List[str], ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = RemoveTagsInput(note_ids=note_ids, tags=tags)
+            res = await note_tools.remove_tags(tool_sync_manager, tool_registry, username, parsed.note_ids, parsed.tags)
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 14. list_note_types
+    @mcp.tool(description="List note types with their field names and card templates.")
+    async def list_note_types(ctx: Context) -> Dict[str, Any]:
+        username = _username_from_context(ctx)
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            return await note_tools.list_note_types(tool_registry, username)
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 15. create_note_type
+    @mcp.tool(
+        description="Create a note type from field names and card templates (omit templates for a "
+        "default single template over the first two fields). Refuses an existing name."
+    )
+    async def create_note_type(
+        name: str,
+        fields: List[str],
+        templates: Optional[List[Dict[str, str]]] = None,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed_templates = (
+                [TemplateInput(**t) for t in templates] if templates is not None else None
+            )
+            parsed = CreateNoteTypeInput(name=name, fields=fields, templates=parsed_templates)
+            res = await note_tools.create_note_type(
+                tool_sync_manager, tool_registry, username, parsed.name, parsed.fields, parsed.templates
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 16. find_cards
+    @mcp.tool(description="Search cards by Anki query with bounded pagination.")
+    async def find_cards(query: str, limit: int = 50, offset: int = 0, ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = FindCardsInput(query=query, limit=limit, offset=offset)
+            return await cards_tools.find_cards(tool_registry, username, parsed.query, parsed.limit, parsed.offset)
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 17. get_card
+    @mcp.tool(description="Retrieve a card's fields, rendered question/answer, and scheduling state.")
+    async def get_card(card_id: int, ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            GetCardInput(card_id=card_id)
+            return await cards_tools.get_card(tool_registry, username, card_id)
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 18. suspend_cards
+    @mcp.tool(description="Suspend cards so they leave the review queue until unsuspended.")
+    async def suspend_cards(card_ids: List[int], ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = SuspendCardsInput(card_ids=card_ids)
+            res = await cards_tools.suspend_cards(tool_sync_manager, tool_registry, username, parsed.card_ids)
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 19. unsuspend_cards
+    @mcp.tool(description="Unsuspend previously suspended cards.")
+    async def unsuspend_cards(card_ids: List[int], ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = SuspendCardsInput(card_ids=card_ids)
+            res = await cards_tools.unsuspend_cards(tool_sync_manager, tool_registry, username, parsed.card_ids)
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 20. set_due_date
+    @mcp.tool(
+        description="Set cards' due date to N days from today ('3') or a random range ('0-2')."
+    )
+    async def set_due_date(card_ids: List[int], days: str, ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = SetDueDateInput(card_ids=card_ids, days=days)
+            res = await cards_tools.set_due_date(tool_sync_manager, tool_registry, username, parsed.card_ids, parsed.days)
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 21. move_cards
+    @mcp.tool(description="Move cards to another deck (target deck must exist).")
+    async def move_cards(card_ids: List[int], deck_id: int, ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = MoveCardsInput(card_ids=card_ids, deck_id=deck_id)
+            res = await cards_tools.move_cards(tool_sync_manager, tool_registry, username, parsed.card_ids, parsed.deck_id)
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 22. get_review_queue
+    @mcp.tool(description="Fetch the scheduler's current review queue with capped questions.")
+    async def get_review_queue(limit: int = 10, ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = ReviewQueueInput(limit=limit)
+            return await cards_tools.get_review_queue(tool_registry, username, parsed.limit)
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 23. answer_card
+    @mcp.tool(
+        description="Answer a queued card with rating 1=Again, 2=Hard, 3=Good, 4=Easy (v3 scheduler). "
+        "The card must currently be in the review queue; only the first 50 queued cards are "
+        "considered, so a card deeper in a long queue is refused until it reaches the front."
+    )
+    async def answer_card(
+        card_id: int,
+        rating: int,
+        idempotency_key: Optional[str] = None,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = AnswerCardInput(card_id=card_id, rating=rating, idempotency_key=idempotency_key)
+            res = await cards_tools.answer_card(
+                tool_sync_manager, tool_registry, username,
+                parsed.card_id, parsed.rating, parsed.idempotency_key,
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 24. store_media_file
+    @mcp.tool(
+        description="Store a media file (standard base64, max 4 MiB decoded, single-segment "
+        "filename); returns the actual stored name."
+    )
+    async def store_media_file(filename: str, data_base64: str, ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = StoreMediaInput(filename=filename, data_base64=data_base64)
+            res = await media_tools.store_media_file(
+                tool_sync_manager, tool_registry, username, parsed.filename, parsed.data_base64
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 25. get_media_file
+    @mcp.tool(description="Read a media file back as base64 (files over 4 MiB are refused).")
+    async def get_media_file(filename: str, ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = GetMediaInput(filename=filename)
+            return await media_tools.get_media_file(tool_registry, username, parsed.filename)
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 26. list_media_files
+    @mcp.tool(description="List media filenames (sorted), capped at the requested limit.")
+    async def list_media_files(limit: int = 200, ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = ListMediaInput(limit=limit)
+            return await media_tools.list_media_files(tool_registry, username, parsed.limit)
+        except Exception as e:
+            return _tool_error_response(e)
+
     # Create Starlette app for streamable HTTP with reverse-proxy support
     from mcp.server.transport_security import TransportSecuritySettings
 
@@ -1098,7 +1599,16 @@ def create_app(custom_settings: Optional[Settings] = None):
             stats = await portal_registry.run(user.username, _collect_deck_stats)
         except Exception:
             logger.exception("Deck stats failed for %r", user.username)
-        response = HTMLResponse(_portal_page(user, csrf_token, flash, stats, token_mask))
+        # Snapshot listing for Version history (cheap directory read); same
+        # resilience posture as the stats above.
+        backups: Optional[List[Dict[str, Any]]] = None
+        try:
+            backups = await run_in_threadpool(portal_registry.list_backups, user.username)
+        except Exception:
+            logger.exception("Backup listing failed for %r", user.username)
+        response = HTMLResponse(
+            _portal_page(user, csrf_token, flash, stats, backups, token_mask)
+        )
         if request.cookies.get(FLASH_COOKIE_NAME):
             _clear_flash(response)  # consumed: render at most once
         return response
@@ -1202,6 +1712,127 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _bad_request(f"Could not sync: {e}", back_href="/", back_label="Back to portal")
         logger.info("Portal sync for %r: success=%s", user.username, result.get("success"))
         return HTMLResponse(_sync_result_page(result))
+
+    # -- Portal version history (snapshots): create / confirm / restore / ------
+    #    download. Session-authenticated like every portal route; every POST is
+    #    CSRF-verified, and every filename is validated by exact string
+    #    membership against the acting user's OWN list_backups() output before
+    #    it may address a file — unknown names, other users' snapshots and
+    #    traversal strings all fail the same way (400).
+
+    def _backup_entry(username: str, filename: str) -> Optional[Dict[str, Any]]:
+        """The user's list_backups record whose filename equals ``filename``.
+
+        The membership check IS the access control: ``filename`` never
+        reaches the filesystem on its own, so it cannot traverse, and a
+        snapshot belonging to a different account is simply not in this
+        user's listing. Returns None for anything else.
+        """
+        if not isinstance(filename, str) or not filename:
+            return None
+        for entry in portal_registry.list_backups(username):
+            if entry["filename"] == filename:
+                return entry
+        return None
+
+    async def portal_backup_create(request: Request) -> Response:
+        user, err = _require_session(request)
+        if err:
+            return err
+        # Same maintenance contract as the sync button: a paused worker must
+        # not write snapshots or rotate retention behind the operator's back.
+        if tool_sync_manager.maintenance_mode:
+            return _redirect_with_flash(
+                "/",
+                "Worker is currently in maintenance mode; writes are paused.",
+                kind="error",
+            )
+        session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        if _body_too_large(request):
+            return HTMLResponse(_message_page("Request body too large."), status_code=413)
+        form = await request.form()
+        if not _csrf_ok(session_value, form):
+            return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
+        try:
+            filename = await portal_registry.backup_user(user.username, "manual")
+        except Exception as e:
+            logger.error("Portal manual backup failed for %r: %s", user.username, e)
+            return _redirect_with_flash("/", f"Backup failed: {e}", kind="error")
+        logger.info("Portal manual backup for %r: %r", user.username, filename)
+        return _redirect_with_flash("/", f"Snapshot created: {filename}.", kind="success")
+
+    async def portal_backup_confirm(request: Request) -> Response:
+        user, err = _require_session(request)
+        if err:
+            return err
+        filename = request.query_params.get("file", "")
+        entry = _backup_entry(user.username, filename)
+        if entry is None:
+            return _bad_request(
+                f"Unknown snapshot {filename!r}.", back_href="/", back_label="Back to portal"
+            )
+        session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        csrf_token = issue_csrf(session_value)
+        return HTMLResponse(_backup_confirm_page(user, csrf_token, entry))
+
+    async def portal_backup_restore(request: Request) -> Response:
+        user, err = _require_session(request)
+        if err:
+            return err
+        # The maintenance pause must cover restore above all: it REPLACES the
+        # collection file (and takes a pre-restore snapshot + retention
+        # rotation on the way), none of which a paused worker may do.
+        if tool_sync_manager.maintenance_mode:
+            return _redirect_with_flash(
+                "/",
+                "Worker is currently in maintenance mode; writes are paused.",
+                kind="error",
+            )
+        session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        if _body_too_large(request):
+            return HTMLResponse(_message_page("Request body too large."), status_code=413)
+        form = await request.form()
+        if not _csrf_ok(session_value, form):
+            return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
+        filename = str(form.get("file", ""))
+        if _backup_entry(user.username, filename) is None:
+            return _bad_request(
+                f"Unknown snapshot {filename!r}.", back_href="/", back_label="Back to portal"
+            )
+        try:
+            result = await portal_registry.restore_backup(user.username, filename)
+        except Exception as e:
+            logger.error("Portal restore failed for %r from %r: %s", user.username, filename, e)
+            return _redirect_with_flash("/", f"Restore failed: {e}", kind="error")
+        snapshot = str(result.get("pre_restore_snapshot", ""))
+        logger.info(
+            "Portal restore for %r from %r (pre-restore snapshot: %r)",
+            user.username,
+            filename,
+            snapshot,
+        )
+        return _redirect_with_flash(
+            "/",
+            f"Collection restored from {filename}. The replaced state was kept as "
+            f"snapshot {snapshot}. The next AnkiWeb sync reconciles the differences "
+            "— review the changes before syncing.",
+            kind="success",
+        )
+
+    async def portal_backup_download(request: Request) -> Response:
+        user, err = _require_session(request)
+        if err:
+            return err
+        filename = request.query_params.get("file", "")
+        if _backup_entry(user.username, filename) is None:
+            return _bad_request(
+                f"Unknown snapshot {filename!r}.", back_href="/", back_label="Back to portal"
+            )
+        # The path is built from the validated name ONLY AFTER the exact-
+        # membership check above, so the filename can never carry a path.
+        # colpkg IS a zip, hence the media type.
+        path = portal_registry.backup_path(user.username, filename)
+        return FileResponse(path, filename=filename, media_type="application/zip")
 
     # -- Admin console (session + admin role, CSRF-protected) ------------------
 
@@ -1402,6 +2033,10 @@ def create_app(custom_settings: Optional[Settings] = None):
     app.add_route("/portal/regenerate-token", portal_regenerate_token, methods=["POST"])
     app.add_route("/portal/credentials", portal_set_credentials, methods=["POST"])
     app.add_route("/portal/sync", portal_sync_now, methods=["POST"])
+    app.add_route("/portal/backup/create", portal_backup_create, methods=["POST"])
+    app.add_route("/portal/backup/confirm", portal_backup_confirm, methods=["GET"])
+    app.add_route("/portal/backup/restore", portal_backup_restore, methods=["POST"])
+    app.add_route("/portal/backup/download", portal_backup_download, methods=["GET"])
     app.add_route("/admin", admin_page, methods=["GET"])
     app.add_route("/admin/create-user", admin_create_user, methods=["POST"])
     app.add_route("/admin/reset-password", admin_reset_password, methods=["POST"])

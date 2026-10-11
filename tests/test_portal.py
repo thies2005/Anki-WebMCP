@@ -139,9 +139,11 @@ async def test_portal_shows_masked_token_deck_table_and_logout(client, tmp_path)
     # Masked token: first 4 + last 4 chars of the RAW token, never the whole value.
     assert _mask_token(raw_token) in res.text
     assert raw_token not in res.text
-    # Deck table headers and the sync/credentials sections.
-    for header in ("<th>Deck</th>", "<th>Notes</th>", "<th>Cards</th>", "<th>Due</th>"):
-        assert header in res.text
+    # Deck section: the flat <table> was intentionally replaced by a
+    # collapsible <details class="decknode"> tree (version-history stage),
+    # so the old <th>Deck</th>/Notes/Cards/Due headers are gone.
+    assert '<details class="decknode' in res.text
+    assert "Version history" in res.text
     assert "AnkiWeb credentials" in res.text
     assert "Sync now" in res.text
     assert "Regenerate token" in res.text
@@ -165,7 +167,10 @@ async def test_portal_deck_stats_reflect_real_collection(client, tmp_path):
     res = await client.get("/")
     assert res.status_code == 200
     # One Basic note in the Default deck: 1 note, 1 card, nothing time-due.
-    assert "<tr><td>Default</td><td>1</td><td>1</td><td>0</td></tr>" in res.text
+    # Intentional rendering change (version-history stage): the deck row is a
+    # collapsible tree leaf now, not a flat-table <tr><td> row.
+    assert ">Default</span>" in res.text
+    assert "1 notes &middot; 1 cards &middot; 0 due" in res.text
     assert "Due now: 1 new, 0 learning, 0 review." in res.text
 
 
@@ -342,6 +347,8 @@ STATE_CHANGING_PATHS = [
     "/portal/regenerate-token",
     "/portal/credentials",
     "/portal/sync",
+    "/portal/backup/create",
+    "/portal/backup/restore",
     "/admin/create-user",
     "/admin/reset-password",
     "/admin/regenerate-token",

@@ -79,7 +79,9 @@ def test_new_tuning_settings_have_correct_defaults(monkeypatch):
     assert settings.idle_timeout_minutes == 15
     assert settings.max_open_collections == 5
     assert settings.max_concurrent_syncs == 2
-    assert settings.backup_retention == 5
+    # Retention default raised 5 -> 20 (snapshot engine: restores plus syncs
+    # each consume a slot, so five was too tight a ceiling).
+    assert settings.backup_retention == 20
 
 
 def test_tuning_settings_read_env_and_enforce_minimum(monkeypatch):

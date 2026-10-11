@@ -1,0 +1,334 @@
+"""Card search, inspection, and scheduling tools.
+
+Read-only tools run via ``registry.run`` directly; scheduling mutations go
+through ``sync_manager.execute_mutation``. Wheel facts this module relies on
+(all probed against the pinned 26.9.3 wheel):
+
+- ``col.sched.get_queued_cards`` returns a ``QueuedCards`` protobuf WITHOUT a
+  ``card_count`` attribute (the fallback is the fetched list's length), and
+  its items' ``.card`` is the cards_pb2 PROTO, not an ``anki.cards.Card`` —
+  ``build_answer`` needs the real object from ``col.get_card``.
+- ``Card.timer_started`` is None until ``start_timer()``; answering without
+  starting the timer raises TypeError inside ``build_answer``.
+- ``CardAnswer.Rating`` proto values are AGAIN=0, HARD=1, GOOD=2, EASY=3; the
+  tool surface's 1..4 rating maps onto them by the named mapping below.
+"""
+
+import logging
+from typing import Any, Dict, List, Optional, Tuple
+
+from anki.errors import NotFoundError  # isort: skip
+from anki.scheduler.v3 import CardAnswer
+
+from ..errors import CollectionToolError
+from ..models import MutationResponse, SyncStatus
+from ..sync_manager import SyncManager
+
+logger = logging.getLogger("anki_mcp.tools.cards")
+
+# Tool-surface rating (1..4) -> proto CardAnswer.Rating (AGAIN=0..EASY=3).
+_RATING_BY_LEVEL = {
+    1: CardAnswer.Rating.AGAIN,
+    2: CardAnswer.Rating.HARD,
+    3: CardAnswer.Rating.GOOD,
+    4: CardAnswer.Rating.EASY,
+}
+
+
+def _get_card_or_none(col, card_id: int):
+    try:
+        return col.get_card(card_id)
+    except NotFoundError:
+        return None
+
+
+def _card_row(col, card) -> Dict[str, Any]:
+    """The find_cards summary row shape."""
+    return {
+        "card_id": int(card.id),
+        "note_id": int(card.nid),
+        "deck_name": col.decks.name(card.did),
+        "queue": card.queue,
+        "type": card.type,
+        "due": card.due,
+        "ivl": card.ivl,
+        "reps": card.reps,
+        "lapses": card.lapses,
+    }
+
+
+def _truncate_html(text: str, cap: int) -> Tuple[str, bool]:
+    """Truncate rendered HTML to ``cap`` chars; report whether it was cut."""
+    if len(text) <= cap:
+        return text, False
+    return text[:cap], True
+
+
+def _partition_existing(col, card_ids: List[int]) -> Tuple[List[int], List[int]]:
+    """Split requested card IDs into existing and missing (single read each)."""
+    existing = []
+    missing = []
+    for cid in card_ids:
+        (existing if _get_card_or_none(col, cid) is not None else missing).append(cid)
+    return existing, missing
+
+
+async def find_cards(
+    registry,
+    username: str,
+    query: str,
+    limit: int = 50,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """Search cards in the collection with bounded pagination."""
+    # Clamp pagination bounds (direct calls bypass the pydantic input model).
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    logger.info("Executing find_cards for %r: query=%r, limit=%d, offset=%d", username, query, limit, offset)
+
+    def _find(col) -> Dict[str, Any]:
+        card_ids = list(col.find_cards(query))
+        total = len(card_ids)
+        rows = []
+        for cid in card_ids[offset : offset + limit]:
+            card = _get_card_or_none(col, cid)
+            if card is None:
+                continue  # vanished between find_cards and the read
+            rows.append(_card_row(col, card))
+        return {"total": total, "cards": rows}
+
+    result = await registry.run(username, _find)
+    return {
+        "total_matches": result["total"],
+        "returned_count": len(result["cards"]),
+        "offset": offset,
+        "limit": limit,
+        "cards": result["cards"],
+    }
+
+
+async def get_card(registry, username: str, card_id: int) -> Dict[str, Any]:
+    """Retrieve a card with note fields, rendered question/answer (capped) and scheduling state."""
+    logger.info("Executing get_card for %r, id %d", username, card_id)
+
+    def _get(col) -> Dict[str, Any]:
+        card = _get_card_or_none(col, card_id)
+        if card is None:
+            raise CollectionToolError(f"Card with ID {card_id} not found in collection.")
+        note = col.get_note(card.nid)
+        question, q_trunc = _truncate_html(card.question(), 10000)
+        answer, a_trunc = _truncate_html(card.answer(), 10000)
+        return {
+            "card_id": int(card.id),
+            "note_id": int(card.nid),
+            "deck_name": col.decks.name(card.did),
+            "model_name": note.note_type()["name"],
+            "tags": list(note.tags),
+            "fields": dict(note.items()),
+            "question": question,
+            "answer": answer,
+            "truncated": q_trunc or a_trunc,
+            "queue": card.queue,
+            "type": card.type,
+            "due": card.due,
+            "ivl": card.ivl,
+            "reps": card.reps,
+            "lapses": card.lapses,
+            "flags": card.flags,
+        }
+
+    return await registry.run(username, _get)
+
+
+def _require_any_existing(card_ids: List[int], existing: List[int], missing: List[int]) -> None:
+    if not existing:
+        raise CollectionToolError(f"None of the requested cards exist: {missing}")
+
+
+async def _ids_mutation(
+    sync_manager: SyncManager,
+    registry,
+    username: str,
+    card_ids: List[int],
+    operation_name: str,
+    apply_fn,
+    result_key: str,
+) -> MutationResponse:
+    """Shared batch shape: report missing IDs, apply to the existing ones.
+
+    Batches with SOME unknown IDs still apply to the known ones (the response
+    carries ``missing``); a batch with NO known IDs is a domain error.
+    ``apply_fn(col, existing)`` performs the wheel call and returns extra
+    response fields.
+    """
+
+    def _apply(col) -> Dict[str, Any]:
+        existing, missing = _partition_existing(col, card_ids)
+        _require_any_existing(card_ids, existing, missing)
+        payload = apply_fn(col, existing)
+        return {"card_ids": existing, "missing": missing, result_key: len(existing), **payload}
+
+    async def _mutation() -> Dict[str, Any]:
+        return await registry.run(username, _apply)
+
+    return await sync_manager.execute_mutation(
+        username,
+        operation_name=operation_name,
+        mutation_fn=_mutation,
+    )
+
+
+async def suspend_cards(
+    sync_manager: SyncManager,
+    registry,
+    username: str,
+    card_ids: List[int],
+) -> MutationResponse:
+    """Suspend cards (they leave the review queue until unsuspended)."""
+    logger.info("Executing suspend_cards for %r over %d card(s)", username, len(card_ids))
+
+    def _apply(col, existing):
+        col.sched.suspend_cards(existing)
+        return {}
+
+    return await _ids_mutation(
+        sync_manager, registry, username, card_ids, "suspend_cards", _apply, "suspended",
+    )
+
+
+async def unsuspend_cards(
+    sync_manager: SyncManager,
+    registry,
+    username: str,
+    card_ids: List[int],
+) -> MutationResponse:
+    """Unsuspend previously suspended cards."""
+    logger.info("Executing unsuspend_cards for %r over %d card(s)", username, len(card_ids))
+
+    def _apply(col, existing):
+        col.sched.unsuspend_cards(existing)
+        return {}
+
+    return await _ids_mutation(
+        sync_manager, registry, username, card_ids, "unsuspend_cards", _apply, "unsuspended",
+    )
+
+
+async def set_due_date(
+    sync_manager: SyncManager,
+    registry,
+    username: str,
+    card_ids: List[int],
+    days: str,
+) -> MutationResponse:
+    """Set cards' due date to N days from today (or a random range like '0-2')."""
+    logger.info("Executing set_due_date for %r over %d card(s): days=%r", username, len(card_ids), days)
+
+    def _apply(col, existing):
+        col.sched.set_due_date(existing, days, None)
+        return {"days": days}
+
+    return await _ids_mutation(
+        sync_manager, registry, username, card_ids, "set_due_date", _apply, "updated",
+    )
+
+
+async def move_cards(
+    sync_manager: SyncManager,
+    registry,
+    username: str,
+    card_ids: List[int],
+    deck_id: int,
+) -> MutationResponse:
+    """Move cards to another deck (existence of the target deck is verified)."""
+    logger.info("Executing move_cards for %r over %d card(s) -> deck %d", username, len(card_ids), deck_id)
+
+    def _apply(col, existing):
+        if deck_id not in {d.id for d in col.decks.all_names_and_ids()}:
+            raise CollectionToolError(f"Deck with ID {deck_id} not found in collection.")
+        col.set_deck(existing, deck_id)
+        return {"deck_id": deck_id}
+
+    return await _ids_mutation(
+        sync_manager, registry, username, card_ids, "move_cards", _apply, "moved",
+    )
+
+
+async def get_review_queue(registry, username: str, limit: int = 10) -> Dict[str, Any]:
+    """Fetch the scheduler's current queue (due + new cards), questions capped."""
+    limit = max(1, min(limit, 50))
+    logger.info("Executing get_review_queue for %r: limit=%d", username, limit)
+
+    def _queue(col) -> Dict[str, Any]:
+        out = col.sched.get_queued_cards(fetch_limit=limit)
+        items = []
+        for queued in out.cards:
+            card = col.get_card(queued.card.id)
+            question, _ = _truncate_html(card.question(), 2000)
+            items.append(
+                {
+                    "card_id": int(card.id),
+                    "note_id": int(card.nid),
+                    "deck_name": col.decks.name(card.did),
+                    "question": question,
+                }
+            )
+        # The wheel's QueuedCards protobuf has no card_count attribute
+        # (probed); the fetched list's length is the honest fallback.
+        total = getattr(out, "card_count", None)
+        if total is None:
+            total = len(out.cards)
+        return {"total_queue_count": int(total), "cards": items}
+
+    return await registry.run(username, _queue)
+
+
+async def answer_card(
+    sync_manager: SyncManager,
+    registry,
+    username: str,
+    card_id: int,
+    rating: int,
+    idempotency_key: Optional[str] = None,
+) -> MutationResponse:
+    """Answer a queued card with a 1..4 rating (Again/Hard/Good/Easy).
+
+    The card must currently be in the scheduler's queue; the answer is built
+    from the queue's scheduling states (the v3 path) and applied via
+    ``sched.answer_card``. The card's answer timer is started at answer time —
+    an unattended tool has no "question shown" moment, and build_answer
+    raises on a never-started timer (probed against the wheel).
+    """
+    logger.info("Executing answer_card for %r: card %d, rating %d", username, card_id, rating)
+
+    def _answer(col) -> Dict[str, Any]:
+        out = col.sched.get_queued_cards(fetch_limit=50)
+        queued = next((q for q in out.cards if q.card.id == card_id), None)
+        if queued is None:
+            raise CollectionToolError(
+                "card is not currently in the review queue (not due) or the queue is longer "
+                "than the fetch limit"
+            )
+        card = col.get_card(card_id)
+        card.start_timer()
+        answer = col.sched.build_answer(card=card, states=queued.states, rating=_RATING_BY_LEVEL[rating])
+        col.sched.answer_card(answer)
+        reloaded = col.get_card(card_id)
+        after = col.sched.get_queued_cards(fetch_limit=50)
+        remaining = sum(1 for q in after.cards if q.card.id != card_id)
+        return {
+            "card_id": card_id,
+            "rating": rating,
+            "next_due": reloaded.due,
+            "remaining_in_queue": remaining,
+        }
+
+    async def _mutation() -> Dict[str, Any]:
+        return await registry.run(username, _answer)
+
+    return await sync_manager.execute_mutation(
+        username,
+        operation_name="answer_card",
+        mutation_fn=_mutation,
+        idempotency_key=idempotency_key,
+    )

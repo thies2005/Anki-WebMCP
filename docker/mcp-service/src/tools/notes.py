@@ -19,7 +19,7 @@ from anki.errors import NotFoundError
 from anki.notes import Note
 
 from ..errors import CollectionToolError
-from ..models import MutationResponse, NoteInput
+from ..models import MutationResponse, NoteInput, SyncStatus
 from ..sync_manager import SyncManager
 
 logger = logging.getLogger("anki_mcp.tools.notes")
@@ -272,5 +272,169 @@ async def add_tags(
     return await sync_manager.execute_mutation(
         username,
         operation_name="add_tags",
+        mutation_fn=_mutation,
+    )
+
+
+async def delete_notes(
+    sync_manager: SyncManager,
+    registry,
+    username: str,
+    note_ids: List[int],
+    confirm: bool = False,
+    idempotency_key: Optional[str] = None,
+) -> MutationResponse:
+    """Delete existing notes after a fail-closed pre-delete-notes snapshot.
+
+    Missing IDs never fail the batch: only the notes that exist are removed
+    and the response reports the missing ones. A request whose IDs are ALL
+    unknown is a domain error (nothing to delete, no snapshot, no ledger
+    commit).
+    """
+    if not confirm:
+        logger.info("delete_notes for %r skipped: confirm=False", username)
+        return MutationResponse(
+            success=False,
+            local_status="skipped",
+            sync_status=SyncStatus(),
+            error="This operation permanently deletes notes and their cards; pass confirm=true "
+            "to proceed (a pre-delete-notes snapshot backup is taken first).",
+        )
+    logger.info("Executing delete_notes for %r over %d note(s)", username, len(note_ids))
+
+    def _delete(col) -> Dict[str, Any]:
+        existing = []
+        missing = []
+        for nid in note_ids:
+            (existing if _get_note_or_none(col, nid) is not None else missing).append(nid)
+        if not existing:
+            raise CollectionToolError(f"Cannot delete notes: none of the requested IDs exist: {missing}")
+        # Fail-closed snapshot FIRST: if it raises, nothing is deleted.
+        registry.snapshot_locked(col, username, "pre-delete-notes")
+        col.remove_notes(existing)
+        return {"requested": len(note_ids), "removed": len(existing), "missing": missing}
+
+    async def _mutation() -> Dict[str, Any]:
+        return await registry.run(username, _delete)
+
+    return await sync_manager.execute_mutation(
+        username,
+        operation_name="delete_notes",
+        mutation_fn=_mutation,
+        idempotency_key=idempotency_key,
+    )
+
+
+async def remove_tags(
+    sync_manager: SyncManager,
+    registry,
+    username: str,
+    note_ids: List[int],
+    tags: List[str],
+) -> MutationResponse:
+    """Remove tags from one or more notes with existence pre-verification."""
+    logger.info("Executing remove_tags for %r over %d notes: %s", username, len(note_ids), tags)
+    tags_string = " ".join(tags)
+
+    def _untag(col) -> Dict[str, Any]:
+        # Verify note existence up front: bulk_remove silently ignores
+        # unknown IDs, which would otherwise report a successful no-op.
+        missing_ids = [nid for nid in note_ids if _get_note_or_none(col, nid) is None]
+        if missing_ids:
+            raise CollectionToolError(f"Cannot remove tags: note(s) not found: {missing_ids}")
+        col.tags.bulk_remove(note_ids, tags_string)
+        return {
+            "note_ids": note_ids,
+            "tags_removed": tags,
+        }
+
+    async def _mutation() -> Dict[str, Any]:
+        return await registry.run(username, _untag)
+
+    return await sync_manager.execute_mutation(
+        username,
+        operation_name="remove_tags",
+        mutation_fn=_mutation,
+    )
+
+
+async def list_note_types(registry, username: str) -> Dict[str, Any]:
+    """List note types with their field names and template names."""
+    logger.info("Executing list_note_types for %r", username)
+
+    def _list(col) -> Dict[str, Any]:
+        models = []
+        for entry in col.models.all_names_and_ids():
+            # all_names_and_ids carries only name+id; the notetype DICT (with
+            # flds/tmpls) comes from the by-name lookup (verified wheel API).
+            nt = col.models.by_name(entry.name)
+            models.append(
+                {
+                    "name": entry.name,
+                    "id": int(entry.id),
+                    "fields": list(col.models.field_names(nt)),
+                    "templates": [t["name"] for t in nt["tmpls"]],
+                }
+            )
+        return {"count": len(models), "note_types": models}
+
+    return await registry.run(username, _list)
+
+
+async def create_note_type(
+    sync_manager: SyncManager,
+    registry,
+    username: str,
+    name: str,
+    fields: List[str],
+    templates: Optional[List[Any]] = None,
+) -> MutationResponse:
+    """Create a new note type; refuses an existing name.
+
+    Not destructive, so no snapshot. With ``templates=None`` a single default
+    template over the first two fields is created (which requires >= 2
+    fields); explicit templates are used verbatim.
+    """
+    logger.info("Executing create_note_type for %r: %r (%d field(s))", username, name, len(fields))
+    if templates is None and len(fields) < 2:
+        raise CollectionToolError(
+            "The default template renders the first two fields; provide at least 2 fields "
+            "or pass explicit templates."
+        )
+
+    def _create(col) -> Dict[str, Any]:
+        if col.models.id_for_name(name) is not None:
+            raise CollectionToolError(f"Cannot create note type {name!r}: note type already exists.")
+        mm = col.models
+        nt = mm.new(name=name)
+        for field_name in fields:
+            mm.add_field(nt, mm.new_field(field_name))
+        if templates is None:
+            template = mm.new_template("Card 1")
+            template["qfmt"] = "{{" + fields[0] + "}}"
+            template["afmt"] = "{{FrontSide}}\n<hr id=answer>\n{{" + fields[1] + "}}"
+            mm.add_template(nt, template)
+        else:
+            for t in templates:
+                template = mm.new_template(t.name)
+                template["qfmt"] = t.front
+                template["afmt"] = t.back
+                mm.add_template(nt, template)
+        mm.add(nt)
+        # mm.add assigns the final id; resolve it from the registry of names
+        # rather than trusting the in-memory dict's id field.
+        return {
+            "name": name,
+            "id": int(mm.id_for_name(name)),
+            "fields": list(fields),
+            "template_count": len(templates) if templates is not None else 1,
+        }
+
+    async def _mutation() -> Dict[str, Any]:
+        return await registry.run(username, _create)
+
+    return await sync_manager.execute_mutation(
+        username,
+        operation_name="create_note_type",
         mutation_fn=_mutation,
     )

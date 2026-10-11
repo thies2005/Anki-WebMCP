@@ -58,7 +58,7 @@ class Settings:
     idle_timeout_minutes: int = field(default_factory=lambda: _env_int_min("IDLE_TIMEOUT_MINUTES", 15, 1))
     max_open_collections: int = field(default_factory=lambda: _env_int_min("MAX_OPEN_COLLECTIONS", 5, 1))
     max_concurrent_syncs: int = field(default_factory=lambda: _env_int_min("MAX_CONCURRENT_SYNCS", 2, 1))
-    backup_retention: int = field(default_factory=lambda: _env_int_min("BACKUP_RETENTION", 5, 1))
+    backup_retention: int = field(default_factory=lambda: _env_int_min("BACKUP_RETENTION", 20, 1))
     # /mcp streamable-HTTP session-table posture (audit fix): the multi-user
     # transport must not float on the SDK wheel's defaults (10,000 sessions /
     # 1800s idle). Sized for this deployment's small user population, owner-

@@ -20,6 +20,14 @@ Design invariants (verified against the anki==26.9.3 wheel):
   26.9.3).
 - Tags are space-separated STRINGS in this API generation (relevant for
   callers of ``run()``; the registry itself is tag-agnostic).
+- ``create_backup`` writes .colpkg files in the NEW package layout: the real
+  database is the zstd-compressed ``collection.anki21b`` zip member, while
+  ``collection.anki2`` is only a downgrade STUB (a SQLite file whose single
+  note tells users to re-import in a newer client — restoring it would wipe
+  the user's data). Restoring therefore reads ``collection.anki21b`` via the
+  stdlib ``compression.zstd`` (Python 3.14+, PEP 784) and falls back to a raw
+  ``collection.anki2`` member only for legacy packages that lack 21b
+  (all verified against the pinned wheel 26.9.3).
 
 Locking model:
 
@@ -47,8 +55,11 @@ Locking model:
 import asyncio
 import logging
 import os
+import re
+import tempfile
 import threading
 import time
+import zipfile
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -61,7 +72,31 @@ from .ledger import MAX_ENTRIES as LEDGER_MAX_ENTRIES
 from .ledger import IdempotencyLedger
 from .users import USERNAME_RE
 
+try:
+    # Python 3.14+ (PEP 784): decompresses the collection.anki21b member the
+    # pinned wheel writes into every .colpkg backup (see module docstring).
+    from compression import zstd
+except ImportError:  # pragma: no cover - Python < 3.14
+    zstd = None
+
 logger = logging.getLogger("anki_mcp.collections")
+
+# Reasons embedded into backup filenames as backup-<timestamp>-<reason>.colpkg.
+# The reason travels in the NAME so a backup's provenance survives on disk and
+# list_backups() can report it without a sidecar index.
+BACKUP_REASONS = ("pre-sync", "pre-delete-notes", "pre-delete-deck", "pre-rename-deck", "pre-restore", "manual")
+
+# backup-<timestamp>[-<reason>].colpkg. The timestamp is second-resolution and
+# zero-padded, so lexicographic order IS chronological order (prune_backups
+# relies on that); reason words are lowercase and hyphen-joined, which is why
+# an uppercase or digit-bearing suffix cannot masquerade as a reason.
+BACKUP_FILENAME_RE = re.compile(r"^backup-(\d{4}-\d{2}-\d{2}-\d{2}\.\d{2}\.\d{2})(?:-([a-z0-9]+(?:-[a-z0-9]+)*))?\.colpkg$")
+
+# Restore reads one zip member into memory; the bound rejects a bomb-sized
+# member BEFORE the read allocates for it (chunked read stops at cap+1). Real
+# collections are far below this; .colpkg files are only ever written by the
+# wheel's create_backup, so this guards against a planted file, not traffic.
+_MAX_RESTORE_MEMBER_BYTES = 1024 * 1024 * 1024
 
 # Follow-up actions for a sync_collection handshake result. The wheel's
 # sync_collection() performs login plus the regular delta sync and reports
@@ -114,6 +149,62 @@ def _check_username(username: str) -> str:
     return username
 
 
+def _check_backup_reason(reason: str) -> str:
+    """Return ``reason`` if it is one of BACKUP_REASONS, else raise ValueError."""
+    if reason not in BACKUP_REASONS:
+        raise ValueError(f"Invalid backup reason {reason!r}: must be one of {', '.join(BACKUP_REASONS)}")
+    return reason
+
+
+def _read_collection_member(path: str) -> bytes:
+    """Return the SQLite collection bytes stored inside a .colpkg backup.
+
+    Verified against the pinned wheel (26.9.3): ``create_backup`` writes the
+    NEW colpkg layout — the real database is the zstd-compressed
+    ``collection.anki21b`` member, while ``collection.anki2`` is only a
+    downgrade STUB whose single note says "Please update to the latest Anki
+    version, then import the .colpkg/.apkg file again"; restoring the stub
+    would wipe the user's data, so it is NEVER used while the real member
+    exists. Legacy packages (older wheels) carry the raw database in
+    ``collection.anki2`` instead. Exactly one member is read directly —
+    never ``extractall`` — so a crafted zip cannot write outside the target
+    directory (zip-slip), and the read itself is byte-bounded so a planted
+    bomb-sized member is rejected instead of buffered.
+    """
+
+    def _bounded_read(archive: "zipfile.ZipFile", name: str) -> bytes:
+        info = archive.getinfo(name)
+        if info.file_size > _MAX_RESTORE_MEMBER_BYTES:
+            raise ValueError(
+                f"Backup {os.path.basename(path)!r} member {name!r} declares "
+                f"{info.file_size} bytes, over the restore cap"
+            )
+        with archive.open(name) as fh:
+            data = fh.read(_MAX_RESTORE_MEMBER_BYTES + 1)
+        if len(data) > _MAX_RESTORE_MEMBER_BYTES:
+            raise ValueError(
+                f"Backup {os.path.basename(path)!r} member {name!r} exceeds the restore cap"
+            )
+        return data
+
+    with zipfile.ZipFile(path) as archive:
+        names = set(archive.namelist())
+        if "collection.anki21b" in names:
+            if zstd is None:
+                raise ValueError(
+                    f"Backup {os.path.basename(path)!r} stores its database in the zstd-compressed "
+                    "'collection.anki21b' member but this Python (< 3.14) has no stdlib zstd; "
+                    "restore requires Python 3.14+"
+                )
+            return zstd.decompress(_bounded_read(archive, "collection.anki21b"))
+        if "collection.anki2" in names:
+            return _bounded_read(archive, "collection.anki2")
+        raise ValueError(
+            f"Backup {os.path.basename(path)!r} contains no collection database "
+            "(expected a 'collection.anki21b' or 'collection.anki2' member)"
+        )
+
+
 @dataclass
 class _UserState:
     """Per-user registry entry. ``col`` is None while the user has no open collection."""
@@ -140,7 +231,7 @@ class CollectionRegistry:
         idle_timeout_minutes: int = 15,
         max_open_collections: int = 5,
         max_concurrent_syncs: int = 2,
-        backup_retention: int = 5,
+        backup_retention: int = 20,
     ):
         self.data_dir = str(data_dir)
         self.idle_timeout_minutes = int(idle_timeout_minutes)
@@ -478,6 +569,144 @@ class CollectionRegistry:
                     logger.warning("Failed to prune backup %s for %r", name, username, exc_info=True)
         return sorted(keep)
 
+    # -- backups (snapshot engine) -----------------------------------------------
+
+    def _backup_locked(self, col: Collection, username: str, reason: str) -> str:
+        """Create a reason-tagged backup of the user's collection; returns its filename.
+
+        The caller holds the user's lock (inside a ``run()`` closure, or under
+        the lock in sync_user/restore_backup): ``create_backup`` must not race
+        a concurrent collection operation. The backend writes a plain
+        ``backup-<timestamp>.colpkg`` — verified against the wheel, it writes
+        NO file when nothing changed since the last backup (returning False,
+        or True while overwriting a same-second name), so the before/after
+        directory diff is authoritative, not the return value. When no new
+        file appears, the newest existing backup already IS the current state
+        and its name is returned. The reason is inserted AFTER the unchanged
+        timestamp prefix, so the lexicographic order prune_backups relies on
+        stays chronological. Prunes to ``backup_retention`` on the way out.
+        """
+        _check_backup_reason(reason)
+        backup_dir = self._backups_dir(username)
+        try:
+            before = set(os.listdir(backup_dir))
+        except FileNotFoundError:
+            before = set()
+        col.create_backup(backup_folder=backup_dir, force=True, wait_for_completion=True)
+        try:
+            after = set(os.listdir(backup_dir))
+        except FileNotFoundError:
+            after = set()
+        new_files = sorted(after - before)
+        if not new_files:
+            # Nothing changed since the last backup (or a same-second backup
+            # overwrote an existing plain name): the newest surviving backup
+            # reflects the current state. Only genuine backup names qualify —
+            # a foreign file must never be returned as a backup handle.
+            existing = sorted(name for name in after if BACKUP_FILENAME_RE.fullmatch(name))
+            if not existing:
+                raise RuntimeError(f"No backup exists for user {username!r} and none was created")
+            return existing[-1]
+        newest = new_files[-1]
+        match = BACKUP_FILENAME_RE.fullmatch(newest)
+        if match is None:
+            # Unreachable for wheel-written names; fail loud rather than
+            # rename an unexpected file into a mangled reason-tagged name.
+            raise RuntimeError(f"Backup backend produced unexpected filename {newest!r}")
+        final_name = f"backup-{match.group(1)}-{reason}.colpkg"
+        # Same-second, same-reason snapshots must never overwrite each other:
+        # os.rename silently REPLACES on POSIX, which would destroy the
+        # pre-delete state a destructive op just snapshotted. Disambiguate
+        # with a numeric suffix instead (parseable: the reason group accepts
+        # digits). Ordering note: within one second the suffixed name sorts
+        # before the base name, so retention prunes the suffixed (newer)
+        # snapshot first — the safe direction, keeping older states longer.
+        candidate = final_name
+        attempt = 2
+        while os.path.exists(os.path.join(backup_dir, candidate)):
+            candidate = f"backup-{match.group(1)}-{reason}-{attempt}.colpkg"
+            attempt += 1
+        os.rename(os.path.join(backup_dir, newest), os.path.join(backup_dir, candidate))
+        self.prune_backups(username)
+        return candidate
+
+    def list_backups(self, username: str) -> List[Dict[str, Any]]:
+        """Parse the user's backup files into display records, newest first.
+
+        Only the backups directory is ever listed (never a caller-supplied
+        path), and only files matching BACKUP_FILENAME_RE are returned —
+        filenames are the only handles restore_backup accepts, so a crafted
+        name can neither escape the directory nor reach the restore path.
+        A missing directory (user never opened) yields an empty list.
+        """
+        _check_username(username)
+        backup_dir = self._backups_dir(username)
+        try:
+            names = os.listdir(backup_dir)
+        except FileNotFoundError:
+            return []
+        entries: List[Dict[str, Any]] = []
+        for name in names:
+            match = BACKUP_FILENAME_RE.fullmatch(name)
+            if match is None:
+                continue
+            try:
+                size = os.path.getsize(os.path.join(backup_dir, name))
+            except OSError:
+                continue  # raced with prune_backups; never list a dead file
+            entries.append(
+                {
+                    "filename": name,
+                    "timestamp": match.group(1),
+                    "reason": match.group(2) or "unknown",
+                    "size_bytes": size,
+                }
+            )
+        # Zero-padded timestamps sort chronologically; the filename breaks
+        # ties (same-second plain vs reason-tagged) deterministically.
+        entries.sort(key=lambda entry: (entry["timestamp"], entry["filename"]), reverse=True)
+        return entries
+
+    async def backup_user(self, username: str, reason: str) -> str:
+        """Create a backup tagged with ``reason`` and return its filename.
+
+        The public entry point for on-demand backups (portal, tests): the
+        snapshot runs inside ``run()``'s user-lock + worker-thread discipline,
+        exactly like every other collection access. An invalid reason is
+        rejected BEFORE any collection is opened or directory created.
+        """
+        _check_username(username)
+        _check_backup_reason(reason)
+
+        def _backup(col: Collection) -> str:
+            return self._backup_locked(col, username, reason)
+
+        return await self.run(username, _backup)
+
+    def snapshot_locked(self, col: Collection, username: str, reason: str) -> str:
+        """Public face of ``_backup_locked`` for callers already inside ``run()``.
+
+        The tools layer takes fail-closed snapshots inside its mutation
+        closures (the per-user lock is already held there); reaching for the
+        underscore-private method across the module boundary would freeze it
+        as de-facto API. Tests keep monkeypatching ``_backup_locked`` — this
+        alias deliberately delegates so the seam stays intact.
+        """
+        return self._backup_locked(col, username, reason)
+
+    def backup_path(self, username: str, filename: str) -> str:
+        """Filesystem path of a backup the caller has ALREADY validated.
+
+        Companion to the portal's download route: callers must have matched
+        ``filename`` against :meth:`list_backups` first (exact string
+        membership), so the name is a genuine snapshot of THIS user. The
+        method deliberately performs no filename validation of its own —
+        only the username path guard — because a traversal name passed
+        here without that prior check would escape the backups directory.
+        """
+        _check_username(username)
+        return os.path.join(self._backups_dir(username), filename)
+
     # -- sync ------------------------------------------------------------------
 
     async def sync_user(
@@ -519,18 +748,11 @@ class CollectionRegistry:
                 try:
                     if on_step is not None:
                         on_step("backup")
-                    backup_folder = self._backups_dir(username)
-                    await asyncio.to_thread(
-                        col.create_backup,
-                        backup_folder=backup_folder,
-                        force=True,
-                        wait_for_completion=False,
-                    )
-                    # create_backup(wait_for_completion=False) runs in the
-                    # backend's background; block until it lands so the file
-                    # exists before pruning and before the sync replaces data.
-                    await asyncio.to_thread(col.await_backup_completion)
-                    self.prune_backups(username)
+                    # Shared snapshot path (reason-tagged file + prune); runs on
+                    # a worker thread because create_backup blocks until the
+                    # backup lands, and it is safe here: we already hold the
+                    # user lock, so no other collection access can interleave.
+                    await asyncio.to_thread(self._backup_locked, col, username, "pre-sync")
 
                     step = "login"
                     if on_step is not None:
@@ -614,3 +836,77 @@ class CollectionRegistry:
         if isinstance(exc, NetworkError):
             return True
         return isinstance(exc, SyncError) and getattr(exc, "kind", None) is not SyncErrorKind.AUTH
+
+    # -- restore ------------------------------------------------------------------
+
+    async def restore_backup(self, username: str, filename: str) -> Dict[str, Any]:
+        """Replace the user's collection with the database inside ``filename``.
+
+        Safety chain: the username is path-checked, and the filename must
+        match BACKUP_FILENAME_RE AND be one of ``list_backups(username)``'s
+        exact strings, so it can never carry a path component (traversal
+        guard). Before anything is replaced a ``pre-restore`` snapshot is
+        taken — a restore is itself reversible. The database is read out of
+        the .colpkg zip as a single member (never ``extractall``), the open
+        collection handle is detached and closed with drop_user's discipline
+        (detach under the registry lock, close while holding the user lock,
+        so no other coroutine can touch the closing handle), and the bytes
+        replace ``collection.anki2`` atomically (mkstemp + fsync + chmod 0644
+        + ``os.replace``, mirroring UserStore's persistence pattern).
+        ``state.col`` stays ``None``, so the next ``run()`` reopens the
+        restored file fresh. Returns the restore record for the caller.
+        """
+        _check_username(username)
+        if not BACKUP_FILENAME_RE.fullmatch(filename) or filename not in {
+            entry["filename"] for entry in self.list_backups(username)
+        }:
+            raise ValueError(f"Unknown backup {filename!r} for user {username!r}")
+
+        state = await self._get_state(username)
+        async with state.lock:
+            col = await self._ensure_open(state)
+            state.last_used = time.time()
+            # (a) Snapshot the CURRENT state first: a restore must be reversible.
+            snapshot = await asyncio.to_thread(self._backup_locked, col, username, "pre-restore")
+            # (b) Read the database bytes out of the backup zip (no extractall).
+            backup_path = os.path.join(self._backups_dir(username), filename)
+            payload = await asyncio.to_thread(_read_collection_member, backup_path)
+            # (c) Detach + close the open handle (drop_user's pattern): the
+            # detach under the registry lock contains no await points, and we
+            # hold the user lock, so no other coroutine can observe or use the
+            # handle between the detach and the close.
+            async with self._registry_lock:
+                old_col = state.col
+                state.col = None
+            if old_col is not None:
+                try:
+                    await asyncio.to_thread(old_col.close)
+                except Exception:
+                    logger.warning("Failed to close collection for %r before restore", username, exc_info=True)
+            # (d) Swap the restored database into place atomically; mode 0644
+            # matches what the wheel creates for collection.anki2.
+            collection_path = self._collection_path(username)
+            temp_fd, temp_path = tempfile.mkstemp(
+                dir=os.path.dirname(collection_path), prefix=".restore-", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(temp_fd, "wb") as f:
+                    f.write(payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.chmod(temp_path, 0o644)
+                os.replace(temp_path, collection_path)
+            except Exception:
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+                raise
+            logger.info(
+                "Restored collection for %r from %r (pre-restore snapshot: %r)",
+                username,
+                filename,
+                snapshot,
+            )
+            return {"restored_from": filename, "pre_restore_snapshot": snapshot}
