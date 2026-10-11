@@ -7,6 +7,8 @@ through the wheel's backend operation, the dupe report through the wheel's
 Python-side find_dupes).
 """
 
+import logging
+
 import pytest
 import pytest_asyncio
 from pydantic import ValidationError
@@ -187,6 +189,45 @@ async def test_unknown_note_ids_are_a_clean_error_before_the_backend(env):
     assert "12345" in res.error
     # The real note was never touched.
     assert (await _fronts(reg, "gunilla", [nid]))[nid] == "real note"
+
+
+@pytest.mark.asyncio
+async def test_invalid_regex_backend_error_stays_single_line_in_logs(env, caplog):
+    """With regex=True a pattern that the backend fails to PARSE comes back as
+    InvalidInput whose message embeds the search VERBATIM (Rust regex error
+    rendering) — and the keep-line-breaks validator admits \n into that
+    pattern. One such call used to author multi-line log records at the two
+    generic %s sinks (the stale-handle warning, which fires on every
+    InvalidInput, and the mutation-failure error): log-forging, CWE-117. Both
+    sinks must %r-escape exception text, so one tool call can never emit a
+    record spanning lines (the invariant tools/notes.py states for its own
+    %r-logged inputs); the client-facing error keeps the raw diagnostic."""
+    reg, manager = env
+    nid = await reg.run("ivar", _add_basic_note, "the colour red")
+
+    forged = "FAKE user=x\n2026-10-11 INFO auth login ok admin\n("
+    with caplog.at_level(logging.INFO):
+        res = await note_tools.find_and_replace(
+            manager, reg, "ivar", search=forged, replacement="x",
+            note_ids=[nid], regex=True,
+        )
+
+    # The failure surfaces to the client with the diagnostic intact (a JSON
+    # string field is a single structured value; only LOG lines had to be
+    # defended).
+    assert res.success is False and res.local_status == "failed"
+    assert "2026-10-11 INFO auth login ok admin" in res.error
+    assert "regex parse error" in res.error
+
+    # Both generic exception-text sinks fired for this call, and NO record
+    # from this one tool call spans a line.
+    assert any("Stale collection handle" in r.getMessage() for r in caplog.records)
+    assert any("Local mutation 'find_and_replace' failed" in r.getMessage() for r in caplog.records)
+    multiline = [r.getMessage() for r in caplog.records if "\n" in r.getMessage() or "\r" in r.getMessage()]
+    assert multiline == []
+
+    # The note is untouched (the backend refused before changing anything).
+    assert (await _fronts(reg, "ivar", [nid]))[nid] == "the colour red"
 
 
 # -- find_duplicates ---------------------------------------------------------------

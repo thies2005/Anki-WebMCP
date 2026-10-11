@@ -298,11 +298,18 @@ class CollectionRegistry:
                 return await asyncio.to_thread(fn, col, *args, **kwargs)
             except Exception as exc:
                 if state.col is col and self._is_stale(col, exc):
+                    # %r over the MESSAGE (not %s over exc): backend exception
+                    # text embeds client-controlled content VERBATIM (e.g. a
+                    # find_and_replace regex=true pattern inside a Rust regex
+                    # parse error), and %s would let one tool call author
+                    # multi-line log records (CWE-117). The wheel's
+                    # BackendError keeps args empty (message in _message), so
+                    # %r of the exception object would drop the diagnostic.
                     logger.warning(
-                        "Stale collection handle for %r (%s: %s); reopening once and retrying",
+                        "Stale collection handle for %r (%s: %r); reopening once and retrying",
                         username,
                         type(exc).__name__,
-                        exc,
+                        str(exc),
                     )
                     col = await self._recover_stale(state, col)
                     return await asyncio.to_thread(fn, col, *args, **kwargs)

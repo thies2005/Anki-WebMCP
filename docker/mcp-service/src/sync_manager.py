@@ -306,7 +306,12 @@ class SyncManager:
             except Exception as e:
                 local_status = "failed"
                 err_msg = str(e)
-                logger.error("Local mutation '%s' failed: %s", operation_name, err_msg)
+                # %r (not %s): err_msg embeds client-controlled content VERBATIM
+                # (e.g. a find_and_replace regex=true pattern inside a backend
+                # regex parse error) — %s would let one tool call author
+                # multi-line log records (CWE-117). The client-facing error
+                # below keeps the raw text: a structured JSON field is one value.
+                logger.error("Local mutation '%s' failed: %r", operation_name, err_msg)
                 if idempotency_key:
                     try:
                         await ledger.record_failure(idempotency_key, err_msg)
