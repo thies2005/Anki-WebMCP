@@ -1,10 +1,18 @@
 """Application configuration for the Anki MCP Service."""
 
+import contextlib
 import os
+import secrets
+import tempfile
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Tuple
 
 PLACEHOLDER_PREFIX = "replace-with"
+
+# Deployment-owned secret material, persisted inside the data volume so
+# zero-touch deployments (no SESSION_SECRET in the environment) still get a
+# stable secret that survives restarts.
+SESSION_SECRET_FILENAME = ".session_secret"
 
 
 def _env_str(name: str, default: str) -> str:
@@ -89,3 +97,43 @@ def validate_deployment_config(settings: Settings) -> List[str]:
 def get_settings() -> Settings:
     """Return an immutable snapshot of configuration, read from the environment at call time."""
     return Settings()
+
+
+def load_or_create_session_secret(data_dir: str) -> Tuple[str, str]:
+    """Return ``(secret, path)`` for this deployment's session secret.
+
+    Zero-touch deployments omit SESSION_SECRET; the service then provisions
+    its own secret once (atomic write, mode 0600) inside the data volume and
+    reuses it on every boot, so issued sessions survive restarts. An existing
+    file always wins — regeneration only happens when the file is absent.
+
+    Raises OSError when the data directory cannot be written; main() surfaces
+    that as a fatal problem (the caller must not run with a volatile secret).
+    """
+    path = os.path.join(data_dir, SESSION_SECRET_FILENAME)
+    try:
+        with open(path, encoding="utf-8") as f:
+            existing = f.read().strip()
+        if existing:
+            return existing, path
+    except FileNotFoundError:
+        pass
+
+    secret = secrets.token_hex(24)
+    os.makedirs(data_dir, exist_ok=True)
+    temp_fd, temp_path = tempfile.mkstemp(
+        dir=data_dir, prefix=".session_secret_", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
+            f.write(secret + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        # mkstemp already creates the file 0o600; re-assert against umask oddities.
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.remove(temp_path)
+        raise
+    return secret, path

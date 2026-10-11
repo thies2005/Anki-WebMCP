@@ -9,6 +9,7 @@ import hmac
 import logging
 import os
 import secrets
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from mcp.server.mcpserver import MCPServer
@@ -20,7 +21,7 @@ import uvicorn
 
 from .auth import AuthMiddleware
 from .collections import CollectionRegistry
-from .config import Settings, get_settings, validate_deployment_config
+from .config import Settings, get_settings, load_or_create_session_secret, validate_deployment_config
 from .logging_util import setup_logging
 from .models import AddNotesInput, AddTagsInput, GetNoteInput, SearchNotesInput, UpdateNoteFieldsInput
 from .sync_manager import SyncManager
@@ -1416,7 +1417,12 @@ def create_app(custom_settings: Optional[Settings] = None):
 
 
 def _bootstrap_first_admin(app_settings: Settings) -> None:
-    """Fail-closed first-boot admin bootstrap, operating on the module-global store.
+    """First-boot admin bootstrap, operating on the module-global store.
+
+    Credentials come from ADMIN_USERNAME/ADMIN_PASSWORD when provided; when
+    they are absent (zero-touch deployments) the password is generated and
+    persisted (0600, atomic) in the data volume so an operator can retrieve
+    it after the fact. The service still never comes up with zero accounts.
 
     MUST rebind the module globals (not build locals): create_app() captures
     ``user_store`` and the tool wrappers use ``sync_manager`` when called without
@@ -1430,26 +1436,104 @@ def _bootstrap_first_admin(app_settings: Settings) -> None:
     user_store = UserStore(app_settings.users_file)
     sync_manager = SyncManager(collection_registry, user_store, app_settings)
     if not user_store.list_users():
-        if app_settings.admin_username and app_settings.admin_password:
+        username = app_settings.admin_username or "admin"
+        generated = not app_settings.admin_password
+        password = app_settings.admin_password or secrets.token_urlsafe(18)
+        if generated:
+            # Persist BEFORE creating the account: if the password cannot be
+            # stored, do not create an admin nobody can log in as.
             try:
-                user_store.bootstrap_admin(app_settings.admin_username, app_settings.admin_password)
-            except ValueError as e:
-                logger.error("FATAL: cannot bootstrap the initial admin account: %s", e)
+                credentials_path = _write_initial_admin_credentials(app_settings, username, password)
+            except OSError as e:
+                logger.error(
+                    "FATAL: no bootstrap credentials set and the generated admin password "
+                    "could not be persisted in the data directory (%s). Set ADMIN_PASSWORD "
+                    "explicitly or make the data directory writable.",
+                    e,
+                )
                 raise SystemExit(1)
-            logger.info("Bootstrapped initial admin account %r", app_settings.admin_username)
-        else:
-            logger.error(
-                "FATAL: no user accounts exist in %s and no bootstrap credentials are set. "
-                "Set both ADMIN_USERNAME and ADMIN_PASSWORD to create the initial admin "
-                "on first start.",
-                app_settings.users_file,
-            )
+        try:
+            user_store.bootstrap_admin(username, password)
+        except ValueError as e:
+            logger.error("FATAL: cannot bootstrap the initial admin account: %s", e)
             raise SystemExit(1)
+        if generated:
+            logger.info(
+                "No ADMIN_USERNAME/ADMIN_PASSWORD set: bootstrapped initial admin %r with a "
+                "generated password, stored with mode 0600 at %s. Read it with "
+                "`docker exec <container> cat %s`, log in at the portal, then change the "
+                "password (the file can be deleted afterwards).",
+                username,
+                credentials_path,
+                credentials_path,
+            )
+        else:
+            logger.info("Bootstrapped initial admin account %r", username)
+
+
+def _write_initial_admin_credentials(app_settings: Settings, username: str, password: str) -> str:
+    """Persist the generated first-boot admin credentials (atomic, 0600); returns the path."""
+    path = os.path.join(app_settings.data_dir, "initial-admin-password.txt")
+    os.makedirs(app_settings.data_dir, exist_ok=True)
+    temp_fd, temp_path = tempfile.mkstemp(
+        dir=app_settings.data_dir, prefix="initial-admin-", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
+            f.write(
+                "Anki-WebMCP first-boot admin credentials\n"
+                "(generated because ADMIN_USERNAME/ADMIN_PASSWORD were not set)\n"
+                f"\nusername: {username}\npassword: {password}\n"
+                "\nLog in at the portal with these, then change the password from the\n"
+                "portal or manage accounts in /admin. This file is not needed after the\n"
+                "first login and can be deleted.\n"
+            )
+            f.flush()
+            os.fsync(f.fileno())
+        # mkstemp already creates the file 0o600; re-assert against umask oddities.
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, path)
+    except Exception:
+        with suppress(OSError):
+            os.remove(temp_path)
+        raise
+    return path
+
+
+def _resolve_session_secret(app_settings: Settings) -> List[str]:
+    """Zero-touch session-secret provisioning; returns fatal problems.
+
+    When SESSION_SECRET is absent from the environment, generate one and
+    persist it (0600, atomic) in the data volume; the same object handed in
+    (the module-global settings in production) is updated in place so the
+    serving app signs sessions with the generated secret. An explicitly set
+    SESSION_SECRET always wins; a placeholder value is still rejected by
+    validate_deployment_config.
+    """
+    if app_settings.session_secret:
+        return []
+    try:
+        secret, path = load_or_create_session_secret(app_settings.data_dir)
+    except OSError as e:
+        return [
+            "SESSION_SECRET is not set and could not be auto-generated inside the data "
+            f"directory ({app_settings.data_dir!r}): {e}. Make the data directory writable "
+            "or set SESSION_SECRET explicitly (openssl rand -hex 24)."
+        ]
+    object.__setattr__(app_settings, "session_secret", secret)
+    logger.info(
+        "SESSION_SECRET not provided: generated a deployment secret (persisted with mode "
+        "0600 at %s; it is reused on every boot). Set SESSION_SECRET to override; delete "
+        "the file to rotate.",
+        path,
+    )
+    return []
 
 
 def main():
     """Start uvicorn server, refusing unsafe configuration and bootstrapping the first admin."""
-    problems = validate_deployment_config(settings)
+    problems = _resolve_session_secret(settings)
+    problems.extend(validate_deployment_config(settings))
     if problems:
         for problem in problems:
             logger.error("FATAL: %s", problem)

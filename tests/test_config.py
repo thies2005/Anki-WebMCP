@@ -1,6 +1,7 @@
 """Unit tests for configuration loading and deployment validation."""
 
 import os
+import stat
 
 import pytest
 from src.config import Settings, get_settings, validate_deployment_config
@@ -121,37 +122,105 @@ def test_mcp_session_knobs_reject_garbage_and_non_positive(monkeypatch):
 # -- main() startup gating ---------------------------------------------------
 
 
-def test_main_refuses_unsafe_config(monkeypatch):
-    from src import main as main_module
-    monkeypatch.setattr(
-        main_module,
-        "settings",
-        Settings(session_secret=""),
-    )
-    with pytest.raises(SystemExit) as exc_info:
-        main_module.main()
-    assert exc_info.value.code == 1
+def test_main_refuses_unsafe_config(monkeypatch, tmp_path):
+    """Empty SESSION_SECRET plus an unwritable data dir must still fail closed.
 
-
-def test_main_refuses_empty_user_store_without_bootstrap(monkeypatch, tmp_path):
-    """No users + no ADMIN_USERNAME/ADMIN_PASSWORD must fail closed with SystemExit(1)."""
+    With a writable data dir the empty secret is auto-provisioned instead; the
+    refusal is exercised by blocking the data dir with a regular file.
+    """
     from src import main as main_module
-    users_file = str(tmp_path / "users.json")
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory")
     monkeypatch.setattr(
         main_module,
         "settings",
         Settings(
-            session_secret="real-secret",
-            users_file=users_file,
-            admin_username="",
-            admin_password="",
+            session_secret="",
+            data_dir=str(blocked),
+            users_file=str(blocked / "users.json"),
         ),
     )
     with pytest.raises(SystemExit) as exc_info:
         main_module.main()
     assert exc_info.value.code == 1
-    # Fail-closed: the refusal path must not create the store file or its directory.
-    assert not os.path.exists(users_file)
+
+
+def test_main_refuses_invalid_explicit_bootstrap(monkeypatch, tmp_path):
+    """An explicitly configured but invalid admin username must fail closed."""
+    from src import main as main_module
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        Settings(
+            session_secret="real-secret",
+            data_dir=str(tmp_path),
+            users_file=str(tmp_path / "users.json"),
+            admin_username="Not Valid",
+            admin_password="some-pw",
+        ),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        main_module.main()
+    assert exc_info.value.code == 1
+
+
+def test_main_zero_touch_provisions_secrets_and_admin(monkeypatch, tmp_path):
+    """No SESSION_SECRET, no ADMIN_* credentials, empty store: main() must
+    provision everything itself and proceed to serving."""
+    from src import main as main_module
+    from src.users import UserStore
+
+    users_file = str(tmp_path / "users.json")
+    boot_settings = Settings(
+        session_secret="",
+        data_dir=str(tmp_path),
+        users_file=users_file,
+        admin_username="",
+        admin_password="",
+    )
+    monkeypatch.setattr(main_module, "settings", boot_settings)
+    monkeypatch.setattr(main_module, "user_store", UserStore(users_file))
+    served = {}
+    monkeypatch.setattr(
+        main_module.uvicorn, "run", lambda app, **kwargs: served.setdefault("app", app)
+    )
+    main_module.main()
+    assert "app" in served
+
+    # Session secret: generated, persisted 0600, and visible to the settings
+    # object the serving app captured.
+    assert boot_settings.session_secret
+    secret_file = tmp_path / ".session_secret"
+    assert secret_file.exists()
+    assert stat.S_IMODE(secret_file.stat().st_mode) == 0o600
+    assert secret_file.read_text().strip() == boot_settings.session_secret
+
+    # Admin: created with the password recorded in the 0600 credentials file.
+    credentials_file = tmp_path / "initial-admin-password.txt"
+    assert credentials_file.exists()
+    assert stat.S_IMODE(credentials_file.stat().st_mode) == 0o600
+    content = credentials_file.read_text()
+    assert "username: admin" in content
+    password = next(
+        line.split("password:", 1)[1].strip()
+        for line in content.splitlines()
+        if line.strip().startswith("password:")
+    )
+    assert password
+    store = UserStore(users_file)
+    assert "admin" in [u.username for u in store.list_users()]
+    assert store.verify_password("admin", password)
+
+
+def test_load_or_create_session_secret_is_stable_across_calls(tmp_path):
+    from src.config import load_or_create_session_secret
+
+    first, path = load_or_create_session_secret(str(tmp_path))
+    assert first
+    assert os.path.exists(path)
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    second, _ = load_or_create_session_secret(str(tmp_path))
+    assert second == first
 
 
 @pytest.mark.asyncio
@@ -222,4 +291,49 @@ async def test_first_boot_bootstrap_visible_to_serving_app(monkeypatch, tmp_path
             )
             assert "credentials" in body.lower(), (
                 f"sync without creds must yield the credentials error, got: {body[:300]}"
+            )
+
+
+@pytest.mark.asyncio
+async def test_zero_touch_generated_admin_can_log_in(monkeypatch, tmp_path):
+    """Zero-touch first boot: the admin created with a GENERATED password (no
+    ADMIN_* env) must authenticate through the serving app, with the password
+    read back from the persisted credentials file."""
+    import httpx
+    import pytest_asyncio  # noqa: F401  (ensures the plugin is active)
+
+    from src import main as main_module
+
+    users_file = str(tmp_path / "users.json")
+    boot_settings = Settings(
+        session_secret="",
+        data_dir=str(tmp_path),
+        users_file=users_file,
+        admin_username="",
+        admin_password="",
+    )
+    monkeypatch.setattr(main_module, "settings", boot_settings)
+    monkeypatch.setattr(main_module, "user_store", __import__("src.users", fromlist=["UserStore"]).UserStore(users_file))
+
+    # Provision the generated secret exactly as main() does, then bootstrap.
+    from src.config import load_or_create_session_secret
+    secret, _ = load_or_create_session_secret(str(tmp_path))
+    object.__setattr__(boot_settings, "session_secret", secret)
+    main_module._bootstrap_first_admin(boot_settings)
+
+    content = (tmp_path / "initial-admin-password.txt").read_text()
+    password = next(
+        line.split("password:", 1)[1].strip()
+        for line in content.splitlines()
+        if line.strip().startswith("password:")
+    )
+
+    app = main_module.create_app()
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            res = await login_via_form(client, "admin", password)
+            assert res.status_code == 303, (
+                "zero-touch generated admin must be able to log in through the serving app "
+                f"(got {res.status_code})"
             )

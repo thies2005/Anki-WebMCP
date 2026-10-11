@@ -48,7 +48,7 @@
 - ~450 MB image and roughly **150–350 MB RAM per open collection** (the pool keeps at most `MAX_OPEN_COLLECTIONS` collections open, LRU-bounded).
 - A free host port `8000` (configurable mapping).
 - A Cloudflare account with a Zero Trust tunnel (only for Exposure Mode 1).
-- `openssl` to generate the session secret (and a strong password for the bootstrap admin).
+- `openssl` if you prefer choosing your own `SESSION_SECRET` and admin password — when omitted, the service generates and persists both on first boot (see [Security Architecture](#security-architecture)).
 
 ---
 
@@ -157,8 +157,10 @@ cd Anki-WebMCP
 cp .env.example .env
 ```
 
-### 2. Generate Secrets
-Edit `.env` and set at least:
+### 2. Generate Secrets (optional)
+Both secrets can be omitted — the service then provisions its own on first boot and persists them (`0600`) in the `/data` volume: a generated `SESSION_SECRET` at `/data/.session_secret`, and a generated initial-admin password recorded in `/data/initial-admin-password.txt` (read it with `docker compose exec anki-mcp cat /data/initial-admin-password.txt`).
+
+To choose your own instead, edit `.env`:
 ```bash
 openssl rand -hex 24     # Use for SESSION_SECRET
 openssl rand -base64 16  # Use for ADMIN_PASSWORD (or pick a strong passphrase)
@@ -196,7 +198,7 @@ Expected health output:
 
 ## First-Run Setup: Portal, Users & AnkiWeb
 
-1. Open **http://localhost:8000** and log in with `ADMIN_USERNAME` / `ADMIN_PASSWORD` from `.env`.
+1. Open **http://localhost:8000** and log in with `ADMIN_USERNAME` / `ADMIN_PASSWORD` from `.env` — or, if you set no admin password, with the generated one from `/data/initial-admin-password.txt` (`docker compose exec anki-mcp cat /data/initial-admin-password.txt`).
 2. Go to **/admin** and create an account for each user (username, initial password, role). Each account immediately gets its own MCP token and empty collection.
 3. As each user: log in at the portal, **copy your MCP token** (shown on the portal page; use it in your MCP client — see [MCP Client Integration](#mcp-client-integration)).
 4. To connect AnkiWeb, enter your **AnkiWeb email/password** under portal → Credentials, then press **Sync**. The first sync pulls your existing collection into `/data/users/<you>/`; from then on, explicit syncs move changes between this service and AnkiWeb.
@@ -231,23 +233,18 @@ Recommended for self-hosters without a public IP or open router ports.
 
 ### Mode 2: Coolify HTTPS Reverse Proxy
 
-Recommended for self-hosters running Coolify. The repository ships a preconfigured, self-contained stack file (`coolify-stack.yml`) — no file merging and no manual proxy labels. The only inputs are your domain and the two secrets.
+Recommended for self-hosters running Coolify — a paste-and-go deploy with zero secrets to enter.
 
-1. In Coolify: create or open a project → **+ New Resource → Docker Compose**, choose this Git repository, and set the Compose file to `coolify-stack.yml`.
-2. In the resource's **Environment** editor, fill the two required secrets:
-   ```env
-   SESSION_SECRET=<output of: openssl rand -hex 24>
-   ADMIN_PASSWORD=<output of: openssl rand -base64 16>
-   ```
-   (`ADMIN_USERNAME` defaults to `admin`; every other variable has a working default — notably `FORCE_SECURE_COOKIES=true`, correct for HTTPS behind the proxy.)
-3. In the compose resource's service list, set your domain on the **anki-mcp** service (e.g. `https://anki-mcp.yourdomain.com`). Coolify generates the Traefik routing and the Let's Encrypt certificate and forwards to the container's port 8000.
-4. **Deploy**, then verify `https://anki-mcp.yourdomain.com/health` returns `{"status":"healthy",...}`.
+0. **One-time prerequisite:** let the `docker-image` workflow publish `ghcr.io/thies2005/anki-webmcp` (it runs on pushes touching `docker/mcp-service`), then make the package public for anonymous pulls — GitHub → your profile → **Packages** → **Anki-WebMCP** → *Package settings* → *Change visibility*. Alternatively keep it private and add GHCR credentials in Coolify.
+1. In Coolify: create or open a project → **+ New Resource → Docker Compose** (the empty/paste variant) — and paste the contents of [`coolify-stack.yml`](coolify-stack.yml) from this repository.
+2. In the compose resource's service list, set your domain on the **anki-mcp** service (e.g. `https://anki-mcp.yourdomain.com`). Coolify generates the Traefik routing and the Let's Encrypt certificate and forwards to the container's port 8000.
+3. **Deploy.** No environment variables are required and the data volume is created from the stack file: on first boot the service provisions `SESSION_SECRET` and the initial admin password itself (persisted `0600` inside the volume, reused across restarts).
+4. Retrieve the generated admin password — Coolify: the resource's **Terminal/Exec** → `cat /data/initial-admin-password.txt` — log into the portal, then change the password. (To choose your own instead, set `SESSION_SECRET` / `ADMIN_PASSWORD` in the Environment editor beforehand.)
+5. Verify `https://anki-mcp.yourdomain.com/health` returns `{"status":"healthy",...}`.
 
-Data persists in the `anki_mcp_data` volume (`/data`). No host port is published — the service is reachable only through Coolify's proxy, which is intentional: the portal serves MCP tokens and AnkiWeb credentials and must never cross the wire as plain HTTP.
+Git-based deploys work too: add the resource from this repository with the compose file at `/coolify-stack.yml`, swapping the `image:` line for the commented `build:` block to build from source. The advanced override (`docker-compose.coolify.yml`, explicit Traefik labels driven by `ANKI_MCP_DOMAIN`) remains for users who manage their own Traefik.
 
 > **If the domain does not resolve after deploy:** attach the `anki-mcp` service to Coolify's proxy network in the Coolify UI, and confirm the service's port is set to 8000.
-
-The advanced override (`docker-compose.coolify.yml`, explicit Traefik labels driven by `ANKI_MCP_DOMAIN`) remains for users who manage their own Traefik; prefer the stack file above.
 
 ---
 
@@ -318,9 +315,9 @@ All tools operate on the **authenticated user's** collection — the token decid
 
 ## Security Architecture
 
-1. **Fail-Closed Startup**:
-   - The service exits unless `SESSION_SECRET` is set to a real (non-placeholder) value — sessions cannot be signed without it.
-   - A fresh deployment with zero accounts must be bootstrapped: the service exits unless `ADMIN_USERNAME` and `ADMIN_PASSWORD` are set, so a bare instance can never come up unauthenticated.
+1. **Fail-Closed Startup (with zero-touch self-provisioning)**:
+   - `SESSION_SECRET` may be set explicitly; placeholder values are always refused. When it is absent, the service generates a secret once and persists it at `/data/.session_secret` (`0600`, atomic write) — stable across restarts, rotatable by deleting the file, overridable by setting the variable. If the data directory is not writable the service refuses to start rather than run on a volatile secret.
+   - A fresh deployment with zero accounts bootstraps an admin before serving: `ADMIN_USERNAME`/`ADMIN_PASSWORD` are used when set; when absent, the password is generated and recorded in `/data/initial-admin-password.txt` (`0600`, same volume protection as `users.json`). A bare instance can never come up with zero accounts; if the generated password cannot be persisted, startup is refused.
 2. **Accounts & Passwords**:
    - Passwords are stored only as salted **scrypt** hashes; verification is constant-time and burns equivalent work for unknown usernames (no enumeration oracle).
    - Login rate limiting: **5 consecutive failures lock the (username, IP) pair out for 15 minutes**.
@@ -347,8 +344,8 @@ All tools operate on the **authenticated user's** collection — the token decid
 ## Troubleshooting
 
 - **`/health` returns 503 / `degraded`**: the users store is unavailable (e.g. `users.json` unreadable/corrupt) or the data directory is missing/not writable (volume not mounted, permissions). Check `docker compose logs -f anki-mcp` for the `Health probe:` warnings.
-- **`anki-mcp` restart-loops with `FATAL: SESSION_SECRET ...`**: the secret is empty or still the `.env.example` placeholder. Generate one (`openssl rand -hex 24`) and recreate the container.
-- **`anki-mcp` exits with `no user accounts exist ... ADMIN_USERNAME`**: first boot without bootstrap credentials. Set both `ADMIN_USERNAME` and `ADMIN_PASSWORD` for the first start.
+- **`anki-mcp` restart-loops with `FATAL: SESSION_SECRET ...`**: the variable is still the `.env.example` placeholder (refused even though auto-generation exists), or the data volume is missing/unwritable so the secret could not be self-provisioned. Set a real secret (`openssl rand -hex 24`) or fix the volume mount.
+- **First-boot admin password unknown**: when `ADMIN_PASSWORD` was not set, it was generated and stored in `/data/initial-admin-password.txt` — `docker compose exec anki-mcp cat /data/initial-admin-password.txt`. It can also be reset at any time via the `src.useradmin` CLI (below).
 - **Portal login locked out**: 5 consecutive failures trigger a 15-minute lock per (username, source IP). Wait it out or correct the password; a successful login clears the counter.
 - **Forgot the admin password**: use the recovery CLI from inside the container —
   ```bash

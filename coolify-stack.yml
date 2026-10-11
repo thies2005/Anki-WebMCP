@@ -1,35 +1,35 @@
-# Coolify-ready stack for Anki-WebMCP — single preconfigured file, no merging.
+# Zero-touch Coolify stack: paste, set the domain on the anki-mcp service,
+# deploy. No environment variables are required and the data volume is created
+# automatically — on first boot the service provisions its own secrets
+# (0600, inside the volume):
+#   • SESSION_SECRET      -> generated at /data/.session_secret (stable across
+#                            restarts; set the env var to override)
+#   • initial admin login -> generated and recorded in
+#                            /data/initial-admin-password.txt
+#                            (read it via your platform's container exec:
+#                             cat /data/initial-admin-password.txt)
 #
-# Deploy: Coolify -> your project -> + New Resource -> Docker Compose (from
-# this Git repository) -> Compose file: coolify-stack.yml
-#
-# The only inputs:
-#   1. Domain:  set it on the anki-mcp service in the Coolify UI (Coolify
-#               generates the proxy routing + Let's Encrypt certificate)
-#   2. Secrets: SESSION_SECRET and ADMIN_PASSWORD in Coolify's Environment
-#               editor (ADMIN_USERNAME defaults to "admin")
-#
-# Everything else ships with working defaults below — notably
-# FORCE_SECURE_COOKIES=true, which is correct for HTTPS-via-proxy. No host
-# port is published: the portal serves tokens and AnkiWeb credentials and
-# must only be reachable through Coolify's HTTPS proxy.
+# The image is published by .github/workflows/docker-image.yml. If your GHCR
+# package is private, either make it public (Package settings) or add GHCR
+# credentials in Coolify. Building from source instead works with a git-based
+# Coolify compose resource — swap `image:` for the commented `build:` block.
 
 services:
   anki-mcp:
-    build:
-      context: ./docker/mcp-service
-      dockerfile: Dockerfile
+    image: ghcr.io/thies2005/anki-webmcp:latest
+    # build:
+    #   context: ./docker/mcp-service
+    #   dockerfile: Dockerfile
     restart: unless-stopped
-    # Container-only port; Coolify's proxy routes the domain here. Deliberately
-    # no `ports:` — no plain-HTTP exposure on the host.
+    # Container-only port; the platform's HTTPS proxy routes the domain here.
+    # Deliberately no `ports:` — no plain-HTTP exposure on the host.
     expose:
       - "8000"
     environment:
-      # --- required: fill these two in Coolify's Environment editor ---
-      - SESSION_SECRET=${SESSION_SECRET}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
-      # --- preconfigured defaults (override in Coolify if needed) ---
+      # All optional — unset/empty means "self-provision on first boot".
+      - SESSION_SECRET=${SESSION_SECRET:-}
       - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
       - FORCE_SECURE_COOKIES=${FORCE_SECURE_COOKIES:-true}
       - TZ=${TZ:-UTC}
       - MAINTENANCE_MODE=${MAINTENANCE_MODE:-false}
