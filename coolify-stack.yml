@@ -1,0 +1,51 @@
+# Coolify-ready stack for Anki-WebMCP — single preconfigured file, no merging.
+#
+# Deploy: Coolify -> your project -> + New Resource -> Docker Compose (from
+# this Git repository) -> Compose file: coolify-stack.yml
+#
+# The only inputs:
+#   1. Domain:  set it on the anki-mcp service in the Coolify UI (Coolify
+#               generates the proxy routing + Let's Encrypt certificate)
+#   2. Secrets: SESSION_SECRET and ADMIN_PASSWORD in Coolify's Environment
+#               editor (ADMIN_USERNAME defaults to "admin")
+#
+# Everything else ships with working defaults below — notably
+# FORCE_SECURE_COOKIES=true, which is correct for HTTPS-via-proxy. No host
+# port is published: the portal serves tokens and AnkiWeb credentials and
+# must only be reachable through Coolify's HTTPS proxy.
+
+services:
+  anki-mcp:
+    build:
+      context: ./docker/mcp-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # Container-only port; Coolify's proxy routes the domain here. Deliberately
+    # no `ports:` — no plain-HTTP exposure on the host.
+    expose:
+      - "8000"
+    environment:
+      # --- required: fill these two in Coolify's Environment editor ---
+      - SESSION_SECRET=${SESSION_SECRET}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      # --- preconfigured defaults (override in Coolify if needed) ---
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - FORCE_SECURE_COOKIES=${FORCE_SECURE_COOKIES:-true}
+      - TZ=${TZ:-UTC}
+      - MAINTENANCE_MODE=${MAINTENANCE_MODE:-false}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - IDLE_TIMEOUT_MINUTES=${IDLE_TIMEOUT_MINUTES:-15}
+      - MAX_OPEN_COLLECTIONS=${MAX_OPEN_COLLECTIONS:-5}
+      - MAX_CONCURRENT_SYNCS=${MAX_CONCURRENT_SYNCS:-2}
+      - BACKUP_RETENTION=${BACKUP_RETENTION:-5}
+    volumes:
+      - anki_mcp_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  anki_mcp_data:

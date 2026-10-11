@@ -231,24 +231,23 @@ Recommended for self-hosters without a public IP or open router ports.
 
 ### Mode 2: Coolify HTTPS Reverse Proxy
 
-Recommended for self-hosters running Coolify.
+Recommended for self-hosters running Coolify. The repository ships a preconfigured, self-contained stack file (`coolify-stack.yml`) — no file merging and no manual proxy labels. The only inputs are your domain and the two secrets.
 
-1. Merge the base and override files into a single stack file Coolify can consume:
-   ```bash
-   docker compose -f docker-compose.yml -f docker-compose.coolify.yml config > coolify-stack.yml
-   ```
-2. In Coolify, create a new project, add a resource of type **Docker Compose**, and paste the contents of `coolify-stack.yml`.
-3. Set the environment variables in Coolify's Environment settings:
+1. In Coolify: create or open a project → **+ New Resource → Docker Compose**, choose this Git repository, and set the Compose file to `coolify-stack.yml`.
+2. In the resource's **Environment** editor, fill the two required secrets:
    ```env
-   ANKI_MCP_DOMAIN=anki-mcp.yourdomain.com
    SESSION_SECRET=<output of: openssl rand -hex 24>
-   ADMIN_USERNAME=admin
    ADMIN_PASSWORD=<output of: openssl rand -base64 16>
    ```
-4. Coolify's Traefik reverse proxy will automatically issue Let's Encrypt certificates and route:
-   - `https://anki-mcp.yourdomain.com` -> `anki-mcp:8000` (portal, `/admin`, and Streamable HTTP MCP)
+   (`ADMIN_USERNAME` defaults to `admin`; every other variable has a working default — notably `FORCE_SECURE_COOKIES=true`, correct for HTTPS behind the proxy.)
+3. In the compose resource's service list, set your domain on the **anki-mcp** service (e.g. `https://anki-mcp.yourdomain.com`). Coolify generates the Traefik routing and the Let's Encrypt certificate and forwards to the container's port 8000.
+4. **Deploy**, then verify `https://anki-mcp.yourdomain.com/health` returns `{"status":"healthy",...}`.
 
-> **Note:** Coolify must be able to route to the container via its Traefik proxy network. If the domain does not resolve, attach the `anki-mcp` service to Coolify's proxy network in the Coolify UI.
+Data persists in the `anki_mcp_data` volume (`/data`). No host port is published — the service is reachable only through Coolify's proxy, which is intentional: the portal serves MCP tokens and AnkiWeb credentials and must never cross the wire as plain HTTP.
+
+> **If the domain does not resolve after deploy:** attach the `anki-mcp` service to Coolify's proxy network in the Coolify UI, and confirm the service's port is set to 8000.
+
+The advanced override (`docker-compose.coolify.yml`, explicit Traefik labels driven by `ANKI_MCP_DOMAIN`) remains for users who manage their own Traefik; prefer the stack file above.
 
 ---
 
