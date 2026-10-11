@@ -188,10 +188,21 @@ def test_body_too_large_boundary():
     # At the cap or below: allowed.
     assert _body_too_large(request_with(str(MAX_FORM_BODY_BYTES).encode())) is False
     assert _body_too_large(request_with(b"0")) is False
-    # Missing header (chunked) and garbage: not rejected here (downstream
-    # bounds apply), never a raise.
+    # Absent header without transfer-encoding: not rejected (nothing sane
+    # to read); garbage-but-present and chunked transfer-encoding are both
+    # refused fail-closed (review fix F1: per-field parser caps do not bound
+    # multipart file parts, so chunked must never reach the parser).
     assert _body_too_large(request_with(b"")) is False
-    assert _body_too_large(request_with(b"abc")) is False
+    assert _body_too_large(request_with(b"abc")) is True
+    req = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/login",
+            "headers": [(b"transfer-encoding", b"chunked")],
+        }
+    )
+    assert _body_too_large(req) is True
 
 
 def test_uvicorn_run_kwargs_carry_concurrency_limit(tmp_path):

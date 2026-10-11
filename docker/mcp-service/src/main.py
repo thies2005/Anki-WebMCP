@@ -1,6 +1,7 @@
 """Main entrypoint for Anki MCP Service."""
 
 import asyncio
+import anyio
 from contextlib import asynccontextmanager, suppress
 import hashlib
 import html
@@ -144,6 +145,11 @@ MAX_FORM_BODY_BYTES = 64 * 1024
 # connections plus in-flight requests per worker; uvicorn's default is None).
 UVICORN_LIMIT_CONCURRENCY = 32
 
+# Dedicated cap on pre-auth password verification: unauthenticated callers
+# cannot occupy more than this many of the shared worker tokens with scrypt
+# burns, whatever uvicorn's overall ceiling is (audit remediation half 2).
+login_verify_capacity = anyio.CapacityLimiter(4)
+
 
 def _prelogin_key(session_secret: str) -> bytes:
     """Derive the prelogin-binding key, domain-separated from every other use of the secret."""
@@ -178,33 +184,39 @@ def _verify_prelogin(session_secret: str, value: str) -> bool:
 
 
 def _body_too_large(request: Request) -> bool:
-    """True when the DECLARED Content-Length exceeds MAX_FORM_BODY_BYTES.
+    """True when the request body must be refused before parsing.
 
-    Reads one header and touches no body bytes, so an oversized form POST is
+    Reads headers only and touches no body bytes, so an oversized form POST is
     refused before starlette's form parser allocates for it (the parser caps
     are per-field, not per-body, and file parts spool to disk unchecked).
-    A missing or unparseable header returns False: chunked bodies then rest on
-    uvicorn's limit_concurrency plus the form parser's own per-field caps.
+    A chunked body (no Content-Length) is refused outright: browsers never
+    chunk form posts, and starlette's per-field caps do not bound multipart
+    file parts, so admitting chunked would reopen the pre-auth spool path.
     """
+    if request.headers.get("transfer-encoding"):
+        return True
     raw = request.headers.get("content-length", "")
     try:
         return int(raw) > MAX_FORM_BODY_BYTES
     except ValueError:
-        return False
+        # Unparseable/absent without transfer-encoding: nothing sane to read.
+        return raw != ""
 
 
 def _uvicorn_run_kwargs(settings: Settings) -> Dict[str, Any]:
     """Keyword arguments for uvicorn.run in main(), testable without a server.
 
     Keeping this in one place lets tests pin the availability-relevant kwargs
-    (limit_concurrency) by source inspection instead of booting uvicorn.
+    (limit_concurrency) by source inspection instead of booting uvicorn. The
+    concurrency ceiling stays above twice the MCP session cap because every
+    stateful MCP session holds a stream that also counts toward it.
     """
     return {
         "host": settings.mcp_host,
         "port": settings.mcp_port,
         "log_level": settings.log_level.lower(),
         "access_log": False,
-        "limit_concurrency": UVICORN_LIMIT_CONCURRENCY,
+        "limit_concurrency": max(UVICORN_LIMIT_CONCURRENCY, 2 * settings.mcp_max_sessions),
     }
 
 
@@ -1007,8 +1019,12 @@ def create_app(custom_settings: Optional[Settings] = None):
             )
         valid = False
         if username:
-            # scrypt is CPU-bound; keep it off the event loop.
-            valid = await run_in_threadpool(store.verify_password, username, password)
+            # scrypt is CPU-bound; keep it off the event loop, and cap how
+            # much unauthenticated crypto work the shared process hosts:
+            # unauthenticated callers get at most a few concurrent burns
+            # regardless of uvicorn's overall concurrency ceiling.
+            async with login_verify_capacity:
+                valid = await run_in_threadpool(store.verify_password, username, password)
         if valid:
             login_rate_limiter.record_success(username, ip)
             response = RedirectResponse("/", status_code=303)
@@ -1293,7 +1309,23 @@ def create_app(custom_settings: Optional[Settings] = None):
         except (OSError, ValueError) as e:
             logger.error("Failed to archive data directory for %r: %s", username, e)
             return _bad_request(f"Deletion failed while archiving data: {e}")
-        await run_in_threadpool(store.delete_user, username)
+        try:
+            await run_in_threadpool(store.delete_user, username)
+        except ValueError as e:
+            # The in-lock last-admin guard raced a concurrent admin change
+            # after the pre-check above. The data directory was ALREADY
+            # archived, so be honest about the divergence rather than 500:
+            # the account record survives and its collection restarts empty
+            # (recoverable by an operator from the deleted/ archive).
+            logger.error(
+                "Delete of %r failed the store-level last-admin guard AFTER archiving: %s",
+                username, e,
+            )
+            return _bad_request(
+                f"{e} The account's data was already archived to {archive_path}; "
+                "the account still exists and will start with an empty collection. "
+                "Restore it from the archive if needed."
+            )
         # Detach every serving state keyed by the username (audit fix): the
         # open Collection handle, the cached registry state and the in-memory
         # idempotency ledger would otherwise survive deletion and be handed

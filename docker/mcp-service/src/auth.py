@@ -71,7 +71,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         provided_token = self._extract_token(request)
         if not provided_token:
-            logger.warning("Rejected unauthenticated request to %s: missing token", request.url.path)
+            logger.warning("Rejected unauthenticated request to %r: missing token", request.url.path)
             return JSONResponse(
                 status_code=401,
                 content={"error": "Unauthorized: Missing authentication token (Authorization: Bearer <token> or X-API-Key)"},
@@ -81,7 +81,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # sha256 + in-memory scan (no I/O, no scrypt): safe to run inline.
         user = self.store.authenticate_token(provided_token)
         if user is None:
-            logger.warning("Rejected request to %s: invalid token provided", request.url.path)
+            logger.warning("Rejected request to %r: invalid token provided", request.url.path)
             return JSONResponse(
                 status_code=401,
                 content={"error": "Unauthorized: Invalid authentication token"},

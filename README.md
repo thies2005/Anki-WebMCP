@@ -221,6 +221,8 @@ Recommended for self-hosters without a public IP or open router ports.
    CLOUDFLARE_TUNNEL_TOKEN=eyJhIjoi...
    ```
    The override file passes the token to cloudflared via its `TUNNEL_TOKEN` **environment variable** — never on the container command line, where it would be world-readable to every local account through `ps` and `/proc/<pid>/cmdline`.
+   
+   > **Login lockout behind a proxy**: the portal's brute-force limiter budgets per *client IP*, but behind cloudflared/Traefik the app sees only the proxy's address, so the per-IP aggregate budget (30 failures / 15 min) is shared by **all** portal users — one attacker's spray can lock portal logins (not MCP tokens) for everyone for 15 minutes. If that matters on your deployment, add a Cloudflare WAF rate-limit rule on `/login`.
 4. Start with the Cloudflare override:
    ```bash
    docker compose -f docker-compose.yml -f docker-compose.cloudflare.yml up -d

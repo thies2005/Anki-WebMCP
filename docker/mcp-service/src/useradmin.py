@@ -74,9 +74,10 @@ def cmd_reset_password(args: argparse.Namespace) -> int:
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
-    # Any active web session for this user stays valid until it expires
-    # (sessions are signed, not stored); the new password applies to the next
-    # login. Start the service again with: docker compose start anki-mcp
+    # The password change bumps the user's sessions_invalid_before epoch, so
+    # once the service restarts and reloads the store (this CLI must run with
+    # the service stopped) web sessions issued before the reset stop
+    # authenticating. Start the service again with: docker compose start anki-mcp
     print(f"Password updated for {args.username!r}.")
     return 0
 
