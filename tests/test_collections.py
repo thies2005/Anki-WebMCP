@@ -15,7 +15,7 @@ import pytest_asyncio
 
 # src.collections imports anki.collection first; the wheel's anki.notes cannot
 # be the FIRST anki module imported (circular import through anki.cards).
-from src.collections import CollectionRegistry  # isort: skip
+from src.collections import CollectionRegistry, _plan_sync_followup  # isort: skip
 from anki.errors import InvalidInput
 from anki.notes import Note
 
@@ -487,3 +487,147 @@ async def test_drop_user_leaves_other_users_unaffected(make_registry):
     fronts = await reg.run("alice", lambda col: [col.get_note(nid).fields[0] for nid in col.find_notes("")])
     assert fronts == ["alice-note"]  # data intact
     assert await reg.run("alice", count_notes) == 1
+
+
+# -- AnkiWeb sync follow-up phases ---------------------------------------------
+
+
+def _sync_response(required, new_endpoint=None, server_media_usn=0, host_number=0):
+    from anki.sync_pb2 import SyncCollectionResponse
+
+    resp = SyncCollectionResponse()
+    resp.required = required
+    resp.host_number = host_number
+    resp.server_media_usn = server_media_usn
+    if new_endpoint:
+        resp.new_endpoint = new_endpoint
+    return resp
+
+
+def test_followup_plan_no_changes_and_normal_sync_settle_in_handshake():
+    from anki.sync_pb2 import SyncCollectionResponse
+
+    plan = _plan_sync_followup
+    assert plan(_sync_response(SyncCollectionResponse.ChangesRequired.NO_CHANGES)) == ("none", None)
+    assert plan(_sync_response(SyncCollectionResponse.ChangesRequired.NORMAL_SYNC)) == ("none", None)
+
+
+def test_followup_plan_full_download_carries_media_usn():
+    from anki.sync_pb2 import SyncCollectionResponse
+
+    out = _sync_response(
+        SyncCollectionResponse.ChangesRequired.FULL_DOWNLOAD,
+        new_endpoint="https://sync30.ankiweb.net/",
+        server_media_usn=231400,
+        host_number=30,
+    )
+    # Exactly the shape a fresh empty collection gets from a real account.
+    assert _plan_sync_followup(out) == ("download", 231400)
+
+
+def test_followup_plan_full_upload_and_full_sync():
+    from anki.sync_pb2 import SyncCollectionResponse
+
+    assert _plan_sync_followup(_sync_response(SyncCollectionResponse.ChangesRequired.FULL_UPLOAD)) == ("upload", None)
+    assert _plan_sync_followup(_sync_response(SyncCollectionResponse.ChangesRequired.FULL_SYNC)) == ("error", None)
+
+
+class _FakeSyncCollection:
+    """Stands in for anki.collection.Collection for sync_user (no network)."""
+
+    def __init__(self, handshake):
+        self.handshake = handshake
+        self.calls = []
+
+    def create_backup(self, **kwargs):
+        pass
+
+    def await_backup_completion(self):
+        pass
+
+    def sync_login(self, email, password, endpoint):
+        self.calls.append(("login", email, endpoint))
+        from anki.sync import SyncAuth
+
+        auth = SyncAuth()
+        auth.hkey = "hkey"
+        return auth
+
+    def sync_collection(self, auth, sync_media):
+        self.calls.append(("sync_collection", auth.endpoint))
+        return self.handshake
+
+    def full_upload_or_download(self, *, auth, server_usn, upload):
+        self.calls.append(("full", auth.endpoint, server_usn, upload))
+
+
+@pytest.mark.asyncio
+async def test_sync_user_performs_full_download_followup_with_redirect(make_registry, monkeypatch):
+    """Regression (real-account first sync): the handshake alone reported
+    success while the collection stayed empty — sync_user must perform the
+    FULL_DOWNLOAD transfer, against the redirected endpoint."""
+    from anki.sync_pb2 import SyncCollectionResponse
+
+    reg = make_registry()
+    fake = _FakeSyncCollection(
+        _sync_response(
+            SyncCollectionResponse.ChangesRequired.FULL_DOWNLOAD,
+            new_endpoint="https://sync30.ankiweb.net/",
+            server_media_usn=231400,
+            host_number=30,
+        )
+    )
+
+    async def fake_ensure_open(state):
+        return fake
+
+    monkeypatch.setattr(reg, "_ensure_open", fake_ensure_open)
+
+    result = await reg.sync_user("alice", "user@example.com", "pw")
+
+    assert result["success"] is True, result
+    assert "Full download" in result["output"]
+    # The follow-up transfer ran, against the redirected endpoint, with the
+    # server's media USN, in the download direction.
+    assert fake.calls[1] == ("sync_collection", "")
+    assert fake.calls[2] == ("full", "https://sync30.ankiweb.net/", 231400, False)
+
+
+@pytest.mark.asyncio
+async def test_sync_user_full_upload_followup(make_registry, monkeypatch):
+    from anki.sync_pb2 import SyncCollectionResponse
+
+    reg = make_registry()
+    fake = _FakeSyncCollection(
+        _sync_response(SyncCollectionResponse.ChangesRequired.FULL_UPLOAD, host_number=7)
+    )
+
+    async def fake_ensure_open(state):
+        return fake
+
+    monkeypatch.setattr(reg, "_ensure_open", fake_ensure_open)
+
+    result = await reg.sync_user("alice", "user@example.com", "pw")
+
+    assert result["success"] is True, result
+    assert "Full upload" in result["output"]
+    assert fake.calls[2] == ("full", "", None, True)
+
+
+@pytest.mark.asyncio
+async def test_sync_user_full_sync_direction_is_a_definitive_failure(make_registry, monkeypatch):
+    from anki.sync_pb2 import SyncCollectionResponse
+
+    reg = make_registry()
+    fake = _FakeSyncCollection(_sync_response(SyncCollectionResponse.ChangesRequired.FULL_SYNC))
+
+    async def fake_ensure_open(state):
+        return fake
+
+    monkeypatch.setattr(reg, "_ensure_open", fake_ensure_open)
+
+    result = await reg.sync_user("alice", "user@example.com", "pw")
+
+    assert result["success"] is False
+    assert "full sync" in result["error"].lower()
+    assert "outcome_unknown" not in result  # definitive refusal, not ambiguous

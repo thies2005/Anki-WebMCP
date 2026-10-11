@@ -54,12 +54,50 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from anki.collection import Collection
 from anki.errors import InvalidInput, NetworkError, SyncError, SyncErrorKind
+from anki.sync import SyncAuth, SyncOutput
+from anki.sync_pb2 import SyncCollectionResponse
 
 from .ledger import MAX_ENTRIES as LEDGER_MAX_ENTRIES
 from .ledger import IdempotencyLedger
 from .users import USERNAME_RE
 
 logger = logging.getLogger("anki_mcp.collections")
+
+# Follow-up actions for a sync_collection handshake result. The wheel's
+# sync_collection() performs login plus the regular delta sync and reports
+# what more the server requires; the bulk transfers are separate calls.
+_CHANGES_REQUIRED = SyncCollectionResponse.ChangesRequired
+
+
+def _plan_sync_followup(out: SyncOutput) -> Tuple[str, Optional[int]]:
+    """Map a ``sync_collection`` result to the follow-up the caller must run.
+
+    Returns ``(action, server_media_usn)`` with action one of:
+
+    - ``"none"``     — NO_CHANGES/NORMAL_SYNC: the handshake already settled
+      everything (the regular delta runs inside ``sync_collection``).
+    - ``"download"`` — the server holds a collection this client must pull
+      wholesale (fresh/empty local collection, e.g. first sync of an account
+      with existing data). Run ``full_upload_or_download(upload=False)`` with
+      the response's ``server_media_usn``.
+    - ``"upload"``   — the local collection must replace the server's. Run
+      ``full_upload_or_download(upload=True)`` (no media USN).
+    - ``"error"``    — FULL_SYNC asks for a user-chosen direction (desktop
+      "on next sync, force full sync" option); an unattended service cannot
+      make that choice, so the caller surfaces it as a failure.
+
+    Regression context: the first sync of a real account returns
+    ``required: FULL_DOWNLOAD`` and, until this is acted on, the collection
+    stays empty while the portal reports success.
+    """
+    required = out.required
+    if required in (_CHANGES_REQUIRED.NO_CHANGES, _CHANGES_REQUIRED.NORMAL_SYNC):
+        return "none", None
+    if required == _CHANGES_REQUIRED.FULL_DOWNLOAD:
+        return "download", int(out.server_media_usn)
+    if required == _CHANGES_REQUIRED.FULL_UPLOAD:
+        return "upload", None
+    return "error", None
 
 
 def _check_username(username: str) -> str:
@@ -503,8 +541,53 @@ class CollectionRegistry:
                     if on_step is not None:
                         on_step("sync")
                     out = await asyncio.to_thread(col.sync_collection, auth, True)
-                    logger.info("Sync completed for %r", username)
-                    return {"success": True, "output": str(out)}
+
+                    # Follow the server's endpoint redirect (syncNN.ankiweb.net)
+                    # before any follow-up transfer, mirroring the desktop client.
+                    if out.new_endpoint:
+                        auth.endpoint = out.new_endpoint
+
+                    followup, server_media_usn = _plan_sync_followup(out)
+                    if followup == "error":
+                        # Deliberately a ValueError (not SyncError): nothing was
+                        # transferred, so the outcome is definitive and must not
+                        # be classified as ambiguous by the handler below.
+                        raise ValueError(
+                            "AnkiWeb requires a full sync with a user-chosen direction "
+                            "(the desktop client's 'force full sync' option was used on this "
+                            "account). Open the desktop client, run a full sync there to settle "
+                            "the direction, then sync this service again."
+                        )
+                    if followup == "download":
+                        if on_step is not None:
+                            on_step("full-download")
+                        await asyncio.to_thread(
+                            col.full_upload_or_download,
+                            auth=auth,
+                            server_usn=server_media_usn,
+                            upload=False,
+                        )
+                        output = (
+                            "Full download from AnkiWeb completed "
+                            f"(host {out.host_number}); collection and media pulled to this service."
+                        )
+                    elif followup == "upload":
+                        if on_step is not None:
+                            on_step("full-upload")
+                        await asyncio.to_thread(
+                            col.full_upload_or_download,
+                            auth=auth,
+                            server_usn=None,
+                            upload=True,
+                        )
+                        output = (
+                            "Full upload to AnkiWeb completed "
+                            f"(host {out.host_number}); collection and media pushed from this service."
+                        )
+                    else:
+                        output = str(out)
+                    logger.info("Sync completed for %r (follow-up: %s)", username, followup)
+                    return {"success": True, "output": output}
                 except Exception as exc:
                     result: Dict[str, Any] = {
                         "success": False,
