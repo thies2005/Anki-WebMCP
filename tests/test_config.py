@@ -4,6 +4,9 @@ import os
 
 import pytest
 from src.config import Settings, get_settings, validate_deployment_config
+# POST /login requires the prelogin CSRF pair issued by GET /login; the
+# shared helper lives with the Wave B regression tests.
+from test_audit_fixes_b import login_via_form
 
 
 def test_get_settings_reads_env_at_call_time(monkeypatch):
@@ -86,6 +89,35 @@ def test_tuning_settings_read_env_and_enforce_minimum(monkeypatch):
         Settings()
 
 
+# -- /mcp session-table knobs (audit fix) ------------------------------------
+
+
+def test_mcp_session_knobs_have_deployment_sized_defaults(monkeypatch):
+    for name in ("MCP_MAX_SESSIONS", "MCP_SESSION_IDLE_TIMEOUT"):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings()
+    assert settings.mcp_max_sessions == 16
+    assert settings.mcp_session_idle_timeout == 300
+
+
+def test_mcp_session_knobs_read_env(monkeypatch):
+    monkeypatch.setenv("MCP_MAX_SESSIONS", "8")
+    monkeypatch.setenv("MCP_SESSION_IDLE_TIMEOUT", "60")
+    settings = Settings()
+    assert settings.mcp_max_sessions == 8
+    assert settings.mcp_session_idle_timeout == 60
+
+
+def test_mcp_session_knobs_reject_garbage_and_non_positive(monkeypatch):
+    monkeypatch.setenv("MCP_MAX_SESSIONS", "not-a-number")
+    with pytest.raises(ValueError, match="MCP_MAX_SESSIONS"):
+        Settings()
+    monkeypatch.setenv("MCP_MAX_SESSIONS", "8")
+    monkeypatch.setenv("MCP_SESSION_IDLE_TIMEOUT", "0")
+    with pytest.raises(ValueError, match="MCP_SESSION_IDLE_TIMEOUT"):
+        Settings()
+
+
 # -- main() startup gating ---------------------------------------------------
 
 
@@ -156,9 +188,7 @@ async def test_first_boot_bootstrap_visible_to_serving_app(monkeypatch, tmp_path
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            res = await client.post(
-                "/login", data={"username": "root", "password": "first-boot-pw"}
-            )
+            res = await login_via_form(client, "root", "first-boot-pw")
             assert res.status_code == 303, (
                 "first-boot admin must be able to log in through the serving app "
                 f"(got {res.status_code})"

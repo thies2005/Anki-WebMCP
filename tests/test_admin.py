@@ -19,6 +19,9 @@ from src.config import Settings
 from src.main import create_app
 from src.users import UserStore
 from src.webauth import SESSION_COOKIE_NAME, issue_session
+# The shared form-login helper lives with the Wave B regression tests: POST
+# /login requires the prelogin CSRF pair issued by GET /login.
+from test_audit_fixes_b import login_via_form
 
 SECRET = "test-session-secret"
 ROOT_PASSWORD = "root-pw"
@@ -161,7 +164,7 @@ async def test_create_user_flash_raw_token_once_and_new_login_works(client, tmp_
     assert disk_store.authenticate_token(raw_token).username == "bob"
 
     # The new account can actually log in through the web form.
-    login = await client.post("/login", data={"username": "bob", "password": "bob-pw"})
+    login = await login_via_form(client, "bob", "bob-pw")
     assert login.status_code == 303
     assert login.headers["location"] == "/"
 
@@ -317,10 +320,11 @@ async def test_reset_password_invalidates_old_and_web_login_works(client, tmp_pa
     assert disk_store.verify_password("alice", "brand-new-pw") is True
 
     # Old password fails the web login; the new one works.
-    # (root's session still sits in the jar; logout not needed for /login POST.)
-    old_login = await client.post("/login", data={"username": "alice", "password": "alice-pw"})
+    # (login_via_form clears the jar each time, so no stale root session is
+    # carried into alice's login attempts.)
+    old_login = await login_via_form(client, "alice", "alice-pw")
     assert old_login.status_code == 401
-    new_login = await client.post("/login", data={"username": "alice", "password": "brand-new-pw"})
+    new_login = await login_via_form(client, "alice", "brand-new-pw")
     assert new_login.status_code == 303
 
 

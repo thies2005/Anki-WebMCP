@@ -2,9 +2,12 @@
 
 import asyncio
 from contextlib import asynccontextmanager, suppress
+import hashlib
 import html
+import hmac
 import logging
 import os
+import secrets
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from mcp.server.mcpserver import MCPServer
@@ -32,6 +35,7 @@ from .webauth import (
     issue_csrf,
     issue_session,
     secure_cookies_enabled,
+    session_issued_before,
     verify_csrf,
     verify_session,
 )
@@ -109,6 +113,101 @@ def _unauthorized_tool_response() -> Dict[str, Any]:
     }
 
 
+# --- Pre-login CSRF binding (login-CSRF fix) --------------------------------
+#
+# POST /login is the one state-changing route OUTSIDE the session-bound CSRF
+# sweep (verify_csrf needs a session, which a pre-login visitor has none of),
+# so it carries its own binding: GET /login mints a random nonce plus an HMAC
+# over it and hands BOTH to the browser — the nonce|MAC value as a short-lived
+# cookie scoped to /login and, embedded in the form, the same value as a
+# hidden field. POST /login must return the identical value via cookie AND
+# field, and the MAC must verify under a key derived from SESSION_SECRET under
+# the ``anki-mcp/prelogin/v1`` domain label. A cross-site page can neither
+# read the cookie (SameSite=strict, HttpOnly) nor know the field value, so a
+# forged login POST fails closed. Deliberately NOT an Origin/Referer
+# comparison: that breaks behind TLS-terminating proxies and is unnecessary
+# here — the bearer token the attacker cannot obtain is the cookie itself.
+#
+# Kept in main.py (not webauth.py) as a self-contained app-layer concern; the
+# helpers mirror webauth's pure-function style so they unit test the same way.
+PRELOGIN_COOKIE_NAME = "anki_prelogin"
+PRELOGIN_FIELD_NAME = "prelogin_token"
+PRELOGIN_KEY_DOMAIN = b"anki-mcp/prelogin/v1"
+PRELOGIN_TTL_SECONDS = 600  # long enough to read the form, short by design
+PRELOGIN_NONCE_BYTES = 32
+
+# Cap on form POST bodies for the web routes: read from the declared
+# Content-Length BEFORE starlette spools any body bytes into memory/disk.
+MAX_FORM_BODY_BYTES = 64 * 1024
+
+# Transport-level concurrency cap handed to uvicorn (bounds half-open
+# connections plus in-flight requests per worker; uvicorn's default is None).
+UVICORN_LIMIT_CONCURRENCY = 32
+
+
+def _prelogin_key(session_secret: str) -> bytes:
+    """Derive the prelogin-binding key, domain-separated from every other use of the secret."""
+    return hmac.new(session_secret.encode("utf-8"), PRELOGIN_KEY_DOMAIN, hashlib.sha256).digest()
+
+
+def _issue_prelogin(session_secret: str) -> str:
+    """Mint a ``nonce|HMAC(nonce)`` pre-login CSRF token (cookie + form field)."""
+    nonce = secrets.token_urlsafe(PRELOGIN_NONCE_BYTES)
+    mac = hmac.new(_prelogin_key(session_secret), nonce.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{nonce}|{mac}"
+
+
+def _verify_prelogin(session_secret: str, value: str) -> bool:
+    """Check a pre-login token's MAC; any malformed input verifies to False."""
+    if not session_secret or not isinstance(value, str):
+        return False
+    nonce, sep, mac = value.partition("|")
+    if not sep or not nonce or not mac or len(nonce) > 256 or len(mac) != 64:
+        return False
+    try:
+        expected = hmac.new(
+            _prelogin_key(session_secret), nonce.encode("ascii"), hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(
+            expected.encode("ascii"), mac.encode("ascii")
+        )
+    except (UnicodeEncodeError, TypeError):
+        # Attacker-controlled segments may be non-ASCII; that can never match
+        # our ASCII-only format, so fail closed without raising.
+        return False
+
+
+def _body_too_large(request: Request) -> bool:
+    """True when the DECLARED Content-Length exceeds MAX_FORM_BODY_BYTES.
+
+    Reads one header and touches no body bytes, so an oversized form POST is
+    refused before starlette's form parser allocates for it (the parser caps
+    are per-field, not per-body, and file parts spool to disk unchecked).
+    A missing or unparseable header returns False: chunked bodies then rest on
+    uvicorn's limit_concurrency plus the form parser's own per-field caps.
+    """
+    raw = request.headers.get("content-length", "")
+    try:
+        return int(raw) > MAX_FORM_BODY_BYTES
+    except ValueError:
+        return False
+
+
+def _uvicorn_run_kwargs(settings: Settings) -> Dict[str, Any]:
+    """Keyword arguments for uvicorn.run in main(), testable without a server.
+
+    Keeping this in one place lets tests pin the availability-relevant kwargs
+    (limit_concurrency) by source inspection instead of booting uvicorn.
+    """
+    return {
+        "host": settings.mcp_host,
+        "port": settings.mcp_port,
+        "log_level": settings.log_level.lower(),
+        "access_log": False,
+        "limit_concurrency": UVICORN_LIMIT_CONCURRENCY,
+    }
+
+
 _PAGE_CSS = """
   body { font-family: system-ui, sans-serif; background: #f5f5f5; margin: 0;
          display: flex; justify-content: center; padding-top: 10vh; }
@@ -181,12 +280,13 @@ def _page(title: str, body: str, css: str = _PAGE_CSS, main_class: str = "") -> 
 </html>"""
 
 
-def _login_page(error: Optional[str] = None) -> str:
+def _login_page(error: Optional[str] = None, prelogin_token: str = "") -> str:
     error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
     return _page(
         "Anki MCP - Sign in",
         f"""<h1>Sign in</h1>
 <form method="post" action="/login">
+  <input type="hidden" name="{PRELOGIN_FIELD_NAME}" value="{html.escape(prelogin_token)}">
   <label for="username">Username</label>
   <input id="username" name="username" autocomplete="username" autofocus required>
   <label for="password">Password</label>
@@ -496,26 +596,16 @@ def _admin_page(
     return _page("Anki MCP - Admin", body, css=_APP_CSS, main_class="app")
 
 
-def _archive_user_data(data_dir: str, username: str) -> Optional[str]:
-    """Move ``<data_dir>/users/<name>`` to ``<data_dir>/deleted/<name>-<unix_ts>``.
+def _deleted_archive_dir(data_dir: str, username: str) -> str:
+    """Collision-free archive destination ``<data_dir>/deleted/<name>-<unix_ts>[n]``.
 
-    Deletion never removes files: the whole directory is MOVED aside so the
-    account's collection stays recoverable (``deleted/`` is created as needed;
-    a same-second collision gets a numeric suffix). The per-user ledger
-    directory (``<data_dir>/ledgers/<name>``) is intentionally left in place:
-    it holds only idempotency keys and is harmless if the username is ever
-    recreated.
-
-    Returns the destination path, or None when the user had no data directory.
-    Raises ValueError for a non-path-safe username and OSError when the rename
-    fails, so callers can abort the account deletion instead of destroying a
-    record whose data could not be archived.
+    Deletion never removes files: archived account data is MOVED here so it
+    stays recoverable (``deleted/`` is created as needed; a same-second
+    collision gets a numeric suffix). Raises ValueError for a non-path-safe
+    username and OSError when the directory cannot be created.
     """
     if not isinstance(username, str) or not USERNAME_RE.fullmatch(username):
         raise ValueError(f"Invalid username {username!r}")
-    src = os.path.join(data_dir, "users", username)
-    if not os.path.isdir(src):
-        return None
     deleted_root = os.path.join(data_dir, "deleted")
     os.makedirs(deleted_root, exist_ok=True)
     base = f"{username}-{int(time.time())}"
@@ -524,6 +614,55 @@ def _archive_user_data(data_dir: str, username: str) -> Optional[str]:
     while os.path.exists(dest):
         dest = os.path.join(deleted_root, f"{base}-{suffix}")
         suffix += 1
+    return dest
+
+
+def _archive_user_data(data_dir: str, username: str) -> Optional[str]:
+    """Move ``<data_dir>/users/<name>`` to ``<data_dir>/deleted/<name>-<unix_ts>``.
+
+    The whole directory is MOVED aside so the account's collection stays
+    recoverable. The per-user ledger directory is archived separately by
+    :func:`_archive_ledger_dir` (it lives outside ``users/`` and must be
+    detached before a same-username recreate can reload it).
+
+    Returns the destination path, or None when the user had no data directory.
+    Raises ValueError for a non-path-safe username and OSError when the rename
+    fails, so callers can abort the account deletion instead of destroying a
+    record whose data could not be archived.
+    """
+    src = os.path.join(data_dir, "users", username)
+    if not os.path.isdir(src):
+        return None
+    dest = _deleted_archive_dir(data_dir, username)
+    os.rename(src, dest)
+    return dest
+
+
+def _archive_ledger_dir(data_dir: str, username: str, archive_path: Optional[str]) -> Optional[str]:
+    """Move ``<data_dir>/ledgers/<name>`` into the account's deleted/ archive.
+
+    Companion to :func:`_archive_user_data`: the registry's drop_user hook
+    clears the IN-MEMORY ledger, but the on-disk ``ledger.json`` would
+    otherwise survive deletion and be reloaded — including after a process
+    restart — by an account recreated under the same username, replaying the
+    previous account's idempotency keys. The directory is renamed to
+    ``<archive>/ledgers`` (the same ``deleted/<name>-<ts>`` directory that
+    holds the archived collection, or a fresh one when the account had no
+    data directory), keeping the whole account recoverable in one place while
+    detaching it from the name.
+
+    Returns the destination directory, or None when there was no ledger dir
+    (skip silently — nothing to archive). Call AFTER ``drop_user``: once the
+    in-memory ledger is popped, no racing sync can recreate the old path
+    between the rename and the state drop. Raises on rename failure so the
+    caller can log it; by then the record deletion is already committed.
+    """
+    src = os.path.join(data_dir, "ledgers", username)
+    if not os.path.isdir(src):
+        return None
+    dest_root = archive_path if archive_path else _deleted_archive_dir(data_dir, username)
+    os.makedirs(dest_root, exist_ok=True)
+    dest = os.path.join(dest_root, "ledgers")
     os.rename(src, dest)
     return dest
 
@@ -671,8 +810,17 @@ def create_app(custom_settings: Optional[Settings] = None):
     # Create Starlette app for streamable HTTP with reverse-proxy support
     from mcp.server.transport_security import TransportSecuritySettings
 
+    # Session-table posture owned in app code (audit fix): stateful mode is
+    # explicit, and the per-process session cardinality + idle reaping come
+    # from operator-tunable settings instead of the SDK wheel's defaults
+    # (10,000 sessions / 1800s idle) — on this shared multi-user surface the
+    # defaults would let any one token holder lock every other user out of
+    # /mcp at trivial cost.
     app = mcp.streamable_http_app(
         streamable_http_path=settings.mcp_path,
+        stateless_http=False,
+        max_sessions=settings.mcp_max_sessions,
+        session_idle_timeout=settings.mcp_session_idle_timeout,
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
@@ -730,9 +878,14 @@ def create_app(custom_settings: Optional[Settings] = None):
         """Resolve the anki_session cookie to an account, or None.
 
         Signed-cookie validity alone is not enough: the named account must
-        still exist, so deleted users lose access immediately even with a
-        valid (stateless) cookie. Lookup goes through UserStore.get (a copy),
-        not a list scan.
+        still exist (deleted users lose access immediately even with a valid
+        stateless cookie; lookup goes through UserStore.get, not a list scan),
+        and the cookie must postdate the account's session-revocation epoch:
+        the MAC-covered issued-at stamp is compared against
+        ``User.sessions_invalid_before`` (bumped by password resets), so a
+        cookie captured before a reset is dead even while unexpired — closing
+        the stale-session-to-token-mint chain. Cookies without a parseable
+        issued-at stamp fail closed.
         """
         session_value = request.cookies.get(SESSION_COOKIE_NAME)
         if not session_value:
@@ -740,7 +893,15 @@ def create_app(custom_settings: Optional[Settings] = None):
         username = verify_session(app_settings.session_secret, session_value)
         if username is None:
             return None
-        return store.get(username)
+        issued_at = session_issued_before(session_value)
+        if issued_at is None:
+            return None  # legacy/malformed cookie: reject (fail closed)
+        user = store.get(username)
+        if user is None:
+            return None
+        if issued_at < user.sessions_invalid_before:
+            return None  # issued before a password-reset epoch bump
+        return user
 
     # Shared guards and flash plumbing for the session-cookie routes below.
 
@@ -784,17 +945,59 @@ def create_app(custom_settings: Optional[Settings] = None):
     def _bad_request(message: str, back_href: str = "/admin", back_label: str = "Back to admin") -> HTMLResponse:
         return HTMLResponse(_message_page(message, back_href, back_label), status_code=400)
 
+    def _login_form_response(error: Optional[str] = None, status_code: int = 200) -> HTMLResponse:
+        """Render the login form together with a FRESH prelogin CSRF pair.
+
+        The nonce|MAC value goes into the hidden form field and into the
+        anki_prelogin cookie (HttpOnly, SameSite=strict, path=/login) — the
+        browser must echo both back on POST. Re-issued on every render,
+        including the 401 re-render, so a mistyped password does not strand
+        the user with a stale pair.
+        """
+        token = _issue_prelogin(app_settings.session_secret)
+        response = HTMLResponse(_login_page(error, token), status_code=status_code)
+        response.set_cookie(
+            PRELOGIN_COOKIE_NAME,
+            token,
+            max_age=PRELOGIN_TTL_SECONDS,
+            path="/login",
+            httponly=True,
+            samesite="strict",
+            secure=secure_cookies_enabled(),
+        )
+        return response
+
     async def login_page(request: Request) -> Response:
         if get_session_user(request) is not None:
             return RedirectResponse("/", status_code=303)
-        return HTMLResponse(_login_page())
+        return _login_form_response()
 
     async def login_submit(request: Request) -> Response:
+        # Body cap BEFORE the form parse: starlette's per-field caps do not
+        # bound a request's total body (and file parts spool to disk), so the
+        # declared Content-Length gates all parse work on this unauthenticated
+        # route. One header read, zero body bytes consumed.
+        if _body_too_large(request):
+            return HTMLResponse(_message_page("Request body too large."), status_code=413)
         form = await request.form()
+        # Login CSRF first — ahead of the rate limiter and any password work:
+        # a cross-site forged POST can neither read the prelogin cookie (Same-
+        # Site=strict + HttpOnly) nor know the form field value, so it is
+        # refused here without consuming lockout budget or scrypt effort.
+        cookie_token = request.cookies.get(PRELOGIN_COOKIE_NAME, "")
+        form_token = str(form.get(PRELOGIN_FIELD_NAME, ""))
+        if (
+            not form_token
+            or form_token != cookie_token
+            or not _verify_prelogin(app_settings.session_secret, form_token)
+        ):
+            return HTMLResponse(
+                _message_page("Invalid or missing CSRF token."), status_code=403
+            )
         username = str(form.get("username", ""))
         password = str(form.get("password", ""))
         ip = request.client.host if request.client else ""
-        # Brute-force gate first: a locked key is rejected before any password
+        # Brute-force gate second: a locked key is rejected before any password
         # work happens, and the page reveals nothing about the account.
         if not login_rate_limiter.check(username, ip):
             logger.warning("Login rate-limited for %r from %s", username, ip)
@@ -822,7 +1025,8 @@ def create_app(custom_settings: Optional[Settings] = None):
             return response
         login_rate_limiter.record_failure(username, ip)
         # Generic message: identical for unknown usernames and wrong passwords.
-        return HTMLResponse(_login_page("Invalid username or password."), status_code=401)
+        # The retry form ships with a fresh prelogin pair.
+        return _login_form_response("Invalid username or password.", status_code=401)
 
     async def index_page(request: Request) -> Response:
         user, err = _require_session(request)
@@ -844,6 +1048,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         return response
 
     async def logout_submit(request: Request) -> Response:
+        if _body_too_large(request):
+            return HTMLResponse(_message_page("Request body too large."), status_code=413)
         session_value = request.cookies.get(SESSION_COOKIE_NAME)
         user = get_session_user(request)
         if user is None or not session_value:
@@ -867,6 +1073,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        if _body_too_large(request):
+            return HTMLResponse(_message_page("Request body too large."), status_code=413)
         form = await request.form()
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
@@ -884,6 +1092,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        if _body_too_large(request):
+            return HTMLResponse(_message_page("Request body too large."), status_code=413)
         form = await request.form()
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
@@ -902,9 +1112,22 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        if _body_too_large(request):
+            return HTMLResponse(_message_page("Request body too large."), status_code=413)
         form = await request.form()
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
+        # Maintenance gate (audit fix): this handler calls the registry's
+        # sync_user directly, so SyncManager's own gate never sees this path.
+        # Refuse BEFORE any registry call — an operator who paused writes must
+        # not be circumvented by the portal's sync button (no backup, no
+        # retention rotation, no AnkiWeb contact).
+        if tool_sync_manager.maintenance_mode:
+            return _redirect_with_flash(
+                "/",
+                "Worker is currently in maintenance mode; writes are paused.",
+                kind="error",
+            )
         if not user.ankiweb_email or not user.ankiweb_password:
             # Inline notice, and no sync call (sync is opt-in per user).
             return _redirect_with_flash(
@@ -944,6 +1167,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        if _body_too_large(request):
+            return HTMLResponse(_message_page("Request body too large."), status_code=413)
         form = await request.form()
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
@@ -965,6 +1190,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        if _body_too_large(request):
+            return HTMLResponse(_message_page("Request body too large."), status_code=413)
         form = await request.form()
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
@@ -984,6 +1211,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        if _body_too_large(request):
+            return HTMLResponse(_message_page("Request body too large."), status_code=413)
         form = await request.form()
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
@@ -1000,6 +1229,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        if _body_too_large(request):
+            return HTMLResponse(_message_page("Request body too large."), status_code=413)
         form = await request.form()
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
@@ -1031,6 +1262,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        if _body_too_large(request):
+            return HTMLResponse(_message_page("Request body too large."), status_code=413)
         form = await request.form()
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
@@ -1061,11 +1294,31 @@ def create_app(custom_settings: Optional[Settings] = None):
             logger.error("Failed to archive data directory for %r: %s", username, e)
             return _bad_request(f"Deletion failed while archiving data: {e}")
         await run_in_threadpool(store.delete_user, username)
+        # Detach every serving state keyed by the username (audit fix): the
+        # open Collection handle, the cached registry state and the in-memory
+        # idempotency ledger would otherwise survive deletion and be handed
+        # to an account recreated under the same name — the recreated user's
+        # reads/writes and portal stats would come from the previous person's
+        # archived collection. Unknown usernames and never-opened users are a
+        # harmless no-op.
+        await portal_registry.drop_user(username)
+        try:
+            # And move the on-disk ledger aside (into the same deleted/
+            # archive), or a recreate — even after a restart — would reload
+            # the previous account's idempotency keys. Runs AFTER drop_user so
+            # no in-flight sync can resurrect the path mid-rename; a failure
+            # here cannot be rolled back (the record is already deleted), so
+            # it is logged for the operator instead of aborting.
+            ledger_archive = _archive_ledger_dir(app_settings.data_dir, username, archive_path)
+        except (OSError, ValueError) as e:
+            logger.error("Failed to archive ledger directory for %r: %s", username, e)
+            ledger_archive = None
         logger.info(
-            "Admin %r deleted account %r (data archived at %s)",
+            "Admin %r deleted account %r (data archived at %s, ledger archived at %s)",
             admin.username,
             username,
             archive_path or "no data directory",
+            ledger_archive or "no ledger directory",
         )
         notice = f"Deleted {username}." + (" Data directory moved to deleted/." if archive_path else "")
         return _redirect_with_flash("/admin", notice, kind="success")
@@ -1178,13 +1431,7 @@ def main():
     logger.info("Authentication enabled (per-user MCP tokens via /data/users.json)")
 
     app = create_app()
-    uvicorn.run(
-        app,
-        host=settings.mcp_host,
-        port=settings.mcp_port,
-        log_level=settings.log_level.lower(),
-        access_log=False,
-    )
+    uvicorn.run(app, **_uvicorn_run_kwargs(settings))
 
 
 if __name__ == "__main__":

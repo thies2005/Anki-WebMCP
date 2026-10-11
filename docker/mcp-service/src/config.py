@@ -51,6 +51,12 @@ class Settings:
     max_open_collections: int = field(default_factory=lambda: _env_int_min("MAX_OPEN_COLLECTIONS", 5, 1))
     max_concurrent_syncs: int = field(default_factory=lambda: _env_int_min("MAX_CONCURRENT_SYNCS", 2, 1))
     backup_retention: int = field(default_factory=lambda: _env_int_min("BACKUP_RETENTION", 5, 1))
+    # /mcp streamable-HTTP session-table posture (audit fix): the multi-user
+    # transport must not float on the SDK wheel's defaults (10,000 sessions /
+    # 1800s idle). Sized for this deployment's small user population, owner-
+    # configurable via env; values <= 0 are refused at Settings construction.
+    mcp_max_sessions: int = field(default_factory=lambda: _env_int_min("MCP_MAX_SESSIONS", 16, 1))
+    mcp_session_idle_timeout: int = field(default_factory=lambda: _env_int_min("MCP_SESSION_IDLE_TIMEOUT", 300, 1))
 
     def __post_init__(self):
         # Derive users_file from data_dir instead of double-reading the

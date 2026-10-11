@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from src.config import Settings
-from src.main import create_app
+from src.main import PRELOGIN_FIELD_NAME, create_app
 from src.users import UserStore
 from src.webauth import (
     SESSION_COOKIE_NAME,
@@ -19,6 +19,9 @@ from src.webauth import (
     verify_csrf,
     verify_session,
 )
+# The shared form-login helper lives with the Wave B regression tests: POST
+# /login requires the prelogin CSRF pair issued by GET /login.
+from test_audit_fixes_b import PRELOGIN_TOKEN_RE, login_via_form
 
 SECRET = "test-session-secret"
 SECRET_OTHER = "some-other-secret"
@@ -368,13 +371,14 @@ async def test_login_page_returns_form(client):
     assert '<form method="post" action="/login">' in res.text
     assert 'name="username"' in res.text and 'name="password"' in res.text
     assert 'name="viewport"' in res.text
+    # The prelogin CSRF pair (hidden field + cookie) must be present.
+    assert PRELOGIN_TOKEN_RE.search(res.text), "login form must embed a prelogin token"
+    assert client.cookies.get("anki_prelogin")
 
 
 @pytest.mark.asyncio
 async def test_login_page_redirects_when_already_logged_in(client):
-    res = await client.post(
-        "/login", data={"username": "alice", "password": "correct-horse"}
-    )
+    res = await login_via_form(client, "alice", "correct-horse")
     assert res.status_code == 303
     assert client.cookies.get(SESSION_COOKIE_NAME)
     res = await client.get("/login")
@@ -384,9 +388,7 @@ async def test_login_page_redirects_when_already_logged_in(client):
 
 @pytest.mark.asyncio
 async def test_login_success_sets_signed_cookie_and_redirects(client):
-    res = await client.post(
-        "/login", data={"username": "alice", "password": "correct-horse"}
-    )
+    res = await login_via_form(client, "alice", "correct-horse")
     assert res.status_code == 303
     assert res.headers["location"] == "/"
     set_cookie = res.headers["set-cookie"]
@@ -403,37 +405,52 @@ async def test_login_success_sets_signed_cookie_and_redirects(client):
 @pytest.mark.asyncio
 async def test_login_secure_cookie_flag_follows_env(client, monkeypatch):
     monkeypatch.delenv("FORCE_SECURE_COOKIES", raising=False)
-    res = await client.post(
-        "/login", data={"username": "alice", "password": "correct-horse"}
-    )
+    res = await login_via_form(client, "alice", "correct-horse")
     assert "secure" not in res.headers["set-cookie"].lower()
 
+    # Under FORCE_SECURE_COOKIES the prelogin cookie is Secure too, and httpx
+    # (correctly) refuses to replay Secure cookies over the plain-http test
+    # transport — so the pair is carried explicitly on the POST instead of via
+    # the jar, exactly as an https browser would send it.
     monkeypatch.setenv("FORCE_SECURE_COOKIES", "true")
     assert secure_cookies_enabled() is True
+    client.cookies.clear()  # drop alice's session so GET /login renders the form
+    page = await client.get("/login")
+    token = PRELOGIN_TOKEN_RE.search(page.text).group(1)
+    client.cookies.clear()
+    # The real prelogin cookie is Secure and httpx (correctly) refuses to
+    # replay Secure cookies over the plain-http test transport, so place the
+    # value in the jar without the flag — exactly what an https browser sends.
+    client.cookies.set("anki_prelogin", token)
     res = await client.post(
-        "/login", data={"username": "alice", "password": "correct-horse"}
+        "/login",
+        data={
+            "username": "alice",
+            "password": "correct-horse",
+            PRELOGIN_FIELD_NAME: token,
+        },
     )
+    assert res.status_code == 303
     assert "secure" in res.headers["set-cookie"].lower()
 
 
 @pytest.mark.asyncio
 async def test_login_wrong_password_is_401_generic(client):
-    res = await client.post(
-        "/login", data={"username": "alice", "password": "wrong-password"}
-    )
+    res = await login_via_form(client, "alice", "wrong-password")
     assert res.status_code == 401
     assert "Invalid username or password" in res.text
-    assert "Set-Cookie" not in res.headers
+    set_cookie = res.headers.get("set-cookie", "")
+    # The rejected attempt must not establish a session; the retry form ships
+    # with a fresh prelogin pair cookie instead.
+    assert SESSION_COOKIE_NAME not in set_cookie
+    assert "anki_prelogin=" in set_cookie.lower()
+    assert PRELOGIN_TOKEN_RE.search(res.text)
 
 
 @pytest.mark.asyncio
 async def test_login_unknown_user_gets_identical_generic_message(client):
-    known = await client.post(
-        "/login", data={"username": "alice", "password": "wrong-password"}
-    )
-    unknown = await client.post(
-        "/login", data={"username": "nobody", "password": "wrong-password"}
-    )
+    known = await login_via_form(client, "alice", "wrong-password")
+    unknown = await login_via_form(client, "nobody", "wrong-password")
     assert known.status_code == unknown.status_code == 401
     # Same generic message: no hint whether the username exists.
     assert "Invalid username or password" in unknown.text
@@ -443,14 +460,10 @@ async def test_login_unknown_user_gets_identical_generic_message(client):
 @pytest.mark.asyncio
 async def test_login_locked_out_returns_429(client):
     for _ in range(5):
-        res = await client.post(
-            "/login", data={"username": "alice", "password": "wrong-password"}
-        )
+        res = await login_via_form(client, "alice", "wrong-password")
         assert res.status_code == 401
     # Even the CORRECT password is rejected while locked out.
-    res = await client.post(
-        "/login", data={"username": "alice", "password": "correct-horse"}
-    )
+    res = await login_via_form(client, "alice", "correct-horse")
     assert res.status_code == 429
     assert "Too many failed attempts" in res.text
 
@@ -488,9 +501,7 @@ async def test_root_rejects_cookie_for_account_not_in_store(client):
 
 @pytest.mark.asyncio
 async def test_logout_with_csrf_clears_cookie_and_redirects(client):
-    res = await client.post(
-        "/login", data={"username": "alice", "password": "correct-horse"}
-    )
+    res = await login_via_form(client, "alice", "correct-horse")
     cookie = client.cookies.get(SESSION_COOKIE_NAME)
     assert cookie
     res = await client.post("/logout", data={"csrf_token": issue_csrf(cookie)})
@@ -504,9 +515,7 @@ async def test_logout_with_csrf_clears_cookie_and_redirects(client):
 
 @pytest.mark.asyncio
 async def test_logout_without_csrf_token_rejected(client):
-    await client.post(
-        "/login", data={"username": "alice", "password": "correct-horse"}
-    )
+    await login_via_form(client, "alice", "correct-horse")
     cookie = client.cookies.get(SESSION_COOKIE_NAME)
     res = await client.post("/logout", data={})
     assert res.status_code == 403
