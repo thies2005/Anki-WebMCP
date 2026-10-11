@@ -349,6 +349,12 @@ All tools operate on the **authenticated user's** collection — the token decid
 | `reposition_note_type_template` | `note_type: string`<br>`template_name: string`<br>`index: int` | Moves a card template to a new 0-based position; existing cards follow their template. |
 | `delete_note_type` | `name: string`<br>`confirm: bool` | Deletes an **unused** note type (zero notes; types with notes are refused with the use count). *Destructive.* |
 | `restore_note_type_to_stock` | `name: string`<br>`force_kind?: string`<br>`confirm: bool` | Resets a modified note type to the stock defaults — fields, templates, and CSS are all replaced, so content under mismatched stock fields can be lost. `force_kind` picks the stock type (`basic`, `basic_and_reversed`, `basic_optional_reversed`, `basic_typing`, `cloze`, `image_occlusion`); omit it to use the type's original stock kind. *Destructive.* |
+| `get_deck_config` | `deck_id: int` | Read-only: shows one deck's full scheduling config dict (name, `maxTaken`, new/review daily limits, autoplay, timer, ...). A deck's config is a preset that may be shared by several decks. |
+| `update_deck_config` | `deck_id: int`<br>`updates: object` | Updates a deck's scheduling preset — the `updates` object accepts only `new_per_day` (0-999), `reviews_per_day` (0-999), `max_answer_secs` (10-120), and `autoplay_audio` (bool); anything else is rejected with the valid keys listed. The preset is **shared** by every deck using it. |
+| `set_card_flags` | `flag: int (0-7)`<br>`card_ids?: list[int]` (1-2000) or `query?: string` | Sets (or with `0` clears) the user flag of the selected cards (`1`-`4` classic colors, `5`-`7` user-renameable). |
+| `bury_cards` | `card_ids?: list[int]` (1-2000) or `query?: string` | Buries the selected cards — they leave the queue and return automatically at the next day rollover (or earlier via `unbury_cards`). |
+| `unbury_cards` | `card_ids?: list[int]` (1-2000) or `query?: string` | Unburies the selected cards. **Note:** the scheduler's unbury restores buried *and suspended* cards alike — suspended cards in the selection are unsuspended too. |
+| `reposition_new_cards` | `start: int`<br>`step: int`<br>`card_ids?: list[int]` (1-2000) or `query?: string`<br>`randomize?: bool`<br>`shift_existing?: bool` | Assigns new queue positions to the selected **new** cards (`start`, then `start + N*step`); review/learning cards in the selection are ignored by the scheduler. |
 
 *Destructive tools* (`rename_deck`, `delete_deck`, `delete_notes`, `change_note_type`, `remove_note_type_field`, `remove_note_type_template`, `delete_note_type`, `restore_note_type_to_stock`) require `confirm=true` **and always create a snapshot in `backups/` first** — if the snapshot fails, the operation is aborted (fail-closed), so every destructive change stays reversible from the portal's Version history. Raw SQL execution and arbitrary add-on passthrough remain deliberately omitted to preserve collection integrity.
 
@@ -456,7 +462,7 @@ PYTHONPATH=docker/mcp-service pytest tests/ -v
 - [x] Service starts fail-closed: refuses to run without `SESSION_SECRET`, and without bootstrap credentials on an empty store.
 - [x] Streamable HTTP MCP server on port 8000 requires a valid per-user bearer token.
 - [x] Per-user isolation verified at protocol level: two users' sessions on one instance see only their own notes and collections.
-- [x] All 41 MCP tools execute against real per-user collections with per-user locking and ledger-backed idempotency (destructive ones snapshot-or-abort).
+- [x] All 47 MCP tools execute against real per-user collections with per-user locking and ledger-backed idempotency (destructive ones snapshot-or-abort).
 - [x] `/health` reports 200 healthy and 503 degraded (users store unavailable / data dir not writable).
 
 ---

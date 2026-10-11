@@ -17,7 +17,7 @@ through ``sync_manager.execute_mutation``. Wheel facts this module relies on
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from anki.errors import NotFoundError  # isort: skip
+from anki.errors import NotFoundError, SearchError  # isort: skip
 from anki.scheduler.v3 import CardAnswer
 
 from ..errors import CollectionToolError
@@ -331,4 +331,187 @@ async def answer_card(
         operation_name="answer_card",
         mutation_fn=_mutation,
         idempotency_key=idempotency_key,
+    )
+
+
+# -- flagging, burying, and new-card repositioning (roadmap phase 4) -----------------
+
+
+def _resolve_card_selection(
+    col,
+    card_ids: Optional[List[int]],
+    query: Optional[str],
+    missing_prefix: str,
+) -> List[int]:
+    """Resolve a card_ids-XOR-query selection to deduplicated, existing card IDs.
+
+    Mirror of ``_resolve_note_selection`` (tools/notes.py), shared by all four
+    phase-4 card tools: both branches verify existence BEFORE any backend
+    mutation — a bad selection must fail the request in Python, never as a
+    backend error (the registry would mistake an ``InvalidInput`` for a stale
+    handle and re-run the closure once). A malformed search raises the wheel's
+    ``SearchError``; it surfaces as a clean CollectionToolError echoing the
+    query instead of the backend's raw error.
+    """
+    if query is not None:
+        # Client-controlled search string: %r-escape in errors/logs (CWE-117).
+        try:
+            cids = list(col.find_cards(query))
+        except SearchError as exc:
+            raise CollectionToolError(f"Invalid search query {query!r}: {exc}") from exc
+        if not cids:
+            raise CollectionToolError(f"No cards matched query {query!r}; nothing to change.")
+        return cids
+    # Dedupe preserving order: a repeated ID would inflate the reported counts.
+    cids = list(dict.fromkeys(int(cid) for cid in card_ids))
+    placeholders = ",".join("?" * len(cids))
+    found = set(col.db.list(f"SELECT id FROM cards WHERE id IN ({placeholders})", *cids))
+    missing = [cid for cid in cids if cid not in found]
+    if missing:
+        raise CollectionToolError(f"{missing_prefix}: card(s) not found: {missing}")
+    return cids
+
+
+async def set_card_flags(
+    sync_manager: SyncManager,
+    registry,
+    username: str,
+    flag: int,
+    card_ids: Optional[List[int]] = None,
+    query: Optional[str] = None,
+) -> MutationResponse:
+    """Set (or clear, flag=0) the user flag of the selected cards."""
+    logger.info(
+        "Executing set_card_flags for %r: flag=%d (%d id(s), query=%r)",
+        username, flag, len(card_ids) if card_ids else 0, query,
+    )
+
+    def _apply(col) -> Dict[str, Any]:
+        cids = _resolve_card_selection(col, card_ids, query, "Cannot set card flags")
+        result = col.set_user_flag_for_cards(flag, cids)
+        return {"flag": flag, "changed": int(result.count), "selected": len(cids)}
+
+    async def _mutation() -> Dict[str, Any]:
+        return await registry.run(username, _apply)
+
+    return await sync_manager.execute_mutation(
+        username,
+        operation_name="set_card_flags",
+        mutation_fn=_mutation,
+    )
+
+
+async def bury_cards(
+    sync_manager: SyncManager,
+    registry,
+    username: str,
+    card_ids: Optional[List[int]] = None,
+    query: Optional[str] = None,
+) -> MutationResponse:
+    """Bury the selected cards until the next day rollover (or unbury_cards)."""
+    logger.info(
+        "Executing bury_cards for %r (%d id(s), query=%r)",
+        username, len(card_ids) if card_ids else 0, query,
+    )
+
+    def _apply(col) -> Dict[str, Any]:
+        cids = _resolve_card_selection(col, card_ids, query, "Cannot bury cards")
+        result = col.sched.bury_cards(cids, manual=True)
+        return {"buried": int(result.count), "selected": len(cids)}
+
+    async def _mutation() -> Dict[str, Any]:
+        return await registry.run(username, _apply)
+
+    return await sync_manager.execute_mutation(
+        username,
+        operation_name="bury_cards",
+        mutation_fn=_mutation,
+    )
+
+
+async def unbury_cards(
+    sync_manager: SyncManager,
+    registry,
+    username: str,
+    card_ids: Optional[List[int]] = None,
+    query: Optional[str] = None,
+) -> MutationResponse:
+    """Unbury the selected cards.
+
+    Wheel semantics (probed: the backend operation is
+    ``restore_buried_and_suspended_cards``): this restores BURIED AND
+    SUSPENDED cards alike, so suspended cards in the selection are
+    unsuspended too — disclosed in the tool description.
+    """
+    logger.info(
+        "Executing unbury_cards for %r (%d id(s), query=%r)",
+        username, len(card_ids) if card_ids else 0, query,
+    )
+
+    def _apply(col) -> Dict[str, Any]:
+        cids = _resolve_card_selection(col, card_ids, query, "Cannot unbury cards")
+        col.sched.unbury_cards(cids)
+        # OpChanges carries no count (probed wheel API): the selection size is
+        # the honest report.
+        return {"unburied": len(cids)}
+
+    async def _mutation() -> Dict[str, Any]:
+        return await registry.run(username, _apply)
+
+    return await sync_manager.execute_mutation(
+        username,
+        operation_name="unbury_cards",
+        mutation_fn=_mutation,
+    )
+
+
+async def reposition_new_cards(
+    sync_manager: SyncManager,
+    registry,
+    username: str,
+    start: int,
+    step: int,
+    card_ids: Optional[List[int]] = None,
+    query: Optional[str] = None,
+    randomize: bool = False,
+    shift_existing: bool = False,
+) -> MutationResponse:
+    """Assign new queue positions to the selected NEW cards.
+
+    Only NEW cards move (the backend ignores review/learning cards in the
+    selection, probed wheel API), so the backend count can be smaller than
+    the selection — both are reported.
+    """
+    logger.info(
+        "Executing reposition_new_cards for %r: start=%d, step=%d, randomize=%r, "
+        "shift_existing=%r (%d id(s), query=%r)",
+        username, start, step, randomize, shift_existing,
+        len(card_ids) if card_ids else 0, query,
+    )
+
+    def _apply(col) -> Dict[str, Any]:
+        cids = _resolve_card_selection(col, card_ids, query, "Cannot reposition cards")
+        result = col.sched.reposition_new_cards(
+            cids,
+            starting_from=start,
+            step_size=step,
+            randomize=randomize,
+            shift_existing=shift_existing,
+        )
+        return {
+            "repositioned": int(result.count),
+            "selected": len(cids),
+            "start": start,
+            "step": step,
+            "randomize": randomize,
+            "shift_existing": shift_existing,
+        }
+
+    async def _mutation() -> Dict[str, Any]:
+        return await registry.run(username, _apply)
+
+    return await sync_manager.execute_mutation(
+        username,
+        operation_name="reposition_new_cards",
+        mutation_fn=_mutation,
     )

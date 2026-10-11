@@ -1,7 +1,7 @@
 """Data models and input validation schemas for Anki MCP service."""
 
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class NoteInput(BaseModel):
@@ -193,6 +193,47 @@ class DeleteDeckInput(BaseModel):
     """Input parameters for delete_deck tool (destructive: snapshots first)."""
     deck_id: int = Field(..., gt=0, description="Unique Anki deck ID to delete (the Default deck, ID 1, cannot be deleted)")
     confirm: bool = Field(False, description="Must be true to actually delete (a pre-delete-deck snapshot is taken first)")
+
+
+class GetDeckConfigInput(BaseModel):
+    """Input parameters for get_deck_config tool (read-only)."""
+    deck_id: int = Field(..., gt=0, description="Unique Anki deck ID")
+
+
+# Keys update_deck_config applies, as a module constant so the whitelist can
+# never drift between the input model's rejection message and the tool.
+DECK_CONFIG_UPDATE_KEYS = ("new_per_day", "reviews_per_day", "max_answer_secs", "autoplay_audio")
+
+
+class UpdateDeckConfigInput(BaseModel):
+    """Input parameters for update_deck_config tool.
+
+    The ``updates`` object accepts ONLY the whitelisted scheduling keys:
+    anything else is rejected HERE (inside the MCP wrapper, so the error
+    becomes structured tool output and never reaches the backend mutation).
+    """
+
+    # Unknown keys must SURVIVE construction until the validator runs, so they
+    # can be named (with the valid keys) in the error instead of pydantic's
+    # generic "extra inputs are not permitted".
+    model_config = ConfigDict(extra="allow")
+
+    deck_id: int = Field(..., gt=0, description="Unique Anki deck ID whose preset is edited")
+    new_per_day: Optional[int] = Field(None, ge=0, le=999, description="New cards per day (0-999)")
+    reviews_per_day: Optional[int] = Field(None, ge=0, le=999, description="Maximum reviews per day (0-999)")
+    max_answer_secs: Optional[int] = Field(None, ge=10, le=120, description="Max seconds before the answer timer auto-reveals (10-120)")
+    autoplay_audio: Optional[bool] = Field(None, description="Whether question/answer audio plays automatically")
+
+    @model_validator(mode="after")
+    def whitelist_and_at_least_one(self) -> "UpdateDeckConfigInput":
+        unknown = sorted(self.model_extra or {})
+        if unknown:
+            raise ValueError(
+                f"Unknown update key(s) {unknown}. Valid keys: {list(DECK_CONFIG_UPDATE_KEYS)}."
+            )
+        if all(getattr(self, key) is None for key in DECK_CONFIG_UPDATE_KEYS):
+            raise ValueError(f"Provide at least one of {list(DECK_CONFIG_UPDATE_KEYS)}.")
+        return self
 
 
 # -- note tools --------------------------------------------------------------------
@@ -778,6 +819,66 @@ class AnswerCardInput(BaseModel):
         max_length=256,
         description="Optional unique key to prevent duplicate answering on network retries",
     )
+
+
+class _CardSelectionInput(BaseModel):
+    """Shared card_ids-XOR-query selection shape for the phase-4 card tools
+    (set_card_flags, bury/unbury, reposition_new_cards).
+
+    Exactly one of ``card_ids`` or ``query`` selects the cards: an explicit ID
+    list or an Anki search string, never both and never neither.
+    """
+
+    card_ids: Optional[List[int]] = Field(None, description="Card IDs to affect (1-2000 per request); mutually exclusive with query")
+    query: Optional[str] = Field(None, description="Anki search selecting the cards, e.g. 'deck:Default' or 'is:due'; mutually exclusive with card_ids")
+
+    @field_validator("card_ids")
+    @classmethod
+    def validate_ids(cls, v: Optional[List[int]]) -> Optional[List[int]]:
+        if v is None:
+            return v
+        # Same bound and rationale as the note-type change (2000, not the
+        # shared _IdListInput 500 cap): each of these tools is ONE backend
+        # operation over the whole selection, so per-request cost does not
+        # grow per ID the way per-item mutations (delete/tag) do; 2000 keeps
+        # a runaway client from repricing the whole collection in one call.
+        if not (1 <= len(v) <= 2000):
+            raise ValueError("Select between 1 and 2000 card IDs per request.")
+        for cid in v:
+            if cid <= 0:
+                raise ValueError("Card IDs must be positive integers.")
+        return v
+
+    @model_validator(mode="after")
+    def exactly_one_selection(self) -> "_CardSelectionInput":
+        _exactly_one_selection(self.card_ids, self.query)
+        return self
+
+
+class SetCardFlagsInput(_CardSelectionInput):
+    """Input parameters for set_card_flags tool."""
+    flag: int = Field(
+        ...,
+        ge=0,
+        le=7,
+        description="0 clears the flag; 1-7 set it (1-4 are the classic red/orange/green/blue flags, 5-7 the extra user-renameable ones)",
+    )
+
+
+class BuryCardsInput(_CardSelectionInput):
+    """Input parameters for bury_cards tool."""
+
+
+class UnburyCardsInput(_CardSelectionInput):
+    """Input parameters for unbury_cards tool."""
+
+
+class RepositionNewCardsInput(_CardSelectionInput):
+    """Input parameters for reposition_new_cards tool."""
+    start: int = Field(..., ge=0, description="Queue position the renumbering starts from (becomes new cards' due)")
+    step: int = Field(..., ge=1, le=9999, description="Position increment between consecutive new cards")
+    randomize: bool = Field(False, description="Assign the positions in random order instead of selection order")
+    shift_existing: bool = Field(False, description="Also shift other new cards that occupy the target positions")
 
 
 # -- media tools -----------------------------------------------------------------------

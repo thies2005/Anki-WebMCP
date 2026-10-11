@@ -35,6 +35,7 @@ from .models import (
     AddNoteTypeTemplateInput,
     AddTagsInput,
     AnswerCardInput,
+    BuryCardsInput,
     ChangeNoteTypeInput,
     CreateDeckInput,
     CreateNoteTypeInput,
@@ -45,6 +46,7 @@ from .models import (
     FindCardsInput,
     FindDuplicatesInput,
     GetCardInput,
+    GetDeckConfigInput,
     GetMediaInput,
     GetNoteInput,
     GetNoteTypeInput,
@@ -56,16 +58,20 @@ from .models import (
     RemoveTagsInput,
     RenameDeckInput,
     RenameNoteTypeFieldInput,
+    RepositionNewCardsInput,
     RepositionNoteTypeFieldInput,
     RepositionNoteTypeTemplateInput,
     RestoreNoteTypeToStockInput,
     ReviewQueueInput,
     SearchNotesInput,
+    SetCardFlagsInput,
     SetDueDateInput,
     StoreMediaInput,
     SuspendCardsInput,
     TemplateInput,
     TemplateUpdateInput,
+    UnburyCardsInput,
+    UpdateDeckConfigInput,
     UpdateNoteFieldsInput,
     UpdateNoteTypeInput,
 )
@@ -1815,6 +1821,156 @@ def create_app(custom_settings: Optional[Settings] = None):
             res = await notetype_tools.restore_note_type_to_stock(
                 tool_sync_manager, tool_registry, username,
                 parsed.name, parsed.force_kind, parsed.confirm,
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 42. get_deck_config
+    @mcp.tool(
+        description="Show one deck's scheduling configuration (read-only): the full config dict "
+        "(name, maxTaken, new/review daily limits, autoplay, timer, ...) as plain JSON. A deck's "
+        "config is a preset that may be shared by several decks."
+    )
+    async def get_deck_config(deck_id: int, ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = GetDeckConfigInput(deck_id=deck_id)
+            return await deck_tools.get_deck_config(tool_registry, username, parsed.deck_id)
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 43. update_deck_config
+    @mcp.tool(
+        description="Update a deck's scheduling configuration preset. The updates object accepts "
+        "ONLY these keys: new_per_day (int 0-999), reviews_per_day (int 0-999), max_answer_secs "
+        "(int 10-120), autoplay_audio (bool); anything else is rejected with the valid keys "
+        "listed. NOTE: the config is a preset SHARED by every deck using it — decks pointing at "
+        "the same preset change scheduling behavior together."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
+    )
+    async def update_deck_config(
+        deck_id: int,
+        updates: Dict[str, Any],
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = UpdateDeckConfigInput(deck_id=deck_id, **updates)
+            res = await deck_tools.update_deck_config(
+                tool_sync_manager, tool_registry, username, parsed.deck_id, parsed
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 44. set_card_flags
+    @mcp.tool(
+        description="Set the user flag of the selected cards (card_ids or query): flag 0 clears "
+        "the flag, 1-4 are the classic red/orange/green/blue flags, 5-7 the extra user-renameable "
+        "ones."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
+    )
+    async def set_card_flags(
+        flag: int,
+        card_ids: Optional[List[int]] = None,
+        query: Optional[str] = None,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = SetCardFlagsInput(flag=flag, card_ids=card_ids, query=query)
+            res = await cards_tools.set_card_flags(
+                tool_sync_manager, tool_registry, username,
+                parsed.flag, parsed.card_ids, parsed.query,
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 45. bury_cards
+    @mcp.tool(
+        description="Bury the selected cards (card_ids or query): they leave the review queue and "
+        "return automatically at the next day rollover, or earlier via unbury_cards."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
+    )
+    async def bury_cards(
+        card_ids: Optional[List[int]] = None,
+        query: Optional[str] = None,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = BuryCardsInput(card_ids=card_ids, query=query)
+            res = await cards_tools.bury_cards(
+                tool_sync_manager, tool_registry, username, parsed.card_ids, parsed.query,
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 46. unbury_cards
+    @mcp.tool(
+        description="Unbury the selected cards (card_ids or query). NOTE: the scheduler's unbury "
+        "restores BURIED AND SUSPENDED cards alike — any suspended card in the selection is "
+        "unsuspended too."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
+    )
+    async def unbury_cards(
+        card_ids: Optional[List[int]] = None,
+        query: Optional[str] = None,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = UnburyCardsInput(card_ids=card_ids, query=query)
+            res = await cards_tools.unbury_cards(
+                tool_sync_manager, tool_registry, username, parsed.card_ids, parsed.query,
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 47. reposition_new_cards
+    @mcp.tool(
+        description="Assign new queue positions to the selected cards (card_ids or query), "
+        "renumbering them from start in steps of step. ONLY new cards are affected — review and "
+        "learning cards in the selection are ignored by the scheduler. randomize assigns the "
+        "positions in random order; shift_existing also shifts other new cards that occupy the "
+        "target positions."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
+    )
+    async def reposition_new_cards(
+        start: int,
+        step: int,
+        card_ids: Optional[List[int]] = None,
+        query: Optional[str] = None,
+        randomize: bool = False,
+        shift_existing: bool = False,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = RepositionNewCardsInput(
+                start=start, step=step, card_ids=card_ids, query=query,
+                randomize=randomize, shift_existing=shift_existing,
+            )
+            res = await cards_tools.reposition_new_cards(
+                tool_sync_manager, tool_registry, username,
+                parsed.start, parsed.step, parsed.card_ids, parsed.query,
+                parsed.randomize, parsed.shift_existing,
             )
             return res.model_dump()
         except Exception as e:

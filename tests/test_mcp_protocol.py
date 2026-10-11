@@ -171,10 +171,30 @@ async def test_search_notes_tool_schema_exposes_only_real_arguments(app_with_use
             assert set(tools["restore_note_type_to_stock"]["inputSchema"]["properties"]) == {
                 "name", "force_kind", "confirm",
             }
+            # The phase-4 scheduling set exposes exactly its real arguments —
+            # in particular no ``ctx`` leak and no auth state.
+            assert set(tools["get_deck_config"]["inputSchema"]["properties"]) == {"deck_id"}
+            assert set(tools["update_deck_config"]["inputSchema"]["properties"]) == {
+                "deck_id", "updates",
+            }
+            assert set(tools["set_card_flags"]["inputSchema"]["properties"]) == {
+                "flag", "card_ids", "query",
+            }
+            assert set(tools["bury_cards"]["inputSchema"]["properties"]) == {"card_ids", "query"}
+            assert set(tools["unbury_cards"]["inputSchema"]["properties"]) == {"card_ids", "query"}
+            assert set(tools["reposition_new_cards"]["inputSchema"]["properties"]) == {
+                "start", "step", "card_ids", "query", "randomize", "shift_existing",
+            }
             # The read-only preview never carries the local-until-synced suffix,
-            # and neither does the read-only note-type detail tool.
+            # and neither do the read-only note-type/deck-config detail tools.
             assert "sync_collection" not in tools["preview_note_type_change"]["description"]
             assert "sync_collection" not in tools["get_note_type"]["description"]
+            assert "sync_collection" not in tools["get_deck_config"]["description"]
+            # Phase-4 disclosure pins: the unbury description must admit that
+            # suspended cards in the selection are restored too, and the deck
+            # config update must admit the preset is shared.
+            assert "suspended" in tools["unbury_cards"]["description"]
+            assert "SHARED" in tools["update_deck_config"]["description"]
 
 
 @pytest.mark.asyncio
@@ -292,7 +312,7 @@ async def test_initialize_result_carries_sync_guidance_instructions(app_with_use
             assert "AnkiWeb" in instructions
 
 
-# Every tool that changes collection state (27 as of the note-type control
+# Every tool that changes collection state (32 as of the phase-4 scheduling
 # set); each description must tell the model that the change is local until
 # sync_collection runs.
 MUTATING_TOOLS = {
@@ -306,6 +326,8 @@ MUTATING_TOOLS = {
     "restore_note_type_to_stock",
     "suspend_cards", "unsuspend_cards",
     "set_due_date", "move_cards", "answer_card", "store_media_file",
+    "update_deck_config", "set_card_flags",
+    "bury_cards", "unbury_cards", "reposition_new_cards",
 }
 
 

@@ -12,7 +12,7 @@ import logging
 from typing import Any, Dict, List
 
 from ..errors import CollectionToolError
-from ..models import MutationResponse, SyncStatus
+from ..models import DECK_CONFIG_UPDATE_KEYS, MutationResponse, SyncStatus, UpdateDeckConfigInput
 from ..sync_manager import SyncManager
 
 logger = logging.getLogger("anki_mcp.tools.decks")
@@ -155,5 +155,87 @@ async def delete_deck(
     return await sync_manager.execute_mutation(
         username,
         operation_name="delete_deck",
+        mutation_fn=_mutation,
+    )
+
+
+# -- deck config presets (roadmap phase 4) ------------------------------------------
+
+
+async def get_deck_config(registry, username: str, deck_id: int) -> Dict[str, Any]:
+    """Return a deck's full scheduling config dict (read-only)."""
+    logger.info("Executing get_deck_config for %r: deck %d", username, deck_id)
+
+    def _get(col) -> Dict[str, Any]:
+        _require_deck(col, deck_id)
+        # Plain JSON dict (probed wheel API): name, maxTaken, new{...},
+        # rev{...}, autoplay, timer, ... A dynamic (filtered) deck has no
+        # preset of its own — config_dict_for_deck_id then returns the deck
+        # itself with its embedded conf, which is still honest to show.
+        conf = col.decks.config_dict_for_deck_id(deck_id)
+        return {"deck_id": deck_id, "deck_name": col.decks.name(deck_id), "config": dict(conf)}
+
+    return await registry.run(username, _get)
+
+
+async def update_deck_config(
+    sync_manager: SyncManager,
+    registry,
+    username: str,
+    deck_id: int,
+    updates: UpdateDeckConfigInput,
+) -> MutationResponse:
+    """Apply whitelisted scheduling updates to a deck's config preset.
+
+    Not destructive (scheduling preferences, same no-snapshot class as
+    update_note_fields) — but the preset is SHARED: every deck pointing at
+    the same config id changes scheduling behavior with it, which the tool
+    description spells out.
+    """
+    logger.info(
+        "Executing update_deck_config for %r: deck %d, keys=%r",
+        username, deck_id,
+        sorted(key for key in DECK_CONFIG_UPDATE_KEYS if getattr(updates, key) is not None),
+    )
+
+    def _update(col) -> Dict[str, Any]:
+        _require_deck(col, deck_id)
+        deck_name = col.decks.name(deck_id)
+        conf = col.decks.config_dict_for_deck_id(deck_id)
+        if conf.get("dyn"):
+            # A filtered deck's config is embedded in the deck itself, not a
+            # shared preset — update_config would write a config with the
+            # deck's shape. Refused in Python before any backend call.
+            raise CollectionToolError(
+                f"Deck {deck_id} ({deck_name!r}) is a filtered (dynamic) deck: its config is "
+                "embedded in the deck and cannot be edited as a preset."
+            )
+        requested = [
+            key for key in DECK_CONFIG_UPDATE_KEYS if getattr(updates, key) is not None
+        ]
+        # Whitelisted mapping only (the input model refused everything else):
+        # apply to the dict, then persist the whole mutated dict.
+        if "new_per_day" in requested:
+            conf["new"]["perDay"] = updates.new_per_day
+        if "reviews_per_day" in requested:
+            conf["rev"]["perDay"] = updates.reviews_per_day
+        if "max_answer_secs" in requested:
+            conf["maxTaken"] = updates.max_answer_secs
+        if "autoplay_audio" in requested:
+            conf["autoplay"] = updates.autoplay_audio
+        col.decks.update_config(conf)
+        return {
+            "deck_id": deck_id,
+            "deck_name": deck_name,
+            "updated_keys": sorted(requested),
+            "config": dict(conf),
+        }
+
+    async def _mutation() -> Dict[str, Any]:
+        return await registry.run(username, _update)
+
+    return await sync_manager.execute_mutation(
+        username,
+        operation_name="update_deck_config",
         mutation_fn=_mutation,
     )

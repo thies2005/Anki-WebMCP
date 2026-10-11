@@ -74,11 +74,31 @@ integrity.
       every later read on the open handle would serve the pre-restore
       schema.
 
-## Phase 4 — Scheduling and organization
+## Phase 4 — Scheduling and organization (DONE, tools 42–47)
 
-- [ ] Deck config preset read/save.
-- [ ] `set_card_flags` — mark cards with the flag colors.
-- [ ] Bury / unbury cards.
-- [ ] Reposition new cards in the new-card queue — **verify the exact
-      anki==26.9.3 scheduler API names first** (the scheduling surface moved
-      several times across wheel generations).
+- [x] `get_deck_config` — read-only: a deck's full scheduling config dict
+      (plain JSON: `name`, `maxTaken`, `new{...}`, `rev{...}`, `autoplay`,
+      `timer`, ...). Deck existence is checked the established way
+      (`all_names_and_ids`) because `col.decks.get` silently returns a
+      fallback deck dict for unknown ids.
+- [x] `update_deck_config` — whitelisted preset keys only (`new_per_day`,
+      `reviews_per_day`, `max_answer_secs`, `autoplay_audio`); anything else
+      is rejected by the input model with the valid keys listed, so a bad key
+      never reaches the backend. No snapshot (scheduling preferences); the
+      description warns that the config is a preset SHARED by every deck
+      using it.
+- [x] `set_card_flags` — flag 0-7 in pydantic (0 clears); selection by
+      card_ids (1-2000) XOR query.
+- [x] `bury_cards` / `unbury_cards` — same XOR selection through ONE shared
+      card-selection resolver (mirror of the note-selection helper in
+      tools/notes.py). The unbury description discloses the probed wheel
+      semantics: the backend operation is
+      `restore_buried_and_suspended_cards`, so SUSPENDED cards in the
+      selection are unsuspended too.
+- [x] `reposition_new_cards` — `col.sched.reposition_new_cards` (exact
+      26.9.3 scheduler API name verified before shipping); start/step with
+      optional randomize/shift_existing. Only NEW cards move — review and
+      learning cards in the selection are ignored by the backend — and the
+      response reports the backend's repositioned count next to the
+      selection size, so a selection full of review cards cannot look like
+      a lost request.
