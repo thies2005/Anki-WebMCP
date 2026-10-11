@@ -22,6 +22,11 @@ services:
     image: cloudflare/cloudflared:latest
     container_name: cloudflared
     restart: unless-stopped
-    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    # The tunnel token is passed via the TUNNEL_TOKEN environment variable, not
+    # the command line: process arguments are world-readable across users via
+    # /proc/<pid>/cmdline and ps, while the environment block is owner-only.
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    command: tunnel --no-autoupdate run
     depends_on:
       - anki-mcp

@@ -1,6 +1,7 @@
 """Tests for the web-auth layer: signed sessions, CSRF, rate limiting, and the login/logout routes."""
 
 import re
+import time
 
 import httpx
 import pytest
@@ -14,6 +15,7 @@ from src.webauth import (
     issue_csrf,
     issue_session,
     secure_cookies_enabled,
+    session_issued_before,
     verify_csrf,
     verify_session,
 )
@@ -46,15 +48,24 @@ def test_tampered_username_segment_rejected():
 
 def test_tampered_mac_segment_rejected():
     cookie = issue_session(SECRET, "alice")
-    u, expiry, nonce, _mac = cookie.split("|")
-    tampered = "|".join([u, expiry, nonce, "AAAA" * 11])
+    u, issued, expiry, nonce, _mac = cookie.split("|")
+    tampered = "|".join([u, issued, expiry, nonce, "AAAA" * 11])
     assert verify_session(SECRET, tampered) is None
 
 
 def test_tampered_expiry_rejected():
     cookie = issue_session(SECRET, "alice")
-    u, expiry, nonce, mac = cookie.split("|")
-    tampered = "|".join([u, str(int(expiry) + 9999), nonce, mac])
+    u, issued, expiry, nonce, mac = cookie.split("|")
+    tampered = "|".join([u, issued, str(int(expiry) + 9999), nonce, mac])
+    assert verify_session(SECRET, tampered) is None
+
+
+def test_tampered_issued_at_rejected():
+    # The issued-at stamp is part of the MACed payload: shifting it (to dodge
+    # a revocation epoch) without re-signing must fail the MAC check.
+    cookie = issue_session(SECRET, "alice")
+    u, issued, expiry, nonce, mac = cookie.split("|")
+    tampered = "|".join([u, str(int(issued) - 10_000), expiry, nonce, mac])
     assert verify_session(SECRET, tampered) is None
 
 
@@ -69,7 +80,16 @@ def test_different_session_secret_rejected():
 
 
 @pytest.mark.parametrize(
-    "value", ["", "garbage", "a|b|c", "a|b|c|d|e", "YWxpY2U|notanumber|nonce|AAAA"]
+    "value",
+    [
+        "",
+        "garbage",
+        "a|b|c",
+        "a|b|c|d",  # legacy four-segment format: fails closed
+        "a|b|c|d|e",  # right segment count, bogus MAC
+        "a|b|c|d|e|f",
+        "YWxpY2U|notanumber|nonce|AAAA",
+    ],
 )
 def test_malformed_session_values_rejected(value):
     assert verify_session(SECRET, value) is None
@@ -78,8 +98,51 @@ def test_malformed_session_values_rejected(value):
 def test_non_ascii_session_segments_rejected_not_raised():
     # Crafted cookie with a non-ASCII segment: the contract is None, never a
     # UnicodeEncodeError escaping the auth layer (was a 500 pre-fix).
-    assert verify_session(SECRET, "AAAA|ö\xff|n|AAAA") is None
-    assert verify_session(SECRET, "AAAA|123|nön|AAAA") is None
+    assert verify_session(SECRET, "AAAA|1|123|n|AAAA|ö\xff") is None
+    assert verify_session(SECRET, "AAAA|1|123|nön|AAAA") is None
+    assert verify_session(SECRET, "AAAA|ö\xff|123|n|AAAA") is None
+
+
+# ---------------------------------------------------------------------------
+# Issued-at segment (session revocation epoch primitive)
+# ---------------------------------------------------------------------------
+
+
+def test_session_payload_has_five_segments_with_issued_at():
+    cookie = issue_session(SECRET, "alice")
+    parts = cookie.split("|")
+    assert len(parts) == 5
+    assert parts[0] != "alice"  # username is base64url-encoded
+    assert int(parts[1]) <= time.time()  # issued at (or before) now
+    assert int(parts[2]) > time.time()  # expires in the future
+    assert parts[3] and parts[4]  # nonce + MAC present
+
+
+def test_session_issued_before_parses_issue_time():
+    before = float(int(time.time()))
+    cookie = issue_session(SECRET, "alice")
+    after = time.time() + 1
+    issued = session_issued_before(cookie)
+    assert issued is not None
+    assert before <= issued < after
+
+
+def test_session_issued_before_rejects_malformed_and_legacy_values():
+    assert session_issued_before("") is None
+    assert session_issued_before("garbage") is None
+    # Legacy four-segment cookie (pre-epoch format): no issued-at -> None.
+    assert session_issued_before("YWxpY2U|1234567890|nonce|AAAA") is None
+    # Five segments but a non-integer issued-at.
+    assert session_issued_before("YWxpY2U|soon|123|nonce|AAAA") is None
+
+
+def test_session_issued_before_none_even_for_verifying_cookie_without_segment():
+    # The primitive and verify_session agree on fail-closed: a value without
+    # the issued-at segment neither verifies nor yields an issue time, so a
+    # legacy cookie can never sneak past an epoch check in get_session_user.
+    legacy = "YWxpY2U|1234567890|nonce|AAAA"
+    assert verify_session(SECRET, legacy) is None
+    assert session_issued_before(legacy) is None
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +241,91 @@ def test_rate_limiter_bounds_entries_and_evicts_oldest():
     # "a" was the oldest activity and was evicted.
     assert ("a", "10.0.0.1") not in rl._entries
     assert ("d", "10.0.0.1") in rl._entries
+
+
+# ---------------------------------------------------------------------------
+# LoginRateLimiter per-IP aggregate budget (username-rotation defense)
+# ---------------------------------------------------------------------------
+
+
+def test_rate_limiter_default_ip_budget_is_30():
+    rl = LoginRateLimiter()
+    assert rl.max_ip_failures == 30
+    assert rl.max_failures == 5
+
+
+def test_rate_limiter_rotating_usernames_eventually_locks_the_ip_bucket():
+    now = [1000.0]
+    rl = _limiter(now, max_ip_failures=3)
+    for i in range(3):
+        # Every request presents a fresh username: each per-account key stays
+        # unlocked, but the per-source aggregate counts them all.
+        assert rl.check(f"attacker-{i}", "10.0.0.1") is True
+        rl.record_failure(f"victim-{i}", "10.0.0.1")
+        now[0] += 1
+    # The 4th request from this IP is rejected no matter which username it
+    # presents — the aggregate budget, not the per-account key, gates it.
+    assert rl.check("brand-new-username", "10.0.0.1") is False
+    assert rl.check("victim-0", "10.0.0.1") is False
+    # Other source IPs are unaffected.
+    assert rl.check("brand-new-username", "10.0.0.2") is True
+
+
+def test_rate_limiter_ip_bucket_lockout_expires_after_window():
+    now = [1000.0]
+    rl = _limiter(now, max_ip_failures=3)
+    for i in range(3):
+        rl.record_failure(f"u{i}", "10.0.0.9")
+        now[0] += 1
+    assert rl.check("x", "10.0.0.9") is False
+    now[0] += 15 * 60 + 1  # past the lockout window
+    assert rl.check("x", "10.0.0.9") is True
+
+
+def test_rate_limiter_pinned_username_lockout_still_works_alongside_ip_budget():
+    now = [1000.0]
+    rl = _limiter(now)  # defaults: 5 per account, 30 per source
+    for _ in range(5):
+        rl.record_failure("pinned", "10.0.0.1")
+    assert rl.check("pinned", "10.0.0.1") is False  # account key locked at 5
+    # The source is not yet locked (5 < 30): a DIFFERENT username from the
+    # same IP still passes the aggregate gate — per-account lockout is intact.
+    assert rl.check("someone-else", "10.0.0.1") is True
+
+
+def test_rate_limiter_success_clears_username_key_but_not_ip_budget():
+    now = [1000.0]
+    rl = _limiter(now, max_ip_failures=2)
+    rl.record_failure("a", "10.0.0.1")
+    rl.record_failure("b", "10.0.0.1")
+    assert rl.check("c", "10.0.0.1") is False  # aggregate exhausted
+    rl.record_success("a", "10.0.0.1")
+    # The success clears only ("a", ip); the source budget must NOT reset, or
+    # an attacker could revive it by interleaving an occasional success into
+    # a username rotation.
+    assert rl.check("a", "10.0.0.1") is False
+    assert rl.check("b", "10.0.0.1") is False
+    assert rl.check("a", "10.0.0.2") is True  # other IPs unaffected
+
+
+def test_rate_limiter_empty_username_counts_once_toward_ip_budget():
+    # Empty-username failures must not double-bump the aggregate key (the
+    # ("", ip) shapes coincide); they also don't burn scrypt upstream.
+    now = [1000.0]
+    rl = _limiter(now, max_ip_failures=3)
+    for _ in range(3):
+        rl.record_failure("", "10.0.0.5")
+    assert rl.check("", "10.0.0.5") is False
+    assert rl._entries[("", "10.0.0.5")][0] == 3  # bumped once per failure
+
+
+def test_rate_limiter_ip_bucket_shares_entry_cap():
+    now = [1000.0]
+    rl = _limiter(now, max_entries=4)
+    for name in ["a", "b", "c", "d", "e"]:
+        rl.record_failure(name, "10.0.0.1")
+        now[0] += 1
+    assert len(rl._entries) <= 4  # both key shapes share the one cap
 
 
 # ---------------------------------------------------------------------------

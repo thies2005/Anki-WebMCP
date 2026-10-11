@@ -133,7 +133,9 @@ class SyncManager:
             if existing:
                 status = existing.get("status")
                 if status == "committed":
-                    logger.info("Idempotency hit for sync key '%s': returning cached committed response", idempotency_key)
+                    # %r + truncate: the key is client-controlled and must never
+                    # split or bloat a log record (CWE-117).
+                    logger.info("Idempotency hit for sync key %r: returning cached committed response", idempotency_key[:64])
                     return {
                         "success": True,
                         "sync_status": SyncStatus(pre_sync="skipped", post_sync="skipped").model_dump(),
@@ -142,7 +144,7 @@ class SyncManager:
                         "warnings": [_REPLAY_WARNING.format(existing.get("timestamp"))],
                     }
                 if status == "failed":
-                    logger.info("Idempotency hit for sync key '%s': returning cached failure", idempotency_key)
+                    logger.info("Idempotency hit for sync key %r: returning cached failure", idempotency_key[:64])
                     error = existing.get("error", "Previous attempt with this idempotency key failed.")
                     return {
                         "success": False,
@@ -256,7 +258,9 @@ class SyncManager:
                 if existing:
                     status = existing.get("status")
                     if status == "committed":
-                        logger.info("Idempotency hit for key '%s': returning cached committed response", idempotency_key)
+                        # %r + truncate: the key is client-controlled and must
+                        # never split or bloat a log record (CWE-117).
+                        logger.info("Idempotency hit for key %r: returning cached committed response", idempotency_key[:64])
                         return MutationResponse(
                             success=True,
                             local_status="committed",
@@ -265,7 +269,7 @@ class SyncManager:
                             warnings=[_REPLAY_WARNING.format(existing.get("timestamp"))],
                         )
                     if status == "failed":
-                        logger.info("Idempotency hit for key '%s': returning cached failure", idempotency_key)
+                        logger.info("Idempotency hit for key %r: returning cached failure", idempotency_key[:64])
                         return MutationResponse(
                             success=False,
                             local_status="failed",

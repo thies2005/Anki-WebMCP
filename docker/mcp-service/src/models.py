@@ -30,8 +30,12 @@ class NoteInput(BaseModel):
 class AddNotesInput(BaseModel):
     """Input parameters for add_notes tool."""
     notes: List[NoteInput] = Field(..., description="List of notes to create")
+    # Bound matches ledger.MAX_KEY_LEN (the ledger rejects longer keys): an
+    # unbounded key would persist arbitrarily many bytes in ledger.json on the
+    # shared /data volume and rewrite them whole on every keyed mutation.
     idempotency_key: Optional[str] = Field(
         None,
+        max_length=256,
         description="Optional unique key to prevent duplicate creation on network retries",
     )
     allow_duplicates: bool = Field(

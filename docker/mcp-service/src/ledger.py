@@ -17,10 +17,15 @@ mid-transfer with an unknown outcome, the outcome is surfaced as
 no-record semantics): a poisoned record could hide a half-applied mutation, so
 the caller is told to verify collection state before retrying. Deterministic
 failures (e.g. duplicate rejection) do persist a ``failed`` record.
+add_notes validates note models AND field names up front, before any write, so
+the remaining add_notes failures occur before any note is persisted — a
+``failed`` record for add_notes implies nothing was applied.
 
 GROWTH LIMIT:
 The ledger keeps at most MAX_ENTRIES (default 1000) most-recent keys,
-evicting the oldest first, so the file cannot grow without bound.
+evicting the oldest first, and rejects keys longer than MAX_KEY_LEN
+characters, so the file cannot grow without bound in either entry count or
+per-entry bytes.
 Single-instance assumption: the lock is process-internal; run exactly
 one mcp-service replica per ledger file.
 """
@@ -36,6 +41,17 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger("anki_mcp.ledger")
 
 MAX_ENTRIES = 1000
+
+# Per-entry application-layer bound on the key (the model layer enforces the
+# same limit on AddNotesInput.idempotency_key). Without it the JSON ledger
+# file on the shared /data volume could grow without bound per entry (every
+# keyed mutation rewrites the whole file), contradicting the growth-limit
+# invariant documented above.
+MAX_KEY_LEN = 256
+
+# Keys are logged %r (repr escapes newlines/control chars) and truncated so a
+# client-controlled key can never split or bloat a log record (CWE-117).
+_LOG_KEY_LEN = 64
 
 
 class IdempotencyLedger:
@@ -55,7 +71,8 @@ class IdempotencyLedger:
         narrow crash window.
 
     GROWTH LIMIT and the single-instance assumption: see the module docstring
-    (at most MAX_ENTRIES most-recent keys; process-internal lock).
+    (at most MAX_ENTRIES most-recent keys, keys bounded at MAX_KEY_LEN
+    characters; process-internal lock).
     """
 
     def __init__(self, file_path: str, max_entries: int = MAX_ENTRIES):
@@ -116,9 +133,16 @@ class IdempotencyLedger:
             return self._entries.get(key)
 
     async def record_success(self, key: str, data: Any) -> None:
-        """Record successful operation in ledger."""
+        """Record successful operation in ledger.
+
+        Raises ValueError for keys longer than MAX_KEY_LEN: the per-entry
+        application-layer byte bound keeping the ledger file growth-limited
+        (the input model enforces the same limit upstream).
+        """
         if not key:
             return
+        if len(key) > MAX_KEY_LEN:
+            raise ValueError(f"idempotency_key longer than {MAX_KEY_LEN} characters")
         async with self._lock:
             self._entries[key] = {
                 "status": "committed",
@@ -127,12 +151,14 @@ class IdempotencyLedger:
             }
             self._evict_oldest_locked()
             self._save_atomic()
-            logger.info("Recorded idempotency key '%s' with committed status", key)
+            logger.info("Recorded idempotency key %r with committed status", key[:_LOG_KEY_LEN])
 
     async def record_failure(self, key: str, error: str) -> None:
-        """Record failed operation in ledger."""
+        """Record failed operation in ledger (same MAX_KEY_LEN guard as record_success)."""
         if not key:
             return
+        if len(key) > MAX_KEY_LEN:
+            raise ValueError(f"idempotency_key longer than {MAX_KEY_LEN} characters")
         async with self._lock:
             self._entries[key] = {
                 "status": "failed",
@@ -141,4 +167,4 @@ class IdempotencyLedger:
             }
             self._evict_oldest_locked()
             self._save_atomic()
-            logger.info("Recorded idempotency key '%s' with failed status", key)
+            logger.info("Recorded idempotency key %r with failed status", key[:_LOG_KEY_LEN])

@@ -59,7 +59,9 @@ async def search_notes(
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
 
-    logger.info("Executing search_notes for %r: query='%s', limit=%d, offset=%d", username, query, limit, offset)
+    # Client-controlled values are logged %r (repr escapes newlines/control
+    # chars) so one tool call can never author multiple log lines (CWE-117).
+    logger.info("Executing search_notes for %r: query=%r, limit=%d, offset=%d", username, query, limit, offset)
 
     def _search(col) -> Dict[str, Any]:
         note_ids = list(col.find_notes(query))
@@ -125,8 +127,13 @@ def _is_first_field_duplicate(col, model, deck_name: str, fields: Dict[str, str]
 
 
 def _add_notes_impl(col, notes: List[NoteInput], allow_duplicates: bool) -> Dict[str, Any]:
-    # Pass 1: resolve models and run duplicate detection for the WHOLE batch
-    # up front (same all-or-nothing reporting as the legacy canAddNotes gate).
+    # Pass 1: resolve models, validate field names, and run duplicate detection
+    # for the WHOLE batch up front (same all-or-nothing reporting as the legacy
+    # canAddNotes gate). Field-name validation (mirrors update_note_fields)
+    # happens here — BEFORE any write — so a mistyped field name can never fail
+    # mid-pass-2 after earlier notes of the batch were already persisted (a
+    # backend KeyError raised there would leave partial state behind a 'failed'
+    # ledger record).
     resolved = []
     failures: List[int] = []
     for idx, n in enumerate(notes):
@@ -135,6 +142,13 @@ def _add_notes_impl(col, notes: List[NoteInput], allow_duplicates: bool) -> Dict
             available = sorted(m.name for m in col.models.all_names_and_ids())
             raise CollectionToolError(
                 f"Unknown note type {n.model_name!r}. Available models: {available}"
+            )
+        valid_fields = sorted(f["name"] for f in model["flds"])
+        unknown_fields = sorted(name for name in n.fields if name not in valid_fields)
+        if unknown_fields:
+            raise CollectionToolError(
+                f"Note index {idx}: unknown field(s) {unknown_fields} for note type "
+                f"{n.model_name!r}. Valid fields for this note type: {valid_fields}."
             )
         if not allow_duplicates and _is_first_field_duplicate(col, model, n.deck_name, n.fields):
             failures.append(idx)
@@ -171,8 +185,8 @@ async def add_notes(
     if not notes:
         raise CollectionToolError("At least one note must be provided.")
     logger.info(
-        "Executing add_notes for %r with %d notes (idempotency_key=%s)",
-        username, len(notes), idempotency_key,
+        "Executing add_notes for %r with %d notes (idempotency_key=%r)",
+        username, len(notes), idempotency_key[:64] if idempotency_key else idempotency_key,
     )
 
     async def _mutation() -> Dict[str, Any]:

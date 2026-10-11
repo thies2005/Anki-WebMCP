@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import stat
+import time
 
 import pytest
 
@@ -161,6 +162,71 @@ def test_set_password_unknown_user_raises(users_file):
         store.set_password("ghost", "pw")
 
 
+# -- session revocation epoch ------------------------------------------------
+
+
+def test_new_user_session_epoch_defaults_to_zero(users_file):
+    store = UserStore(users_file)
+    store.create_user("kay", "pw")
+    assert store.get("kay").sessions_invalid_before == 0.0
+
+
+def test_legacy_record_without_epoch_field_loads_tolerantly(users_file):
+    # A users.json written before the field existed must load with epoch 0.0
+    # (no revocation), not raise or reset the store.
+    os.makedirs(os.path.dirname(users_file), exist_ok=True)
+    legacy = {
+        "kay": {
+            "username": "kay",
+            "password_hash": hash_password("pw"),
+            "token_hash": "a" * 64,
+            "role": "user",
+            "created_at": 123.0,
+        }
+    }
+    with open(users_file, "w", encoding="utf-8") as f:
+        json.dump(legacy, f)
+    store = UserStore(users_file)
+    user = store.get("kay")
+    assert user is not None
+    assert user.sessions_invalid_before == 0.0
+    assert user.created_at == 123.0
+    assert store.verify_password("kay", "pw") is True
+
+
+def test_set_password_bumps_session_epoch(users_file):
+    store = UserStore(users_file)
+    store.create_user("lem", "pw")
+    assert store.get("lem").sessions_invalid_before == 0.0
+    before = time.time()
+    store.set_password("lem", "pw2")
+    epoch = store.get("lem").sessions_invalid_before
+    # A cookie issued before the reset (any issued_at < epoch) must be
+    # rejected; the epoch is stamped at/after the reset moment.
+    assert epoch >= before
+    assert epoch <= time.time()
+
+
+def test_session_epoch_persists_across_reload(users_file):
+    store = UserStore(users_file)
+    store.create_user("moe", "pw")
+    store.set_password("moe", "pw2")
+    epoch = store.get("moe").sessions_invalid_before
+    reloaded = UserStore(users_file).get("moe")
+    assert reloaded.sessions_invalid_before == epoch
+
+
+def test_other_mutations_do_not_bump_session_epoch(users_file):
+    # Only a password reset evicts sessions; token regeneration and credential
+    # storage must not log the user out of the web portal.
+    store = UserStore(users_file)
+    store.create_user("nan", "pw")
+    store.regenerate_token("nan")
+    store.set_ankiweb_credentials("nan", "nan@example.com", "anki-pw")
+    store.set_role("nan", "admin")
+    assert store.get("nan").sessions_invalid_before == 0.0
+
+
 def test_set_ankiweb_credentials_round_trip(users_file):
     store = UserStore(users_file)
     store.create_user("gina", "pw")
@@ -181,6 +247,48 @@ def test_delete_user_removes_record_and_kills_token(users_file):
     assert store.delete_user("henry") is False
     assert store.authenticate_token(raw) is None
     assert store.list_users() == []
+
+
+# -- last-admin guards under the store lock -----------------------------------
+
+
+def test_set_role_refuses_demoting_last_admin(users_file):
+    store = UserStore(users_file)
+    store.create_user("root", "pw", "admin")
+    with pytest.raises(ValueError, match="last admin"):
+        store.set_role("root", "user")
+    assert store.get("root").role == "admin"  # mutation did not commit
+    # With a second admin the same demotion goes through.
+    store.create_user("alice", "pw", "admin")
+    store.set_role("root", "user")
+    assert store.get("root").role == "user"
+    assert store.get("alice").role == "admin"
+
+
+def test_delete_user_refuses_deleting_last_admin(users_file):
+    store = UserStore(users_file)
+    store.create_user("root", "pw", "admin")
+    with pytest.raises(ValueError, match="last admin"):
+        store.delete_user("root")
+    assert store.get("root") is not None  # mutation did not commit
+    # Deleting a plain user while an admin remains is unaffected.
+    store.create_user("bob", "pw")
+    assert store.delete_user("bob") is True
+
+
+def test_delete_last_admin_guard_sees_concurrent_role_changes(users_file):
+    # The guard must count admins from the CURRENT in-lock state, not a stale
+    # copy: promote a second admin, then deleting the first must succeed even
+    # if an old list_users() snapshot showed only one admin.
+    store = UserStore(users_file)
+    store.create_user("root", "pw", "admin")
+    store.create_user("alice", "pw")
+    snapshot = store.list_users()  # stale: alice still 'user' here
+    store.set_role("alice", "admin")
+    assert sum(1 for u in snapshot if u.role == "admin") == 1
+    assert store.delete_user("root") is True
+    assert store.get("root") is None
+    assert store.get("alice").role == "admin"
 
 
 # -- persistence -------------------------------------------------------------

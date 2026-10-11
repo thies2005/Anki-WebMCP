@@ -14,6 +14,17 @@ _PATTERNS = [
     (re.compile(r'(["\']?(?:api[_-]?key|key|token|auth|password|secret|hkey)["\']?\s*[:=]\s*["\']?)([^"\'\s,;&]+)(["\']?)', re.IGNORECASE), r'\1[REDACTED]\3'),
 ]
 
+# C0/C1 control characters EXCEPT the structural newline (\n): NUL, BEL, ESC
+# and CSI openers, CR, TAB, and the C1 range cannot be distinguished from
+# terminal control sequences by log viewers, so they are escaped to visible
+# \xNN form before redaction. Attacker-influenced strings must never reach the
+# log stream with active escape bytes (ANSI/terminal log-forging, CWE-117);
+# CR in particular rewrites the current terminal line. \n is preserved so
+# traceback blocks keep their line structure; call sites logging client-
+# controlled single-line values use %r so their newlines are repr-escaped and
+# cannot split a record.
+_CONTROL_CHARS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")
+
 # Secret-bearing dict keys. Generic names cover every real secret this service
 # handles (session_secret, admin_password, per-user MCP tokens, AnkiWeb
 # credentials); the deleted legacy env-var names are NOT listed.
@@ -50,10 +61,18 @@ def sanitize_data(data: Any) -> Any:
 
 
 class RedactingFormatter(logging.Formatter):
-    """Logging formatter that redacts sensitive credentials from log outputs."""
+    """Redact credentials and neutralize active control characters.
+
+    All C0/C1 control characters except ``\\n`` are escaped to ``\\xNN`` form
+    (before redaction) so attacker-influenced strings cannot alter how log
+    records render or parse (ANSI/terminal log forging). ``\\n`` survives so
+    exception tracebacks keep their structure; single-line client values are
+    logged via ``%r`` at the call sites, which repr-escapes their newlines.
+    """
 
     def format(self, record: logging.LogRecord) -> str:
         original = super().format(record)
+        original = _CONTROL_CHARS.sub(lambda m: f"\\x{ord(m.group(0)):02x}", original)
         return redact_string(original)
 
 

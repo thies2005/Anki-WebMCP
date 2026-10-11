@@ -220,6 +220,7 @@ Recommended for self-hosters without a public IP or open router ports.
    ```env
    CLOUDFLARE_TUNNEL_TOKEN=eyJhIjoi...
    ```
+   The override file passes the token to cloudflared via its `TUNNEL_TOKEN` **environment variable** — never on the container command line, where it would be world-readable to every local account through `ps` and `/proc/<pid>/cmdline`.
 4. Start with the Cloudflare override:
    ```bash
    docker compose -f docker-compose.yml -f docker-compose.cloudflare.yml up -d
@@ -378,6 +379,11 @@ All tools operate on the **authenticated user's** collection — the token decid
   git pull && docker compose build --pull && docker compose up -d
   ```
   **Read before upgrading**: the image pins `anki==26.9.3` exactly. Anki upgrades collection schemas **one-way** — once a collection is opened by a newer wheel it cannot be opened by an older one, so **downgrades are unsupported**. Take a volume backup first, and expect the first post-upgrade sync with older Anki clients to require updating those clients.
+- **Check the parser/dependency versions actually inside your built image** (`requirements.txt` floors only bite at the next rebuild — images built from older floors keep whatever they resolved at build time):
+  ```bash
+  docker run --rm --entrypoint python <image> -c "import importlib.metadata as md; print(md.version('python-multipart'), md.version('starlette'))"
+  ```
+  Pass = `python-multipart` >= 0.0.18 and `starlette` >= 0.40.0 (the security-fix floors for the pre-auth multipart parser DoS CVEs CVE-2024-53981 and CVE-2024-47874). If the image reports lower versions, rebuild (`docker compose build --pull`) and re-check.
 - **Logs**: `docker compose logs -f anki-mcp`
 
 ---

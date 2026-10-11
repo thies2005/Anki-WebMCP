@@ -15,7 +15,9 @@ Design invariants (verified against the anki==26.9.3 wheel):
   collection is serialized behind that user's ``asyncio.Lock`` and executed on
   worker threads via ``asyncio.to_thread``.
 - ``Collection(path)`` opens OR creates the collection; ``col.close()`` sets
-  ``col.db = None`` and later use raises ``InvalidInput("CollectionNotOpen")``.
+  ``col.db = None`` and later use raises ``InvalidInput`` — a backend error
+  with EMPTY ``args`` and ``str() == "CollectionNotOpen"`` (pinned wheel
+  26.9.3).
 - Tags are space-separated STRINGS in this API generation (relevant for
   callers of ``run()``; the registry itself is tag-agnostic).
 
@@ -33,6 +35,13 @@ Locking model:
   the detached handle is closed without holding any user lock and without a
   lock-ordering deadlock (a user lock is never awaited while holding
   ``_registry_lock``).
+- ``drop_user`` (user-deletion hook) follows close_all's pattern: it pops the
+  ``_UserState`` and detaches the handle in one critical section under
+  ``_registry_lock``, then closes the detached handle while holding the
+  popped state's user lock. An in-flight ``run()``/``sync_user`` therefore
+  finishes before its handle is closed, while any call arriving after the pop
+  creates fresh state and a fresh collection — a recreated username can never
+  inherit the deleted account's serving state.
 """
 
 import asyncio
@@ -44,7 +53,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from anki.collection import Collection
-from anki.errors import NetworkError, SyncError, SyncErrorKind
+from anki.errors import InvalidInput, NetworkError, SyncError, SyncErrorKind
 
 from .ledger import MAX_ENTRIES as LEDGER_MAX_ENTRIES
 from .ledger import IdempotencyLedger
@@ -176,19 +185,22 @@ class CollectionRegistry:
     def _is_stale(col: Collection, exc: Exception) -> bool:
         """True if ``exc`` indicates the handle was closed underneath us.
 
-        ``col.close()`` sets ``db = None``; the wheel raises
-        ``InvalidInput("CollectionNotOpen")`` for subsequent use. The handle
-        check is authoritative; the message substring is a best-effort
-        fallback for a backend that died without the attribute being cleared.
-        Trade-off: an application exception whose text merely CONTAINS
-        "CollectionNotOpen" on a healthy handle would also be classified
-        stale and re-run ``fn`` once. Task 5's tool fns must therefore not
-        surface raw collection-layer exception text as user-supplied input to
-        this discriminator.
+        Contract: the retry may fire ONLY when the handle was genuinely
+        closed. The handle check is authoritative — ``col.close()`` sets
+        ``db = None``, and every close path in this registry goes through
+        ``col.close()``. The single fallback is exact backend TYPE identity
+        (``isinstance(exc, InvalidInput)``): the pinned wheel raises
+        ``InvalidInput`` with EMPTY ``args`` for a closed handle, so there is
+        nothing to match in the text and, more importantly, exception TEXT is
+        NEVER matched — tool-layer messages can carry user-controlled strings
+        (model/field names), and an application exception that merely mentions
+        "CollectionNotOpen" on a healthy handle must propagate unchanged
+        without closing the handle and without re-executing ``fn`` (the retry
+        re-runs it, so non-idempotent mutations must not be re-run).
         """
         if getattr(col, "db", None) is None:
             return True
-        return "CollectionNotOpen" in f"{type(exc).__name__}: {exc}"
+        return isinstance(exc, InvalidInput)
 
     async def _recover_stale(self, state: _UserState, col: Collection) -> Collection:
         """Drop a stale handle and reopen. Caller holds state.lock."""
@@ -343,6 +355,39 @@ class CollectionRegistry:
                 logger.warning("Failed to close collection for %r during shutdown", state.username, exc_info=True)
         if pending:
             logger.info("Closed %d open collection(s) at shutdown", len(pending))
+
+    async def drop_user(self, username: str) -> None:
+        """Detach ALL serving state for ``username`` (user-deletion hook).
+
+        Closes and drops the open Collection handle, pops the cached
+        ``_UserState`` and pops the in-memory per-user ledger, so a recreated
+        username starts from a fresh collection and an empty ledger. The
+        caller must also archive/remove ``users/<username>/`` and
+        ``ledgers/<username>/`` on disk, or a registry restart reloads them.
+
+        Race-safety (close_all's pattern): the state pop + handle detach are
+        one critical section under ``_registry_lock``; the detached handle is
+        then closed while holding the popped state's user lock, so an
+        in-flight ``run()``/``sync_user`` completes before its handle is
+        closed, and any call arriving after the pop creates fresh state and a
+        fresh collection. Close errors are logged, never raised — deletion
+        must not fail because a broken handle could not be closed.
+        """
+        _check_username(username)
+        async with self._registry_lock:
+            state = self._users.pop(username, None)
+            col = state.col if state is not None else None
+            if state is not None:
+                state.col = None
+        if state is not None:
+            try:
+                async with state.lock:
+                    if col is not None:
+                        await asyncio.to_thread(col.close)
+            except Exception:
+                logger.warning("Failed to close collection for deleted user %r", username, exc_info=True)
+        with self._ledgers_lock:
+            self._ledgers.pop(username, None)
 
     # -- introspection (tests / health endpoints) ------------------------------
 

@@ -8,6 +8,7 @@ set/clear cookies (flash) naturally.
 """
 
 import re
+import threading
 
 import httpx
 import pytest
@@ -481,3 +482,44 @@ async def test_demoting_deleting_non_last_admin_still_works(client, tmp_path):
     disk_store = await _fresh_store(tmp_path)
     assert disk_store.get("alice") is None
     assert disk_store.get("root").role == "admin"
+
+
+# ---------------------------------------------------------------------------
+# Store-lock last-admin guard (audit regression): the guard must be ATOMIC
+# with the mutation. Two concurrent set_role demotions targeting two admins
+# must leave exactly one admin — previously the guard ran on unlocked store
+# copies outside the commit lock, so both demotions could pass and commit,
+# leaving zero admins (unadministerable web surface).
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_admin_demotions_leave_exactly_one_admin(tmp_path):
+    for round_no in range(5):
+        store = UserStore(str(tmp_path / f"users-race-{round_no}.json"))
+        store.create_user("root", "pw", role="admin")
+        store.create_user("alice", "pw", role="admin")
+
+        barrier = threading.Barrier(2)  # maximize scheduling overlap
+        refused = []
+
+        def demote(name: str) -> None:
+            barrier.wait()
+            try:
+                store.set_role(name, "user")
+            except ValueError as e:
+                refused.append(str(e))
+
+        threads = [threading.Thread(target=demote, args=("root",)),
+                   threading.Thread(target=demote, args=("alice",))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Exactly one demotion committed; the other was refused by the guard
+        # that re-checked the admin count under the store lock.
+        admins = [u.username for u in store.list_users() if u.role == "admin"]
+        assert len(admins) == 1, f"round {round_no}: admins left: {admins}"
+        assert len(refused) == 1, f"round {round_no}: refusals: {refused}"
+        assert "last admin" in refused[0]
+        assert admins[0] in ("root", "alice")

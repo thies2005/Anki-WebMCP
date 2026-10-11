@@ -16,6 +16,7 @@ import pytest_asyncio
 # src.collections imports anki.collection first; the wheel's anki.notes cannot
 # be the FIRST anki module imported (circular import through anki.cards).
 from src.collections import CollectionRegistry  # isort: skip
+from anki.errors import InvalidInput
 from anki.notes import Note
 
 
@@ -209,6 +210,97 @@ async def test_run_retries_once_after_stale_handle_failure(make_registry):
     assert reg.is_open("gina")
 
 
+@pytest.mark.asyncio
+async def test_user_text_exception_on_healthy_handle_is_not_stale(make_registry):
+    """An application exception whose TEXT mentions 'CollectionNotOpen' on a
+    healthy handle must propagate unchanged: fn runs exactly once, the handle
+    is NOT recycled, no retry fires (regression: the old substring fallback
+    re-executed non-idempotent mutations and reported them as failed)."""
+    reg = make_registry()
+    await reg.run("hank", count_notes)
+    col_before = reg._users["hank"].col
+    calls = {"n": 0}
+
+    def fn(col):
+        calls["n"] += 1
+        raise KeyError("CollectionNotOpen")
+
+    with pytest.raises(KeyError):
+        await reg.run("hank", fn)
+    assert calls["n"] == 1  # no retry on a healthy handle
+    assert reg._users["hank"].col is col_before  # handle not recycled
+
+
+@pytest.mark.asyncio
+async def test_genuinely_stale_handle_retries_once_then_serves_reopened_collection(make_registry):
+    reg = make_registry()
+    await reg.run("iris", count_notes)
+    calls = {"n": 0}
+
+    def read(col):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            col.close()  # underlying collection closed directly mid-operation
+            return col.find_notes("")  # raises InvalidInput (EMPTY args, col.db is None)
+        return col.find_notes("")  # the retry succeeds on the reopened handle
+
+    assert await reg.run("iris", read) == []
+    assert calls["n"] == 2  # exactly one retry on the authoritative db-is-None signal
+    assert reg._users["iris"].col is not None
+    assert reg._users["iris"].col.db is not None  # a genuinely reopened handle
+    assert reg.is_open("iris")
+
+    # The reopened collection serves subsequent calls normally.
+    assert await reg.run("iris", count_notes) == 0
+
+
+@pytest.mark.asyncio
+async def test_handle_closed_directly_between_calls_is_replaced_before_fn_runs(make_registry):
+    """A handle closed behind the registry's back between calls never reaches
+    fn: _ensure_open sees col.db is None and swaps in a fresh handle, so the
+    read fn runs exactly once on the reopened collection."""
+    reg = make_registry()
+    await reg.run("iris2", count_notes)
+    closed_handle = reg._users["iris2"].col
+    closed_handle.close()
+    calls = {"n": 0}
+
+    def read(col):
+        calls["n"] += 1
+        return col.find_notes("")
+
+    assert await reg.run("iris2", read) == []
+    assert calls["n"] == 1
+    assert reg._users["iris2"].col is not closed_handle
+    assert reg.is_open("iris2")
+
+
+@pytest.mark.asyncio
+async def test_is_stale_matches_only_backend_type_never_exception_text(make_registry):
+    """The only healthy-handle fallback is exact InvalidInput TYPE identity.
+
+    The pinned wheel raises InvalidInput with EMPTY args for a closed handle,
+    so exception TEXT must never be matched: tool-layer messages can carry
+    user-controlled model/field names, and text matching classified benign
+    application errors (e.g. KeyError('CollectionNotOpen')) as stale."""
+    reg = make_registry()
+    await reg.run("hana", count_notes)
+    healthy = reg._users["hana"].col
+    assert healthy.db is not None
+
+    # Backend TYPE identity triggers the fallback regardless of args/text.
+    backend_error = InvalidInput("CollectionNotOpen", None, None, None)
+    assert backend_error.args == ()  # wheel shape: EMPTY args, no text to match
+    assert CollectionRegistry._is_stale(healthy, backend_error) is True
+    # Application exceptions on a healthy handle: NEVER stale, whatever text.
+    assert CollectionRegistry._is_stale(healthy, KeyError("CollectionNotOpen")) is False
+    assert CollectionRegistry._is_stale(healthy, ValueError("backend says CollectionNotOpen")) is False
+
+    # The handle check stays authoritative even for unrelated exception types.
+    healthy.close()
+    assert CollectionRegistry._is_stale(healthy, ValueError("unrelated")) is True
+
+
 # -- per-user idempotency ledgers ---------------------------------------------------
 
 
@@ -313,6 +405,8 @@ async def test_invalid_usernames_are_rejected_before_path_use(make_registry):
             reg.prune_backups(bad)
         with pytest.raises(ValueError):
             await reg.sync_user(bad, "e@example.com", "p")
+        with pytest.raises(ValueError):
+            await reg.drop_user(bad)
 
     # Nothing was created for the rejected names.
     assert not os.path.exists(os.path.join(reg.data_dir, "users"))
@@ -333,3 +427,63 @@ async def test_close_all_closes_everything_but_keeps_data_on_disk(make_registry)
 
     # Collections reopen transparently after shutdown with data intact.
     assert await reg.run("pat", count_notes) == 1
+
+
+# -- drop_user (user-deletion hook) ------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_drop_user_detaches_open_collection_and_ledger(make_registry):
+    """Deleted user loses state AND ledger, so a recreated username starts
+    fresh (regression: recreated usernames inherited the old open collection
+    handle and the old idempotency ledger)."""
+    reg = make_registry()
+    await reg.run("zara", add_basic_note, "old-zara-note", "back")
+    old_ledger = reg.ledger("zara")
+    await old_ledger.record_success("old-key", {"created_note_ids": [1]})
+    old_state = reg._users["zara"]
+
+    await reg.drop_user("zara")
+
+    assert "zara" not in reg._users  # cached state popped
+    assert not reg.is_open("zara")
+    assert "zara" not in reg.open_usernames()
+    assert "zara" not in reg._ledgers  # in-memory ledger popped
+
+    # Simulate the delete handler's archive step (production moves users/ and
+    # ledgers/ into deleted/<name>-<ts> before/around drop_user): the registry
+    # reopens whatever is on disk, so the old files must be out of the way for
+    # the fresh-collection guarantee.
+    os.rename(os.path.join(reg.data_dir, "users", "zara"), os.path.join(reg.data_dir, "archived-zara"))
+    os.rename(os.path.join(reg.data_dir, "ledgers", "zara"), os.path.join(reg.data_dir, "archived-ledgers-zara"))
+
+    # Recreated username: fresh registry state and a FRESH empty collection.
+    assert await reg.run("zara", count_notes) == 0
+    assert reg._users["zara"] is not old_state
+    new_ledger = reg.ledger("zara")
+    assert new_ledger is not old_ledger
+    assert await new_ledger.get("old-key") is None  # old entries not reloaded
+
+
+@pytest.mark.asyncio
+async def test_drop_user_unknown_username_is_a_noop(make_registry):
+    reg = make_registry()
+
+    await reg.drop_user("ghost")  # must not raise
+
+    assert not os.path.exists(os.path.join(reg.data_dir, "users", "ghost"))
+    assert not os.path.exists(os.path.join(reg.data_dir, "ledgers", "ghost"))
+
+
+@pytest.mark.asyncio
+async def test_drop_user_leaves_other_users_unaffected(make_registry):
+    reg = make_registry()
+    await reg.run("alice", add_basic_note, "alice-note", "back")
+    await reg.run("bob", add_basic_note, "bob-note", "back")
+
+    await reg.drop_user("bob")
+
+    assert reg.is_open("alice")  # never touched
+    fronts = await reg.run("alice", lambda col: [col.get_note(nid).fields[0] for nid in col.find_notes("")])
+    assert fronts == ["alice-note"]  # data intact
+    assert await reg.run("alice", count_notes) == 1

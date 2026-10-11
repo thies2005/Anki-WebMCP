@@ -6,6 +6,7 @@ byte-for-byte the ones the AnkiConnect-era suite asserted — that schema is the
 compatibility contract.
 """
 
+import logging
 import os
 
 import pytest
@@ -17,6 +18,7 @@ from src.collections import CollectionRegistry  # isort: skip
 from anki.notes import Note
 
 from src.errors import CollectionToolError
+from src.logging_util import RedactingFormatter
 from src.models import NoteInput
 from src.sync_manager import SyncManager
 from src.tools import decks as deck_tools
@@ -118,6 +120,29 @@ async def test_search_notes_offset_past_end_returns_empty_shape(env):
     assert res["returned_count"] == 0
     assert res["offset"] == 5
     assert res["notes"] == []
+
+
+@pytest.mark.asyncio
+async def test_search_notes_query_log_is_single_line(env, caplog):
+    """A newline in the client query cannot split the log record (CWE-117).
+
+    The call site logs the query with %r, so the repr escapes the newline and
+    the production-formatted output stays exactly one line.
+    """
+    reg, _ = env
+    caplog.set_level(logging.INFO)
+    res = await note_tools.search_notes(reg, "alice", query="deck:Default\nforged line")
+    assert res["total_matches"] == 0  # the search still runs, just finds nothing
+
+    recs = [
+        r for r in caplog.records
+        if r.name == "anki_mcp.tools.notes" and "Executing search_notes" in r.getMessage()
+    ]
+    assert len(recs) == 1  # exactly ONE record for this call
+    line = RedactingFormatter("%(message)s").format(recs[0])
+    assert "\n" not in line  # no forged second line
+    assert "\\n" in line  # newline repr-escaped
+    assert "forged line" in line  # content preserved inline, escaped
 
 
 # -- get_note -------------------------------------------------------------------
@@ -338,6 +363,98 @@ async def test_add_notes_empty_batch_rejected(env, tmp_path):
         await note_tools.add_notes(manager, reg, "alice", [])
     # Nothing may have been opened/created for the user by a rejected batch
     assert not os.path.exists(os.path.join(str(tmp_path), "users", "alice"))
+
+
+# -- add_notes pass-1 field validation (all-or-nothing batches) -------------------
+
+
+@pytest.mark.asyncio
+async def test_add_notes_unknown_field_rejected_before_write(env):
+    """An unknown field name fails deterministically in pass 1: no partial state.
+
+    Regression for partial-batch-failure-record-poisoning: the field check runs
+    BEFORE any col.add_note, so the 'failed' ledger record implies nothing was
+    applied (the wheel's KeyError can no longer fire mid-pass-2).
+    """
+    reg, manager = env
+    notes = [
+        NoteInput(deck_name="Default", model_name="Basic",
+                  fields={"Front": "q1", "Back": "a1", "BogusField": "x"})
+    ]
+    res = await note_tools.add_notes(manager, reg, "alice", notes, idempotency_key="K1")
+    assert res.success is False
+    assert res.local_status == "failed"
+    # Structured error: index, unknown fields, and the valid fields are named.
+    assert "Note index 0" in res.error
+    assert "BogusField" in res.error
+    assert "Front" in res.error and "Back" in res.error
+
+    # ZERO notes created.
+    count = await reg.run("alice", lambda col: len(col.find_notes("*")))
+    assert count == 0
+
+    # The ledger records the deterministic failure for the key...
+    entry = await reg.ledger("alice").get("K1")
+    assert entry is not None
+    assert entry["status"] == "failed"
+    assert "BogusField" in entry["error"]
+    # ...and a same-key retry deterministically replays it (nothing applied).
+    replay = await note_tools.add_notes(manager, reg, "alice", notes, idempotency_key="K1")
+    assert replay.success is False
+    assert "Idempotent operation replay" in replay.warnings[0]
+    count = await reg.run("alice", lambda col: len(col.find_notes("*")))
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_add_notes_valid_plus_unknown_field_batch_applies_nothing(env):
+    """A batch of [valid note, unknown-field note] applies NOTHING (all-or-nothing)."""
+    reg, manager = env
+    notes = [
+        NoteInput(deck_name="Default", model_name="Basic",
+                  fields={"Front": "valid-q", "Back": "a"}),
+        NoteInput(deck_name="Default", model_name="Basic",
+                  fields={"Front": "q2", "Back": "a2", "BogusField": "x"}),
+    ]
+    res = await note_tools.add_notes(manager, reg, "alice", notes)
+    assert res.success is False
+    assert "Note index 1" in res.error
+    assert "BogusField" in res.error
+    # The otherwise-valid note 0 was NOT applied either.
+    count = await reg.run("alice", lambda col: len(col.find_notes("*")))
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_add_notes_field_validation_precedes_duplicate_gate(env):
+    """Field validation is deterministic and runs before the duplicate check.
+
+    The duplicate gate itself is unchanged (covered by the duplicate tests
+    above); this pins only the precedence within pass 1.
+    """
+    reg, manager = env
+    await reg.run("alice", add_basic_note, "dup-q", "a")
+    notes = [
+        NoteInput(deck_name="Default", model_name="Basic",
+                  fields={"Front": "dup-q", "BogusField": "x"})
+    ]
+    res = await note_tools.add_notes(manager, reg, "alice", notes)
+    assert res.success is False
+    assert "BogusField" in res.error
+    assert "Duplicate check failed" not in res.error
+
+
+@pytest.mark.asyncio
+async def test_add_notes_all_valid_batch_still_applies_after_field_check(env):
+    """Sanity: the new pass-1 check does not reject valid field dicts."""
+    reg, manager = env
+    notes = [NoteInput(deck_name="Default", model_name="Basic",
+                       fields={"Front": "ok-q", "Back": "ok-a"})]
+    res = await note_tools.add_notes(manager, reg, "alice", notes, idempotency_key="KOK")
+    assert res.success is True
+    assert res.data["count"] == 1
+    entry = await reg.ledger("alice").get("KOK")
+    assert entry is not None and entry["status"] == "committed"
 
 
 # -- update_note_fields ----------------------------------------------------------

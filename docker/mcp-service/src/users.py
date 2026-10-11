@@ -142,6 +142,11 @@ class User:
     ankiweb_email: str = ""
     ankiweb_password: str = ""
     created_at: float = field(default_factory=time.time)
+    # Session-revocation epoch: web session cookies carry a signed issued-at
+    # stamp (src/webauth.py), and a cookie issued BEFORE this value is
+    # rejected. Bumped by set_password so a password reset evicts outstanding
+    # sessions. 0.0 (legacy records, no reset yet) accepts every cookie.
+    sessions_invalid_before: float = 0.0
 
 
 class UserStore:
@@ -192,6 +197,11 @@ class UserStore:
                     ankiweb_email=record.get("ankiweb_email", ""),
                     ankiweb_password=record.get("ankiweb_password", ""),
                     created_at=float(record.get("created_at", 0.0)),
+                    # Tolerant load: records written before the session epoch
+                    # existed simply start with "no revocation" (0.0).
+                    sessions_invalid_before=float(
+                        record.get("sessions_invalid_before", 0.0)
+                    ),
                 )
             except (KeyError, TypeError, ValueError) as e:
                 raise ValueError(
@@ -353,8 +363,13 @@ class UserStore:
         with self._lock:
             user = self._get_locked(username)
             user.password_hash = hash_password(new_password)
+            # Session revocation: stamp the epoch so web cookies issued before
+            # now stop verifying (main.get_session_user consults this via
+            # webauth.session_issued_before). This is the eviction step that
+            # makes a password reset actually terminate outstanding sessions.
+            user.sessions_invalid_before = time.time()
             self._save_atomic()
-        logger.info("Updated password for %r", username)
+        logger.info("Updated password for %r (older web sessions invalidated)", username)
 
     def set_ankiweb_credentials(self, username: str, email: str, password: str) -> None:
         with self._lock:
@@ -367,21 +382,45 @@ class UserStore:
     def set_role(self, username: str, role: str) -> None:
         """Promote/demote an account between ``"admin"`` and ``"user"``.
 
-        Raises ValueError for unknown usernames or an invalid role.
+        Raises ValueError for unknown usernames or an invalid role, and when a
+        demotion would leave zero admin accounts. The last-admin guard runs
+        under the same lock acquisition that commits the mutation, so
+        concurrent demotions cannot interleave check and commit and strip
+        every admin (handlers may keep a friendlier pre-check outside).
         """
         if role not in ROLES:
             raise ValueError(f"Invalid role {role!r}: must be one of {ROLES}")
         with self._lock:
             user = self._get_locked(username)
+            if (
+                user.role == "admin"
+                and role != "admin"
+                and sum(1 for u in self._users.values() if u.role == "admin") <= 1
+            ):
+                raise ValueError(
+                    f"Cannot demote {username!r}: it is the last admin account. "
+                    "Promote another account to admin first."
+                )
             user.role = role
             self._save_atomic()
         logger.info("Set role of %r to %r", username, role)
 
     def delete_user(self, username: str) -> bool:
-        """Remove the account record only; data directories are NOT touched here."""
+        """Remove the account record only; data directories are NOT touched here.
+
+        Raises ValueError when deleting would leave zero admin accounts (the
+        guard and the deletion commit atomically under the store lock).
+        """
         with self._lock:
-            if username not in self._users:
+            user = self._users.get(username)
+            if user is None:
                 return False
+            if user.role == "admin" and sum(
+                1 for u in self._users.values() if u.role == "admin"
+            ) <= 1:
+                raise ValueError(
+                    f"Cannot delete {username!r}: it is the last admin account."
+                )
             del self._users[username]
             self._save_atomic()
         logger.info("Deleted account %r (per-user data directories are untouched)", username)
