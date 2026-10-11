@@ -1,7 +1,7 @@
 """Data models and input validation schemas for Anki MCP service."""
 
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class NoteInput(BaseModel):
@@ -293,6 +293,74 @@ class CreateNoteTypeInput(BaseModel):
         if v is not None and not (1 <= len(v) <= 10):
             raise ValueError("Provide between 1 and 10 templates (or omit for the default).")
         return v
+
+
+class _NoteTypeChangeInputBase(BaseModel):
+    """Shared selection shape for preview_note_type_change / change_note_type.
+
+    Exactly one of ``note_ids`` or ``query`` selects the notes: an explicit ID
+    list or an Anki search string, never both and never neither.
+    """
+
+    new_note_type: str = Field(..., min_length=1, max_length=100, description="Target note type name (must already exist)")
+    note_ids: Optional[List[int]] = Field(None, description="Note IDs to change (1-2000 per request); mutually exclusive with query")
+    query: Optional[str] = Field(None, description="Anki search selecting the notes, e.g. 'note:Src3' or 'deck:Default'; mutually exclusive with note_ids")
+
+    @field_validator("new_note_type")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("Note type name must not be empty.")
+        return _reject_control_chars(s, "Note type name")
+
+    @field_validator("note_ids")
+    @classmethod
+    def validate_ids(cls, v: Optional[List[int]]) -> Optional[List[int]]:
+        if v is None:
+            return v
+        # Bound deviates from the shared _IdListInput 500 cap on purpose: a
+        # note-type change is ONE backend operation over the whole selection
+        # (a single change_notetype request), so per-request cost does not
+        # grow per ID the way per-item mutations (delete/tag) do; 2000 keeps
+        # a runaway client from repricing the whole collection in one call.
+        if not (1 <= len(v) <= 2000):
+            raise ValueError("Select between 1 and 2000 note IDs per request.")
+        for nid in v:
+            if nid <= 0:
+                raise ValueError("Note IDs must be positive integers.")
+        return v
+
+    @model_validator(mode="after")
+    def exactly_one_selection(self) -> "_NoteTypeChangeInputBase":
+        if (self.note_ids is None) == (self.query is None):
+            raise ValueError("Provide exactly one of note_ids or query.")
+        return self
+
+
+class PreviewNoteTypeChangeInput(_NoteTypeChangeInputBase):
+    """Input parameters for preview_note_type_change (read-only)."""
+
+
+class ChangeNoteTypeInput(_NoteTypeChangeInputBase):
+    """Input parameters for change_note_type tool (destructive: snapshots first)."""
+    # An empty dict normalizes to None (backend default mapping): "discard
+    # every field" is never a useful explicit request, and treating {} as
+    # "map positionally" keeps a half-typed call from becoming total data loss.
+    field_map: Optional[Dict[str, Optional[str]]] = Field(
+        None,
+        description="NEW field name -> OLD field name (or null to discard). Omitted: positional default; new fields not mentioned are discarded.",
+    )
+    template_map: Optional[Dict[str, Optional[str]]] = Field(
+        None,
+        description="NEW template name -> OLD template name (or null). Omitted: positional default; refused when either note type is a Cloze type.",
+    )
+    confirm: bool = Field(False, description="Must be true to actually change (run preview_note_type_change first; a pre-change-note-type snapshot is taken first)")
+    idempotency_key: Optional[str] = Field(
+        None,
+        max_length=256,
+        description="Optional unique key to prevent duplicate changes on network retries",
+    )
 
 
 # -- card tools ----------------------------------------------------------------------

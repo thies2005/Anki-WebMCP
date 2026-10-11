@@ -1,4 +1,4 @@
-"""Note searching, retrieval, creation, and updating tools.
+"""Note searching, retrieval, creation, updating, and note-type changing tools.
 
 All operations run against the calling user's collection via the
 ``CollectionRegistry`` (no AnkiConnect). Search/note reads replicate the
@@ -15,6 +15,7 @@ STRINGS at the storage layer while ``note.tags`` is a List[str] property;
 import logging
 from typing import Any, Dict, List, Optional
 
+from anki.consts import MODEL_CLOZE
 from anki.errors import NotFoundError
 from anki.notes import Note
 
@@ -437,4 +438,271 @@ async def create_note_type(
         username,
         operation_name="create_note_type",
         mutation_fn=_mutation,
+    )
+
+
+# -- note-type changing -------------------------------------------------------------
+
+
+def _resolve_change_selection(col, note_ids: Optional[List[int]], query: Optional[str]) -> List[int]:
+    """Resolve the selection to deduplicated note IDs of ONE note type.
+
+    The mixed-type check happens HERE in Python instead of by catching the
+    backend's error: a mixed selection makes ``get_single_notetype_of_notes``
+    raise ``InvalidInput`` with EMPTY args — the exact signature
+    ``CollectionRegistry._is_stale`` reads as a closed handle (it would reopen
+    the collection and re-run the closure once) — and the empty message tells
+    the caller nothing. One bounded ``notes`` query answers both questions.
+    """
+    if query is not None:
+        # Client-controlled search string: %r-escape in errors/logs (CWE-117).
+        nids = list(col.find_notes(query))
+        if not nids:
+            raise CollectionToolError(f"No notes matched query {query!r}; nothing to change.")
+        return nids
+    # Dedupe preserving order: a repeated ID would inflate the changed count
+    # and reappear twice in reports.
+    nids = list(dict.fromkeys(int(nid) for nid in note_ids))
+    placeholders = ",".join("?" * len(nids))
+    rows = col.db.all(f"SELECT id, mid FROM notes WHERE id IN ({placeholders})", *nids)
+    found = {row[0]: row[1] for row in rows}
+    missing = [nid for nid in nids if nid not in found]
+    if missing:
+        raise CollectionToolError(f"Cannot change note type: note(s) not found: {missing}")
+    if len(set(found.values())) > 1:
+        names = sorted(col.models.get(mid)["name"] for mid in set(found.values()))
+        raise CollectionToolError(
+            f"Selection spans multiple note types ({', '.join(names)}); "
+            "change each note type in a separate call."
+        )
+    return nids
+
+
+def _resolve_change_maps(
+    col,
+    old_ntid,
+    new_note_type: str,
+    note_ids: List[int],
+    field_map: Optional[Dict[str, Optional[str]]],
+    template_map: Optional[Dict[str, Optional[str]]],
+):
+    """Validate both maps and build the backend request (shared by preview/mutation).
+
+    Returns ``(request, old_name, new_name, is_cloze, resolved_field_map,
+    resolved_template_map, warnings)``. ``request`` is the wheel's prefilled
+    ``ChangeNotetypeRequest`` with the selection extended and both maps
+    applied; fetching it fresh per call keeps ``current_schema`` current at
+    apply time. All validation raises ``CollectionToolError`` BEFORE anything
+    is written — the registry would mistake a backend ``InvalidInput`` for a
+    stale handle and re-run the whole closure once.
+
+    Map semantics (wheel ``change_notetype_of_notes``): ``new_fields`` /
+    ``new_templates`` are lists indexed by NEW position, each value an index
+    into the OLD type (-1 discards). With cloze on either side the request
+    carries ``is_cloze`` and an EMPTY template list, so a template_map is
+    refused outright.
+    """
+    new_nt = col.models.by_name(new_note_type)
+    if new_nt is None:
+        available = sorted(m.name for m in col.models.all_names_and_ids())
+        raise CollectionToolError(
+            f"Unknown note type {new_note_type!r}. Available models: {available}"
+        )
+    info = col.models.change_notetype_info(old_notetype_id=old_ntid, new_notetype_id=new_nt["id"])
+    old_nt = col.models.get(old_ntid)
+    old_name = info.old_notetype_name
+    new_name = new_nt["name"]
+    is_cloze = old_nt["type"] == MODEL_CLOZE or new_nt["type"] == MODEL_CLOZE
+
+    old_fields = list(info.old_field_names)
+    new_fields = list(info.new_field_names)
+    old_tmpls = [t["name"] for t in old_nt["tmpls"]]
+    new_tmpls = [t["name"] for t in new_nt["tmpls"]]
+
+    def _map_side(what, mapping, new_names, old_names, default_ords):
+        """Turn name->name-or-None into NEW-position -> OLD-index (-1 discards).
+
+        ``mapping=None`` keeps the backend's positional default; an explicit
+        mapping must name every key/value in the right type and never target
+        one old name twice (the desktop dialog forbids duplicates too — both
+        sources would collapse into one field).
+        """
+        if mapping is None:
+            resolved = {}
+            for pos, old_ord in enumerate(default_ords):
+                resolved[new_names[pos]] = old_names[old_ord] if old_ord >= 0 else None
+            return list(default_ords), resolved
+        bad_keys = sorted(k for k in mapping if k not in new_names)
+        if bad_keys:
+            raise CollectionToolError(
+                f"Unknown {what} name(s) {bad_keys} of the NEW note type {new_name!r}. "
+                f"Valid {what} names for {new_name!r}: {sorted(new_names)}."
+            )
+        bad_vals = sorted(
+            v for v in mapping.values() if v is not None and v not in old_names
+        )
+        if bad_vals:
+            raise CollectionToolError(
+                f"Unknown {what} name(s) {bad_vals} of the OLD note type {old_name!r}. "
+                f"Valid {what} names for {old_name!r}: {sorted(old_names)} (use null to discard)."
+            )
+        targets = [v for v in mapping.values() if v is not None]
+        duplicated = sorted({v for v in targets if targets.count(v) > 1})
+        if duplicated:
+            raise CollectionToolError(
+                f"{what}_map maps multiple NEW {what}s to the same OLD "
+                f"{what} {duplicated}; each old {what} may feed at most one new "
+                f"{what} (mapping two onto one would silently destroy content)."
+            )
+        ords = []
+        resolved = {}
+        for pos, name in enumerate(new_names):
+            target = mapping.get(name)
+            resolved[name] = target
+            ords.append(old_names.index(target) if target is not None else -1)
+        return ords, resolved
+
+    field_ords, resolved_fields = _map_side(
+        "field", field_map, new_fields, old_fields, list(info.input.new_fields)
+    )
+    if is_cloze:
+        if template_map:
+            raise CollectionToolError(
+                "template_map is not supported when either note type is a Cloze type: "
+                "cloze cards all render through the single cloze template, so the "
+                "wheel requires an empty template list."
+            )
+        template_ords = []
+        resolved_tmpls = {}
+    else:
+        template_ords, resolved_tmpls = _map_side(
+            "template", template_map, new_tmpls, old_tmpls, list(info.input.new_templates)
+        )
+
+    warnings = []
+    discarded_fields = [f for f in old_fields if f not in set(resolved_fields.values()) - {None}]
+    for name in discarded_fields:
+        warnings.append(
+            f"Field {name!r} of {old_name!r} is not mapped: its content is discarded in every changed note."
+        )
+    if not is_cloze:
+        for name in old_tmpls:
+            if name not in set(resolved_tmpls.values()) - {None}:
+                warnings.append(
+                    f"Template {name!r} of {old_name!r} has no mapping: cards generated from it are deleted."
+                )
+
+    request = info.input
+    request.note_ids.extend(note_ids)
+    request.new_fields[:] = field_ords
+    request.new_templates[:] = template_ords
+    return request, old_name, new_name, is_cloze, resolved_fields, resolved_tmpls, warnings
+
+
+async def preview_note_type_change(
+    registry,
+    username: str,
+    new_note_type: str,
+    note_ids: Optional[List[int]] = None,
+    query: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Preview a note-type change (read-only): resolved maps and discard warnings.
+
+    The exact resolver ``change_note_type`` runs, so what the preview shows is
+    what the mutation would do — including which old content is discarded.
+    """
+    logger.info(
+        "Executing preview_note_type_change for %r: new_note_type=%r (%d note id(s), query=%r)",
+        username, new_note_type, len(note_ids) if note_ids else 0, query,
+    )
+
+    def _preview(col) -> Dict[str, Any]:
+        nids = _resolve_change_selection(col, note_ids, query)
+        # Maps are None here: the preview always shows the change AS THE
+        # MUTATION WOULD APPLY IT with the backend's default mapping (the
+        # mutation's explicit maps reuse the exact same resolver).
+        _request, old_name, new_name, is_cloze, fields, tmpls, warnings = _resolve_change_maps(
+            col, col.models.get_single_notetype_of_notes(nids),
+            new_note_type, nids, None, None,
+        )
+        return {
+            "old_note_type": old_name,
+            "new_note_type": new_name,
+            "is_cloze": is_cloze,
+            "note_count": len(nids),
+            "field_map": fields,
+            "template_map": tmpls,
+            "warnings": warnings,
+        }
+
+    return await registry.run(username, _preview)
+
+
+async def change_note_type(
+    sync_manager: SyncManager,
+    registry,
+    username: str,
+    new_note_type: str,
+    note_ids: Optional[List[int]] = None,
+    query: Optional[str] = None,
+    field_map: Optional[Dict[str, Optional[str]]] = None,
+    template_map: Optional[Dict[str, Optional[str]]] = None,
+    confirm: bool = False,
+    idempotency_key: Optional[str] = None,
+) -> MutationResponse:
+    """Change the note type of selected notes after a fail-closed pre-mutation snapshot.
+
+    Unmapped old content is discarded and cards regenerate on the new note
+    type (cards of unmapped old templates are deleted), so this sits behind
+    the confirm gate like delete_notes. Validation runs before the snapshot:
+    a bad map must fail the request without ever reaching the backend.
+    """
+    field_map = field_map or None
+    template_map = template_map or None
+    if not confirm:
+        logger.info("change_note_type for %r skipped: confirm=False", username)
+        return MutationResponse(
+            success=False,
+            local_status="skipped",
+            sync_status=SyncStatus(),
+            error="This operation permanently changes the note type of the selected notes, "
+            "discarding content that is not mapped onto the new type; run "
+            "preview_note_type_change first, then pass confirm=true to proceed "
+            "(a pre-change-note-type snapshot backup is taken first).",
+        )
+    logger.info(
+        "Executing change_note_type for %r: new_note_type=%r (%d note id(s), query=%r)",
+        username, new_note_type, len(note_ids) if note_ids else 0, query,
+    )
+
+    def _change(col) -> Dict[str, Any]:
+        # Re-resolve and validate INSIDE the closure: the schema may have moved
+        # since the request was built, and current_schema must be current at
+        # apply time (info is fetched fresh here).
+        nids = _resolve_change_selection(col, note_ids, query)
+        request, old_name, new_name, is_cloze, fields, tmpls, _warnings = _resolve_change_maps(
+            col, col.models.get_single_notetype_of_notes(nids),
+            new_note_type, nids, field_map, template_map,
+        )
+        # Fail-closed snapshot FIRST: if it raises, nothing is changed.
+        registry.snapshot_locked(col, username, "pre-change-note-type")
+        col.models.change_notetype_of_notes(request)
+        return {
+            "old_note_type": old_name,
+            "new_note_type": new_name,
+            "is_cloze": is_cloze,
+            "changed": len(nids),
+            "field_map": fields,
+            "template_map": tmpls,
+            "snapshot_reason": "pre-change-note-type",
+        }
+
+    async def _mutation() -> Dict[str, Any]:
+        return await registry.run(username, _change)
+
+    return await sync_manager.execute_mutation(
+        username,
+        operation_name="change_note_type",
+        mutation_fn=_mutation,
+        idempotency_key=idempotency_key,
     )

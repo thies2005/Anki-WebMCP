@@ -150,6 +150,17 @@ async def test_search_notes_tool_schema_exposes_only_real_arguments(app_with_use
             payload = _parse_mcp_response(list_res)
             tools = {t["name"]: t for t in payload["result"]["tools"]}
             assert set(tools["search_notes"]["inputSchema"]["properties"]) == {"query", "limit", "offset"}
+            # The note-type change pair exposes exactly their real arguments —
+            # in particular no ``ctx`` leak and no auth state.
+            assert set(tools["preview_note_type_change"]["inputSchema"]["properties"]) == {
+                "new_note_type", "note_ids", "query",
+            }
+            assert set(tools["change_note_type"]["inputSchema"]["properties"]) == {
+                "new_note_type", "note_ids", "query", "field_map", "template_map",
+                "confirm", "idempotency_key",
+            }
+            # The read-only preview never carries the local-until-synced suffix.
+            assert "sync_collection" not in tools["preview_note_type_change"]["description"]
 
 
 @pytest.mark.asyncio
@@ -267,12 +278,13 @@ async def test_initialize_result_carries_sync_guidance_instructions(app_with_use
             assert "AnkiWeb" in instructions
 
 
-# Every tool that changes collection state; each description must tell the
-# model that the change is local until sync_collection runs.
+# Every tool that changes collection state (16 as of change_note_type); each
+# description must tell the model that the change is local until
+# sync_collection runs.
 MUTATING_TOOLS = {
     "add_notes", "update_note_fields", "add_tags", "remove_tags",
     "create_deck", "rename_deck", "delete_deck", "delete_notes",
-    "create_note_type", "suspend_cards", "unsuspend_cards",
+    "create_note_type", "change_note_type", "suspend_cards", "unsuspend_cards",
     "set_due_date", "move_cards", "answer_card", "store_media_file",
 }
 

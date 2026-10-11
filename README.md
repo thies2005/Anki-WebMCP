@@ -334,8 +334,10 @@ All tools operate on the **authenticated user's** collection — the token decid
 | `store_media_file` | `filename: string`<br>`data_base64: string` | Stores a media file (standard base64). **Decoded size cap: 4 MiB**; returns the actual stored name. |
 | `get_media_file` | `filename: string` | Reads a media file back as base64 (files over 4 MiB are refused). |
 | `list_media_files` | `limit?: int (default 200)` | Lists media filenames (sorted), capped at the requested limit. |
+| `preview_note_type_change` | `new_note_type: string`<br>`note_ids?: list[int]`<br>`query?: string` (exactly one of note_ids/query) | Read-only preview of a note-type change: old/new type names, the resolved field/template mapping, and warnings listing every old field whose content would be discarded and every old template whose cards would be deleted. Run this before `change_note_type`. |
+| `change_note_type` | `new_note_type: string`<br>`note_ids?: list[int]` (1-2000) or `query?: string`<br>`field_map?: map`<br>`template_map?: map`<br>`confirm: bool`<br>`idempotency_key?: string` | Moves notes to another note type with an explicit field/template mapping (new name → old name, or null to discard; omitted maps use the positional default). Unmapped old content is **discarded** and cards regenerate on the new type. *Destructive — see note below.* |
 
-*Destructive tools* (`rename_deck`, `delete_deck`, `delete_notes`) require `confirm=true` **and always create a snapshot in `backups/` first** — if the snapshot fails, the operation is aborted (fail-closed), so every destructive change stays reversible from the portal's Version history. Raw SQL execution and arbitrary add-on passthrough remain deliberately omitted to preserve collection integrity.
+*Destructive tools* (`rename_deck`, `delete_deck`, `delete_notes`, `change_note_type`) require `confirm=true` **and always create a snapshot in `backups/` first** — if the snapshot fails, the operation is aborted (fail-closed), so every destructive change stays reversible from the portal's Version history. Raw SQL execution and arbitrary add-on passthrough remain deliberately omitted to preserve collection integrity.
 
 ---
 
@@ -441,7 +443,7 @@ PYTHONPATH=docker/mcp-service pytest tests/ -v
 - [x] Service starts fail-closed: refuses to run without `SESSION_SECRET`, and without bootstrap credentials on an empty store.
 - [x] Streamable HTTP MCP server on port 8000 requires a valid per-user bearer token.
 - [x] Per-user isolation verified at protocol level: two users' sessions on one instance see only their own notes and collections.
-- [x] All 26 MCP tools execute against real per-user collections with per-user locking and ledger-backed idempotency (destructive ones snapshot-or-abort).
+- [x] All 28 MCP tools execute against real per-user collections with per-user locking and ledger-backed idempotency (destructive ones snapshot-or-abort).
 - [x] `/health` reports 200 healthy and 503 degraded (users store unavailable / data dir not writable).
 
 ---

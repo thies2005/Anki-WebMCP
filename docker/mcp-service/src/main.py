@@ -33,6 +33,7 @@ from .models import (
     AddNotesInput,
     AddTagsInput,
     AnswerCardInput,
+    ChangeNoteTypeInput,
     CreateDeckInput,
     CreateNoteTypeInput,
     DeleteDeckInput,
@@ -43,6 +44,7 @@ from .models import (
     GetNoteInput,
     ListMediaInput,
     MoveCardsInput,
+    PreviewNoteTypeChangeInput,
     RemoveTagsInput,
     RenameDeckInput,
     ReviewQueueInput,
@@ -1376,6 +1378,69 @@ def create_app(custom_settings: Optional[Settings] = None):
         try:
             parsed = ListMediaInput(limit=limit)
             return await media_tools.list_media_files(tool_registry, username, parsed.limit)
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 27. preview_note_type_change
+    @mcp.tool(
+        description="Preview changing the note type of selected notes (read-only): returns the old "
+        "and new note type names, the resolved field/template mapping, and warnings listing every "
+        "old field whose content would be discarded and every old template whose cards would be "
+        "deleted. Unmapped old content is discarded and cards regenerate on the new note type; "
+        "always run this before change_note_type."
+    )
+    async def preview_note_type_change(
+        new_note_type: str,
+        note_ids: Optional[List[int]] = None,
+        query: Optional[str] = None,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = PreviewNoteTypeChangeInput(new_note_type=new_note_type, note_ids=note_ids, query=query)
+            return await note_tools.preview_note_type_change(
+                tool_registry, username, parsed.new_note_type, parsed.note_ids, parsed.query
+            )
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 28. change_note_type
+    @mcp.tool(
+        description="Change the note type of selected notes with an explicit field/template mapping "
+        "(new field name -> old field name, or null to discard; omitted maps use the positional "
+        "default). DESTRUCTIVE: unmapped old content is discarded, cards regenerate on the new note "
+        "type, and cards of unmapped old templates are deleted — run preview_note_type_change first. "
+        "Requires confirm=true; a pre-change-note-type snapshot backup is taken first and the change "
+        "is aborted if it fails."
+        + LOCAL_UNTIL_SYNCED_SUFFIX
+    )
+    async def change_note_type(
+        new_note_type: str,
+        note_ids: Optional[List[int]] = None,
+        query: Optional[str] = None,
+        field_map: Optional[Dict[str, Optional[str]]] = None,
+        template_map: Optional[Dict[str, Optional[str]]] = None,
+        confirm: bool = False,
+        idempotency_key: Optional[str] = None,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = ChangeNoteTypeInput(
+                new_note_type=new_note_type, note_ids=note_ids, query=query,
+                field_map=field_map, template_map=template_map,
+                confirm=confirm, idempotency_key=idempotency_key,
+            )
+            res = await note_tools.change_note_type(
+                tool_sync_manager, tool_registry, username,
+                parsed.new_note_type, parsed.note_ids, parsed.query,
+                parsed.field_map, parsed.template_map, parsed.confirm, parsed.idempotency_key,
+            )
+            return res.model_dump()
         except Exception as e:
             return _tool_error_response(e)
 

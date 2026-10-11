@@ -84,7 +84,7 @@ logger = logging.getLogger("anki_mcp.collections")
 # Reasons embedded into backup filenames as backup-<timestamp>-<reason>.colpkg.
 # The reason travels in the NAME so a backup's provenance survives on disk and
 # list_backups() can report it without a sidecar index.
-BACKUP_REASONS = ("pre-sync", "pre-delete-notes", "pre-delete-deck", "pre-rename-deck", "pre-restore", "manual")
+BACKUP_REASONS = ("pre-sync", "pre-delete-notes", "pre-change-note-type", "pre-delete-deck", "pre-rename-deck", "pre-restore", "manual")
 
 # backup-<timestamp>[-<reason>].colpkg. The timestamp is second-resolution and
 # zero-padded, so lexicographic order IS chronological order (prune_backups
