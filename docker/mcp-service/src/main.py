@@ -1016,7 +1016,7 @@ def _tools_page(
             f"<tr><td>{html.escape(str(entry.get('ts', '')))}</td>"
             f"<td><code>{html.escape(str(entry.get('tool', '')))}</code></td>"
             f"<td>{outcome}</td>"
-            f"<td>{entry.get('duration_ms', 0)}</td>"
+            f"<td>{html.escape(str(entry.get('duration_ms', 0)))}</td>"
             f"<td>{error}</td></tr>"
         )
     global_note = (
@@ -2997,7 +2997,12 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _redirect_with_flash(
                 "/portal/tools", f"Rule rejected: {e}", kind="error"
             )
-        await run_in_threadpool(store.set_disabled_tool_patterns, user.username, patterns)
+        try:
+            await run_in_threadpool(store.set_disabled_tool_patterns, user.username, patterns)
+        except ValueError as e:
+            # Account deleted between the session check and the mutation;
+            # mirror the sibling portal handlers' 400-instead-of-500 posture.
+            return _redirect_with_flash("/portal/tools", f"Could not save rules: {e}", kind="error")
         logger.info(
             "Portal tool rules updated for %r: %d pattern(s)", user.username, len(patterns)
         )

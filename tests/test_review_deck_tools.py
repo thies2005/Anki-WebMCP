@@ -145,6 +145,16 @@ async def test_answer_card_selection_is_restored(korean_cards):
     assert await _current_deck_id(reg, "riri") == before
 
 
+@pytest.mark.asyncio
+async def test_queue_total_counts_beyond_fetch_limit(korean_cards):
+    """total_queue_count is the TRUE remaining queue, not the fetch-limited
+    prefix: 3 queued cards fetched with limit=1 must still report 3."""
+    reg, _ = korean_cards
+    q = await card_tools.get_review_queue(reg, "riri", limit=1, deck="Korean::Vocab")
+    assert len(q["cards"]) == 1
+    assert q["total_queue_count"] == 3
+
+
 # -- parent decks include subdecks ----------------------------------------------------
 
 

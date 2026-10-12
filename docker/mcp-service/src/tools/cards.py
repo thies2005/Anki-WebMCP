@@ -331,15 +331,14 @@ async def get_review_queue(
                     "question": question,
                 }
             )
-        # The wheel's QueuedCards protobuf has no card_count attribute
-        # (probed); the fetched list's length is the honest fallback.
-        total = getattr(out, "card_count", None)
-        if total is None:
-            total = len(out.cards)
+        # The wheel's QueuedCards proto (26.9.3, probed) has no card_count
+        # attribute; the true remaining queue is the sum of the three per-kind
+        # counts (len(out.cards) is only the fetch-limited prefix).
+        total = int(out.new_count) + int(out.learning_count) + int(out.review_count)
         return {
             "deck_id": deck_id,
             "deck_name": col.decks.name(deck_id),
-            "total_queue_count": int(total),
+            "total_queue_count": total,
             "cards": items,
         }
 
@@ -378,10 +377,10 @@ async def answer_card(
             queued = next((q for q in out.cards if q.card.id == card_id), None)
             if queued is None:
                 raise CollectionToolError(
-                    f"card {card_id} is not currently in the review queue (not due), or it sits "
-                    f"deeper than the first 50 queued cards of deck "
-                    f"{col.decks.name(deck_id)!r}. Call get_review_queue with the same deck "
-                    "to see what is currently queued."
+                    f"card {card_id} is not currently in the review queue (not due or not "
+                    f"scheduled under today's limits), or it sits deeper than the first 50 "
+                    f"queued cards of deck {col.decks.name(deck_id)!r}. Call get_review_queue "
+                    "with the same deck to see what is currently queued."
                 )
             card = col.get_card(card_id)
             card.start_timer()
