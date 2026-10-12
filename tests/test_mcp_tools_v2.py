@@ -530,7 +530,10 @@ async def test_review_queue_contains_new_card_and_answer_card_answers_it(env):
     cid = (await card_tools.find_cards(reg, "omar", "deck:Default"))["cards"][0]["card_id"]
 
     q = await card_tools.get_review_queue(reg, "omar")
-    assert set(q) == {"total_queue_count", "cards"}
+    # deck_id/deck_name name the deck the queue was built from so an empty
+    # queue is self-explaining (deck-scoped review fix).
+    assert set(q) == {"total_queue_count", "cards", "deck_id", "deck_name"}
+    assert q["deck_name"] == "Default"
     assert q["total_queue_count"] >= 1
     entry = next(c for c in q["cards"] if c["card_id"] == cid)
     assert set(entry) == {"card_id", "note_id", "deck_name", "question"}
@@ -559,11 +562,19 @@ async def test_review_queue_contains_new_card_and_answer_card_answers_it(env):
 async def test_answer_card_refuses_card_not_in_queue(env):
     reg, manager = env
     await reg.run("omar", add_basic_note, "q", "a")
+    cid = (await card_tools.find_cards(reg, "omar", "deck:Default"))["cards"][0]["card_id"]
 
+    # A nonexistent card is refused with its own clearer error (the card's
+    # deck cannot even be resolved).
     res = await card_tools.answer_card(manager, reg, "omar", 987654321, 3)
-
     assert res.success is False
-    assert "not currently in the review queue" in res.error
+    assert "not found" in res.error
+
+    # A REAL card that is not due: suspend it, and the queue refusal fires.
+    await card_tools.suspend_cards(manager, reg, "omar", [cid])
+    res2 = await card_tools.answer_card(manager, reg, "omar", cid, 3)
+    assert res2.success is False
+    assert "not currently in the review queue" in res2.error
 
 
 def test_answer_card_rating_input_bounded():

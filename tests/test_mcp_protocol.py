@@ -123,8 +123,13 @@ async def test_add_notes_empty_batch_returns_structured_protocol_error(
             structured = json.loads(text)
             assert structured.get("success") is False
             assert structured.get("error_type") == "ValidationError"
-            # No collection may have been opened/created by the rejected batch
-            assert not os.path.exists(os.path.join(settings.data_dir, "users", "alice"))
+            # No collection may have been opened/created by the rejected batch.
+            # (The user directory itself may exist since the tool-usage log
+            # moved under users/<name>/ — the collection file is the precise
+            # invariant.)
+            assert not os.path.isfile(
+                os.path.join(settings.data_dir, "users", "alice", "collection.anki2")
+            )
 
 
 # -- scenario 3: invalid search limit ------------------------------------------------

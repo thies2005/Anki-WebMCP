@@ -3,6 +3,7 @@
 import asyncio
 import anyio
 from contextlib import asynccontextmanager, suppress
+import functools
 import hashlib
 import html
 import hmac
@@ -84,6 +85,8 @@ from .tools import notes as note_tools
 from .tools import notetypes as notetype_tools
 from .tools import stats as stats_tools
 from .tools import sync as sync_tools
+from .toollog import ToolUsageLogger
+from .toolpolicy import ToolPolicyStore, matching_rule, parse_pattern_text
 from .users import USERNAME_RE, User, UserStore
 from .webauth import (
     SESSION_COOKIE_NAME,
@@ -120,7 +123,11 @@ SERVER_INSTRUCTIONS = (
     "call sync_collection to push them to AnkiWeb and pull changes made on "
     "other devices; call it before reading when data from other devices must "
     "be current. sync_collection requires AnkiWeb credentials saved in the web "
-    "portal's account settings."
+    "portal's account settings. Review tools are deck-scoped: pass deck to "
+    "get_review_queue to review a specific deck (subdecks included; without "
+    "it the currently selected deck is used, which is 'Default' and usually "
+    "empty on a fresh collection); answer_card can answer any card currently "
+    "due in its own deck."
 )
 
 # Appended to every mutating tool's description so the local-only rule also
@@ -128,6 +135,54 @@ SERVER_INSTRUCTIONS = (
 LOCAL_UNTIL_SYNCED_SUFFIX = (
     " Changes stay local until sync_collection pushes them to AnkiWeb."
 )
+
+# Reference grouping of every registered tool, for the portal/admin rule UIs.
+# Pinned by tests against tools/list so a renamed or newly added tool cannot
+# silently drop out of the disablement UI.
+TOOL_REFERENCE_GROUPS: List[Tuple[str, List[str]]] = [
+    ("Decks", [
+        "list_decks", "create_deck", "rename_deck", "delete_deck",
+        "get_deck_config", "update_deck_config",
+    ]),
+    ("Notes", [
+        "search_notes", "get_note", "add_notes", "update_note_fields",
+        "add_tags", "remove_tags", "delete_notes", "find_and_replace",
+        "find_duplicates",
+    ]),
+    ("Note types", [
+        "list_note_types", "create_note_type", "get_note_type", "update_note_type",
+        "add_note_type_field", "remove_note_type_field", "rename_note_type_field",
+        "reposition_note_type_field", "add_note_type_template",
+        "remove_note_type_template", "reposition_note_type_template",
+        "delete_note_type", "restore_note_type_to_stock", "preview_note_type_change",
+        "change_note_type",
+    ]),
+    ("Cards", [
+        "find_cards", "get_card", "suspend_cards", "unsuspend_cards",
+        "set_due_date", "move_cards", "set_card_flags", "bury_cards",
+        "unbury_cards", "reposition_new_cards",
+    ]),
+    ("Review", ["get_review_queue", "answer_card"]),
+    ("Media", ["store_media_file", "get_media_file", "list_media_files"]),
+    ("Sync & stats", ["get_collection_stats", "sync_collection"]),
+]
+
+
+def _tool_status_chip(tool_name: str, global_patterns: List[str], user_patterns: List[str]) -> str:
+    """Live Enabled/Disabled chip for the tools reference table."""
+    rule = matching_rule(tool_name, global_patterns)
+    if rule is not None:
+        return (
+            '<span class="chip off-global">disabled: global rule '
+            f"{html.escape(rule)}</span>"
+        )
+    rule = matching_rule(tool_name, user_patterns)
+    if rule is not None:
+        return (
+            '<span class="chip off-user">disabled: your rule '
+            f"{html.escape(rule)}</span>"
+        )
+    return '<span class="chip on">enabled</span>'
 
 # Globals initialized in factory
 settings: Settings = get_settings()
@@ -347,6 +402,12 @@ _APP_CSS = """
   .muted { color: #666; }
   .ok { color: #14532d; }
   .error { color: #b00020; }
+  textarea { font-family: ui-monospace, monospace; padding: 0.35rem; width: 100%; }
+  .chip { display: inline-block; border-radius: 999px; padding: 0.05rem 0.55rem;
+          font-size: 0.8rem; border: 1px solid #e3e3e3; white-space: nowrap; }
+  .chip.on { background: #eef7ee; color: #14532d; border-color: #b7d7b7; }
+  .chip.off-user { background: #fdf3e7; color: #7c4a03; border-color: #e5cfa4; }
+  .chip.off-global { background: #fdeeee; color: #b00020; border-color: #e5b4b4; }
   code { background: #f4f4f4; padding: 0.1rem 0.35rem; border-radius: 4px; overflow-wrap: anywhere; }
   pre.syncout { background: #fafafa; border: 1px solid #e3e3e3; border-radius: 4px;
                 padding: 0.6rem; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -461,6 +522,7 @@ def _app_header(user: User, csrf_token: str) -> str:
   <nav>
     <span>Logged in as <strong>{html.escape(user.username)}</strong></span>
     <a href="/">Portal</a>
+    <a href="/portal/tools">Tools</a>
     {admin_link}
     <form method="post" action="/logout">
       <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
@@ -808,13 +870,19 @@ def _sync_result_page(result: Dict[str, Any]) -> str:
 
 
 def _admin_page(
-    user: User, csrf_token: str, flash: Optional[Tuple[str, str]], accounts: List[User]
+    user: User,
+    csrf_token: str,
+    flash: Optional[Tuple[str, str]],
+    accounts: List[User],
+    global_patterns: Optional[List[str]] = None,
 ) -> str:
     """Admin console: create-user form plus one action cell per account.
 
     The table shows no secrets: credentials are shown as a masked email and the
-    token column only says whether a token exists.
+    token column only says whether a token exists. The global tool-rules
+    section edits the deny layer applied to EVERY account (admins included).
     """
+    global_patterns = global_patterns if global_patterns is not None else []
     hidden = (
         f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">'
         '<input type="hidden" name="username" value="{name}">'
@@ -887,8 +955,97 @@ def _admin_page(
   </table></div>
   <p class="muted">Deleting a user requires typing their username to confirm; their data
   directory is moved under <code>deleted/</code>, never removed.</p>
+</section>
+<section>
+  <h2>Global tool rules</h2>
+  <p class="muted">These disable rules apply to EVERY account (admins included) and cannot be
+  overridden: users may add their own rules on their Tools page, but nothing can re-enable a
+  tool matched here. Same grammar as user rules &mdash; exact tool name or trailing-* prefix.</p>
+  {_tool_rules_form('/admin/tool-rules', csrf_token, global_patterns, 'Save global rules')}
+  {_tool_reference_html(global_patterns, [])}
 </section>"""
     return _page("Anki MCP - Admin", body, css=_APP_CSS, main_class="app")
+
+
+def _tool_rules_form(
+    action: str, csrf_token: str, patterns: List[str], button_label: str
+) -> str:
+    """Shared rules editor for the portal (own rules) and admin (global)."""
+    return f"""<form method="post" action="{html.escape(action)}">
+  <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
+  <label for="patterns">One rule per line &mdash; an exact tool name (sync_collection) or a trailing-* prefix (delete_*)</label>
+  <textarea id="patterns" name="patterns" rows="4" spellcheck="false">{html.escape(chr(10).join(patterns))}</textarea>
+  <button type="submit">{html.escape(button_label)}</button>
+</form>"""
+
+
+def _tool_reference_html(global_patterns: List[str], user_patterns: List[str]) -> str:
+    """Grouped per-tool status table (used by both the Tools page and admin)."""
+    sections = []
+    for group, names in TOOL_REFERENCE_GROUPS:
+        rows = "".join(
+            f'<tr><td><code>{html.escape(n)}</code></td>'
+            f"<td>{_tool_status_chip(n, global_patterns, user_patterns)}</td></tr>"
+            for n in names
+        )
+        sections.append(
+            f'<h3>{html.escape(group)}</h3>'
+            '<div class="tablewrap"><table><thead><tr><th>Tool</th><th>Status</th></tr></thead>'
+            f"<tbody>{rows}</tbody></table></div>"
+        )
+    return "\n".join(sections)
+
+
+def _tools_page(
+    user: User,
+    csrf_token: str,
+    flash: Optional[Tuple[str, str]],
+    usage: List[Dict[str, Any]],
+    global_patterns: List[str],
+) -> str:
+    """Portal Tools page: recent tool activity, the account's own disable
+    rules, and a live status table of every tool. Global (admin) rules are
+    shown read-only: they apply to every account and cannot be overridden."""
+    activity_rows = []
+    for entry in usage:
+        outcome = (
+            '<span class="ok">ok</span>' if entry.get("ok") else '<span class="error">error</span>'
+        )
+        error = html.escape(str(entry.get("error") or ""))
+        activity_rows.append(
+            f"<tr><td>{html.escape(str(entry.get('ts', '')))}</td>"
+            f"<td><code>{html.escape(str(entry.get('tool', '')))}</code></td>"
+            f"<td>{outcome}</td>"
+            f"<td>{entry.get('duration_ms', 0)}</td>"
+            f"<td>{error}</td></tr>"
+        )
+    global_note = (
+        f"Global rules currently in effect: <code>{html.escape(', '.join(global_patterns))}</code>. "
+        "They are set by the server admin and cannot be overridden from this page."
+        if global_patterns
+        else "No global rules are currently set by the server admin."
+    )
+    body = f"""{_app_header(user, csrf_token)}
+{_flash_html(flash)}
+<section>
+  <h2>Tool activity</h2>
+  <p class="muted">The most recent MCP tool calls on your account (reads included, refusals too).</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Time (UTC)</th><th>Tool</th><th>Result</th><th>ms</th><th>Error</th></tr></thead>
+    <tbody>{''.join(activity_rows) or '<tr><td colspan="5">No tool calls recorded yet.</td></tr>'}</tbody>
+  </table></div>
+</section>
+<section>
+  <h2>Your disabled-tool rules</h2>
+  <p class="muted">These rules apply only to your account's MCP token and OAuth connections. A matching tool call is refused with an explanatory error. Deny-only: a tool disabled here or by a global rule cannot be re-enabled by another rule.</p>
+  {_tool_rules_form('/portal/tools/disabled', csrf_token, user.disabled_tool_patterns, 'Save rules')}
+</section>
+<section>
+  <h2>All tools</h2>
+  <p class="muted">{global_note}</p>
+  {_tool_reference_html(global_patterns, user.disabled_tool_patterns)}
+</section>"""
+    return _page("Anki MCP - Tools", body, css=_APP_CSS, main_class="app")
 
 
 def _deleted_archive_dir(data_dir: str, username: str) -> str:
@@ -996,8 +1153,100 @@ def create_app(custom_settings: Optional[Settings] = None):
         instructions=SERVER_INSTRUCTIONS,
     )
 
+    # -- Two-layer tool gate + usage logging (wraps EVERY tool below) --------
+    #
+    # Each @mcp.tool registration is wrapped by _tool_guard BETWEEN the SDK
+    # decorator and the function: @mcp.tool derives the client-visible schema
+    # from the ORIGINAL signature (inspect.signature follows functools.wraps'
+    # __wrapped__), so tool names and schemas are unchanged, while every call
+    # passes through two things the wrapper owns:
+    #   1. deny-gate — the admin's global rules (ToolPolicyStore) UNIONED with
+    #      the account's own rules (User.disabled_tool_patterns); either match
+    #      refuses the call with a structured error naming rule and layer;
+    #   2. usage log — every call (reads included, refusals too) is recorded
+    #      to the per-user log the portal's Tools page renders.
+    # Captured app-locally like tool_registry above: a later create_app()'s
+    # stores must never gate or log this app's calls.
+    gating_store = user_store
+    tool_policy_store = ToolPolicyStore(os.path.join(settings.data_dir, "tool_policy.json"))
+    tool_usage_log = ToolUsageLogger(settings.data_dir)
+
+    def _disabled_by(tool_name: str, username: str) -> Optional[Tuple[str, str]]:
+        """(layer, rule) of the first matching deny rule, or None.
+
+        Global rules are checked first on purpose: the refusal text should
+        name the layer the caller cannot remove, and a user-side duplicate
+        would otherwise mask the admin's rule.
+        """
+        rule = matching_rule(tool_name, tool_policy_store.get_patterns())
+        if rule is not None:
+            return "global rule", rule
+        user = gating_store.get(username)
+        if user is not None:
+            rule = matching_rule(tool_name, user.disabled_tool_patterns)
+            if rule is not None:
+                return "your rule", rule
+        return None
+
+    def _tool_guard(fn):
+        """Schema-preserving per-tool wrapper: deny-gate + usage-log."""
+        tool_name = fn.__name__
+
+        @functools.wraps(fn)
+        async def _guarded(*args, **kwargs):
+            ctx = kwargs.get("ctx")
+            username = _username_from_context(ctx) if ctx is not None else None
+            if username is None:
+                return _unauthorized_tool_response()
+            blocked = _disabled_by(tool_name, username)
+            if blocked is not None:
+                layer, rule = blocked
+                await tool_usage_log.record(
+                    username,
+                    tool_name,
+                    ok=False,
+                    duration_ms=0,
+                    error=f"refused: disabled by {layer} {rule!r}",
+                )
+                return {
+                    "success": False,
+                    "error": (
+                        f"Tool '{tool_name}' is disabled (matched {layer} '{rule}'). "
+                        "Global rules are set by the server admin; your own rules "
+                        "can be changed on the web portal's Tools page."
+                    ),
+                    "error_type": "ToolDisabledError",
+                }
+            started = time.monotonic()
+            try:
+                result = await fn(*args, **kwargs)
+            except Exception as e:
+                # The wrappers convert expected failures themselves; this arm
+                # only sees wrapper bugs. Log it, then let the SDK's generic
+                # error path take over (same posture as before the wrapper).
+                await tool_usage_log.record(
+                    username,
+                    tool_name,
+                    ok=False,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    error=f"unhandled {type(e).__name__}: {e}",
+                )
+                raise
+            failed = isinstance(result, dict) and result.get("success") is False
+            await tool_usage_log.record(
+                username,
+                tool_name,
+                ok=not failed,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                error=str(result.get("error", "")) if failed else None,
+            )
+            return result
+
+        return _guarded
+
     # 1. list_decks
     @mcp.tool(description="List all available decks and their IDs in the Anki collection.")
+    @_tool_guard
     async def list_decks(ctx: Context) -> Dict[str, Any]:
         username = _username_from_context(ctx)
         if username is None:
@@ -1009,6 +1258,7 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # 2. search_notes
     @mcp.tool(description="Search notes in the collection by Anki query with bounded pagination.")
+    @_tool_guard
     async def search_notes(query: str, limit: int = 50, offset: int = 0, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1021,6 +1271,7 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # 3. get_note
     @mcp.tool(description="Retrieve details and fields for a specific note by ID.")
+    @_tool_guard
     async def get_note(note_id: int, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1033,6 +1284,7 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # 4. get_collection_stats
     @mcp.tool(description="Get reliably supported collection statistics and deck summaries.")
+    @_tool_guard
     async def get_collection_stats(ctx: Context) -> Dict[str, Any]:
         username = _username_from_context(ctx)
         if username is None:
@@ -1049,6 +1301,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "reads when data from other devices must be current. Requires AnkiWeb credentials saved in "
         "the web portal."
     )
+    @_tool_guard
     async def sync_collection(ctx: Context) -> Dict[str, Any]:
         username = _username_from_context(ctx)
         if username is None:
@@ -1063,6 +1316,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         description="Add notes to the collection with duplicate prevention and per-user idempotency."
                      + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def add_notes(
         notes: List[Dict[str, Any]],
         idempotency_key: Optional[str] = None,
@@ -1085,6 +1339,7 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # 7. update_note_fields
     @mcp.tool(description="Update fields on an existing note." + LOCAL_UNTIL_SYNCED_SUFFIX)
+    @_tool_guard
     async def update_note_fields(note_id: int, fields: Dict[str, str], ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1098,6 +1353,7 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # 8. add_tags
     @mcp.tool(description="Add tags to notes." + LOCAL_UNTIL_SYNCED_SUFFIX)
+    @_tool_guard
     async def add_tags(note_ids: List[int], tags: List[str], ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1114,6 +1370,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         description="Create a deck ('Parent::Child' creates subdecks); an existing name resolves to its ID."
                      + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def create_deck(deck_name: str, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1131,6 +1388,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "pre-rename-deck snapshot backup is taken first and the rename is aborted if it fails."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def rename_deck(deck_id: int, new_name: str, confirm: bool = False, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1151,6 +1409,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "first and the deletion is aborted if it fails."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def delete_deck(deck_id: int, confirm: bool = False, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1171,6 +1430,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "and the deletion is aborted if it fails."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def delete_notes(
         note_ids: List[int],
         confirm: bool = False,
@@ -1192,6 +1452,7 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # 13. remove_tags
     @mcp.tool(description="Remove tags from notes." + LOCAL_UNTIL_SYNCED_SUFFIX)
+    @_tool_guard
     async def remove_tags(note_ids: List[int], tags: List[str], ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1205,6 +1466,7 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # 14. list_note_types
     @mcp.tool(description="List note types with their field names and card templates.")
+    @_tool_guard
     async def list_note_types(ctx: Context) -> Dict[str, Any]:
         username = _username_from_context(ctx)
         if username is None:
@@ -1220,6 +1482,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "default single template over the first two fields). Refuses an existing name."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def create_note_type(
         name: str,
         fields: List[str],
@@ -1243,6 +1506,7 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # 16. find_cards
     @mcp.tool(description="Search cards by Anki query with bounded pagination.")
+    @_tool_guard
     async def find_cards(query: str, limit: int = 50, offset: int = 0, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1255,6 +1519,7 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # 17. get_card
     @mcp.tool(description="Retrieve a card's fields, rendered question/answer, and scheduling state.")
+    @_tool_guard
     async def get_card(card_id: int, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1268,6 +1533,7 @@ def create_app(custom_settings: Optional[Settings] = None):
     # 18. suspend_cards
     @mcp.tool(description="Suspend cards so they leave the review queue until unsuspended."
                           + LOCAL_UNTIL_SYNCED_SUFFIX)
+    @_tool_guard
     async def suspend_cards(card_ids: List[int], ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1281,6 +1547,7 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # 19. unsuspend_cards
     @mcp.tool(description="Unsuspend previously suspended cards." + LOCAL_UNTIL_SYNCED_SUFFIX)
+    @_tool_guard
     async def unsuspend_cards(card_ids: List[int], ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1297,6 +1564,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         description="Set cards' due date to N days from today ('3') or a random range ('0-2')."
                      + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def set_due_date(card_ids: List[int], days: str, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1310,6 +1578,7 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # 21. move_cards
     @mcp.tool(description="Move cards to another deck (target deck must exist)." + LOCAL_UNTIL_SYNCED_SUFFIX)
+    @_tool_guard
     async def move_cards(card_ids: List[int], deck_id: int, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1322,27 +1591,40 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 22. get_review_queue
-    @mcp.tool(description="Fetch the scheduler's current review queue with capped questions.")
-    async def get_review_queue(limit: int = 10, ctx: Context = None) -> Dict[str, Any]:
+    @mcp.tool(
+        description="Fetch the scheduler's current review queue with capped questions. "
+        "The queue covers exactly ONE deck (subdecks included): pass deck (a deck name "
+        "from list_decks) to review that deck; without it the collection's currently "
+        "selected deck is used, which on a fresh collection is 'Default' and usually "
+        "empty. The response names the deck the queue came from."
+    )
+    @_tool_guard
+    async def get_review_queue(
+        limit: int = 10, deck: Optional[str] = None, ctx: Context = None
+    ) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
             return _unauthorized_tool_response()
         try:
-            parsed = ReviewQueueInput(limit=limit)
-            return await cards_tools.get_review_queue(tool_registry, username, parsed.limit)
+            parsed = ReviewQueueInput(limit=limit, deck=deck)
+            return await cards_tools.get_review_queue(tool_registry, username, parsed.limit, parsed.deck)
         except Exception as e:
             return _tool_error_response(e)
 
     # 23. answer_card
     @mcp.tool(
         description="Answer a queued card with rating 1=Again, 2=Hard, 3=Good, 4=Easy (v3 scheduler). "
-        "The card must currently be in the review queue; only the first 50 queued cards are "
-        "considered, so a card deeper in a long queue is refused until it reaches the front."
+        "By default the card's OWN deck's queue is consulted, so any currently due card "
+        "can be answered; pass deck to require the card to be queued in that deck. "
+        "Only the first 50 queued cards of the deck are considered, so a card deeper in a "
+        "long queue is refused until it reaches the front."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def answer_card(
         card_id: int,
         rating: int,
+        deck: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         ctx: Context = None,
     ) -> Dict[str, Any]:
@@ -1350,10 +1632,10 @@ def create_app(custom_settings: Optional[Settings] = None):
         if username is None:
             return _unauthorized_tool_response()
         try:
-            parsed = AnswerCardInput(card_id=card_id, rating=rating, idempotency_key=idempotency_key)
+            parsed = AnswerCardInput(card_id=card_id, rating=rating, deck=deck, idempotency_key=idempotency_key)
             res = await cards_tools.answer_card(
                 tool_sync_manager, tool_registry, username,
-                parsed.card_id, parsed.rating, parsed.idempotency_key,
+                parsed.card_id, parsed.rating, parsed.deck, parsed.idempotency_key,
             )
             return res.model_dump()
         except Exception as e:
@@ -1365,6 +1647,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "filename); returns the actual stored name."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def store_media_file(filename: str, data_base64: str, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1380,6 +1663,7 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # 25. get_media_file
     @mcp.tool(description="Read a media file back as base64 (files over 4 MiB are refused).")
+    @_tool_guard
     async def get_media_file(filename: str, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1392,6 +1676,7 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # 26. list_media_files
     @mcp.tool(description="List media filenames (sorted), capped at the requested limit.")
+    @_tool_guard
     async def list_media_files(limit: int = 200, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1410,6 +1695,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "deleted. Unmapped old content is discarded and cards regenerate on the new note type; "
         "always run this before change_note_type."
     )
+    @_tool_guard
     async def preview_note_type_change(
         new_note_type: str,
         note_ids: Optional[List[int]] = None,
@@ -1437,6 +1723,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "is aborted if it fails."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def change_note_type(
         new_note_type: str,
         note_ids: Optional[List[int]] = None,
@@ -1477,6 +1764,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "gate and no snapshot."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def find_and_replace(
         search: str,
         replacement: str = "",
@@ -1512,6 +1800,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "count and one requested page of {field_value, note_ids} groups — useful to clean up "
         "before or after a mass edit."
     )
+    @_tool_guard
     async def find_duplicates(
         field_name: str,
         search: str = "",
@@ -1536,6 +1825,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "fields with ordinals, templates with question/answer formats, CSS, sort field, and the "
         "number of notes using it."
     )
+    @_tool_guard
     async def get_note_type(name: str, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1554,6 +1844,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "nor removed, and no note content changes."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def update_note_type(
         name: str,
         new_name: Optional[str] = None,
@@ -1589,6 +1880,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "0-based position. Existing notes get an empty value for it."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def add_note_type_field(
         note_type: str,
         field_name: str,
@@ -1616,6 +1908,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "is aborted if it fails."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def remove_note_type_field(
         note_type: str,
         field_name: str,
@@ -1642,6 +1935,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "another field of the same type."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def rename_note_type_field(
         note_type: str,
         field_name: str,
@@ -1669,6 +1963,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "every note keeps its values, only the field order changes."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def reposition_note_type_field(
         note_type: str,
         field_name: str,
@@ -1695,6 +1990,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "generated by Anki's usual template logic."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def add_note_type_template(
         note_type: str,
         name: str,
@@ -1728,6 +2024,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "removal is aborted if it fails."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def remove_note_type_template(
         note_type: str,
         template_name: str,
@@ -1755,6 +2052,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "(0..template count - 1); existing cards follow their template."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def reposition_note_type_template(
         note_type: str,
         template_name: str,
@@ -1783,6 +2081,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "fails. Note types with notes on them are refused — change or delete those notes first."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def delete_note_type(name: str, confirm: bool = False, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1807,6 +2106,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "the restore is aborted if it fails."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def restore_note_type_to_stock(
         name: str,
         force_kind: Optional[str] = None,
@@ -1832,6 +2132,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "(name, maxTaken, new/review daily limits, autoplay, timer, ...) as plain JSON. A deck's "
         "config is a preset that may be shared by several decks."
     )
+    @_tool_guard
     async def get_deck_config(deck_id: int, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
@@ -1851,6 +2152,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "the same preset change scheduling behavior together."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def update_deck_config(
         deck_id: int,
         updates: Dict[str, Any],
@@ -1875,6 +2177,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "ones."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def set_card_flags(
         flag: int,
         card_ids: Optional[List[int]] = None,
@@ -1900,6 +2203,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "return automatically at the next day rollover, or earlier via unbury_cards."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def bury_cards(
         card_ids: Optional[List[int]] = None,
         query: Optional[str] = None,
@@ -1924,6 +2228,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "unsuspended too."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def unbury_cards(
         card_ids: Optional[List[int]] = None,
         query: Optional[str] = None,
@@ -1950,6 +2255,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         "target positions."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
+    @_tool_guard
     async def reposition_new_cards(
         start: int,
         step: int,
@@ -2476,7 +2782,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         csrf_token = issue_csrf(session_value)
         flash = _peek_flash(request)
         accounts = await run_in_threadpool(store.list_users)
-        response = HTMLResponse(_admin_page(user, csrf_token, flash, accounts))
+        global_patterns = tool_policy_store.get_patterns()
+        response = HTMLResponse(_admin_page(user, csrf_token, flash, accounts, global_patterns))
         if request.cookies.get(FLASH_COOKIE_NAME):
             _clear_flash(response)  # consumed: render at most once
         return response
@@ -2658,6 +2965,66 @@ def create_app(custom_settings: Optional[Settings] = None):
         notice = f"Deleted {username}." + (" Data directory moved to deleted/." if archive_path else "")
         return _redirect_with_flash("/admin", notice, kind="success")
 
+    # -- Portal Tools page + tool-disable rules (session, CSRF-protected) ----
+
+    async def tools_page(request: Request) -> Response:
+        user, err = _require_session(request)
+        if err:
+            return err
+        session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        csrf_token = issue_csrf(session_value)
+        flash = _peek_flash(request)
+        usage = await tool_usage_log.recent(user.username, 50)
+        global_patterns = tool_policy_store.get_patterns()
+        response = HTMLResponse(_tools_page(user, csrf_token, flash, usage, global_patterns))
+        if request.cookies.get(FLASH_COOKIE_NAME):
+            _clear_flash(response)  # consumed: render at most once
+        return response
+
+    async def portal_tools_disabled(request: Request) -> Response:
+        user, err = _require_session(request)
+        if err:
+            return err
+        session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        if _body_too_large(request):
+            return HTMLResponse(_message_page("Request body too large."), status_code=413)
+        form = await request.form()
+        if not _csrf_ok(session_value, form):
+            return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
+        try:
+            patterns = parse_pattern_text(str(form.get("patterns", "")))
+        except ValueError as e:
+            return _redirect_with_flash(
+                "/portal/tools", f"Rule rejected: {e}", kind="error"
+            )
+        await run_in_threadpool(store.set_disabled_tool_patterns, user.username, patterns)
+        logger.info(
+            "Portal tool rules updated for %r: %d pattern(s)", user.username, len(patterns)
+        )
+        return _redirect_with_flash(
+            "/portal/tools", f"Saved {len(patterns)} tool rule(s).", kind="success"
+        )
+
+    async def admin_tool_rules(request: Request) -> Response:
+        admin, err = _require_admin(request)
+        if err:
+            return err
+        session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        if _body_too_large(request):
+            return HTMLResponse(_message_page("Request body too large."), status_code=413)
+        form = await request.form()
+        if not _csrf_ok(session_value, form):
+            return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
+        try:
+            patterns = parse_pattern_text(str(form.get("patterns", "")))
+        except ValueError as e:
+            return _bad_request(f"Rule rejected: {e}")
+        await run_in_threadpool(tool_policy_store.set_patterns, patterns)
+        logger.info("Admin %r set %d global tool rule(s)", admin.username, len(patterns))
+        return _redirect_with_flash(
+            "/admin", f"Saved {len(patterns)} global tool rule(s).", kind="success"
+        )
+
     app.add_route("/login", login_page, methods=["GET"])
     app.add_route("/login", login_submit, methods=["POST"])
     app.add_route("/", index_page, methods=["GET"])
@@ -2675,6 +3042,9 @@ def create_app(custom_settings: Optional[Settings] = None):
     app.add_route("/admin/regenerate-token", admin_regenerate_token, methods=["POST"])
     app.add_route("/admin/set-role", admin_set_role, methods=["POST"])
     app.add_route("/admin/delete-user", admin_delete_user, methods=["POST"])
+    app.add_route("/admin/tool-rules", admin_tool_rules, methods=["POST"])
+    app.add_route("/portal/tools", tools_page, methods=["GET"])
+    app.add_route("/portal/tools/disabled", portal_tools_disabled, methods=["POST"])
 
     # -- OAuth 2.1 authorization server (claude.ai custom connectors) ---------
     # Discovery, dynamic client registration, the consent-gated authorize
@@ -2694,6 +3064,8 @@ def create_app(custom_settings: Optional[Settings] = None):
     app.state.anki_registry = collection_registry
     app.state.anki_store = store
     app.state.anki_oauth_store = oauth_store
+    app.state.anki_tool_policy = tool_policy_store
+    app.state.anki_tool_usage = tool_usage_log
 
     # Per-user collection lifecycle (Task 3): a background task closes
     # collections idle beyond idle_timeout_minutes every minute, and shutdown

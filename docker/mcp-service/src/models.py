@@ -5,13 +5,37 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 class NoteInput(BaseModel):
-    """Specification of a new note to create."""
+    """Specification of a new note to create.
+
+    The note type field is canonically ``note_type`` (consistent with every
+    other note-type tool); ``model_name`` is accepted as a legacy alias for
+    callers written before the rename. Exactly one of the two must be given,
+    or both with the same value.
+    """
     deck_name: str = Field(..., description="Name of target deck, e.g. 'Default'")
-    model_name: str = Field(..., description="Note type model name, e.g. 'Basic' or 'Cloze'")
+    note_type: str = Field(..., description="Note type name, e.g. 'Basic' or 'Cloze'")
     fields: Dict[str, str] = Field(..., description="Field names and their string values")
     tags: List[str] = Field(default_factory=list, description="Tags to assign to the note")
 
-    @field_validator("deck_name", "model_name")
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_model_name_alias(cls, data):
+        """Fold the legacy ``model_name`` key into canonical ``note_type``."""
+        if not isinstance(data, dict):
+            return data
+        legacy = data.pop("model_name", None)
+        if legacy is None:
+            return data
+        canonical = data.get("note_type")
+        if canonical is not None and canonical != legacy:
+            raise ValueError(
+                "Pass the note type once: 'note_type' is canonical and the legacy "
+                "alias 'model_name' must not disagree with it."
+            )
+        data["note_type"] = legacy
+        return data
+
+    @field_validator("deck_name", "note_type")
     @classmethod
     def not_empty(cls, v: str) -> str:
         s = v.strip()
@@ -808,12 +832,29 @@ class MoveCardsInput(_IdListInput):
 class ReviewQueueInput(BaseModel):
     """Input parameters for get_review_queue tool."""
     limit: int = Field(10, ge=1, le=50, description="Max queued cards to fetch (1-50, default 10)")
+    deck: Optional[str] = Field(
+        None,
+        max_length=255,
+        description=(
+            "Deck name whose queue to fetch (e.g. 'Korean::Vocab'; subdecks included). "
+            "Defaults to the collection's currently selected deck, which on a fresh "
+            "collection is 'Default' and usually empty."
+        ),
+    )
 
 
 class AnswerCardInput(BaseModel):
     """Input parameters for answer_card tool."""
-    card_id: int = Field(..., gt=0, description="Unique Anki card ID (must be in the current review queue)")
+    card_id: int = Field(..., gt=0, description="Unique Anki card ID (must be currently queued in its deck)")
     rating: int = Field(..., ge=1, le=4, description="1=Again, 2=Hard, 3=Good, 4=Easy")
+    deck: Optional[str] = Field(
+        None,
+        max_length=255,
+        description=(
+            "Require the card to be queued in this deck (subdecks included). "
+            "By default the card's OWN deck's queue is used, so any due card can be answered."
+        ),
+    )
     idempotency_key: Optional[str] = Field(
         None,
         max_length=256,

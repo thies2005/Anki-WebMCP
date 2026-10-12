@@ -147,18 +147,18 @@ def _add_notes_impl(col, notes: List[NoteInput], allow_duplicates: bool) -> Dict
     resolved = []
     failures: List[int] = []
     for idx, n in enumerate(notes):
-        model = col.models.by_name(n.model_name)
+        model = col.models.by_name(n.note_type)
         if model is None:
             available = sorted(m.name for m in col.models.all_names_and_ids())
             raise CollectionToolError(
-                f"Unknown note type {n.model_name!r}. Available models: {available}"
+                f"Unknown note type {n.note_type!r}. Available models: {available}"
             )
         valid_fields = sorted(f["name"] for f in model["flds"])
         unknown_fields = sorted(name for name in n.fields if name not in valid_fields)
         if unknown_fields:
             raise CollectionToolError(
                 f"Note index {idx}: unknown field(s) {unknown_fields} for note type "
-                f"{n.model_name!r}. Valid fields for this note type: {valid_fields}."
+                f"{n.note_type!r}. Valid fields for this note type: {valid_fields}."
             )
         if not allow_duplicates and _is_first_field_duplicate(col, model, n.deck_name, n.fields):
             failures.append(idx)

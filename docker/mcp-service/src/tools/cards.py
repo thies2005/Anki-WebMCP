@@ -15,6 +15,7 @@ through ``sync_manager.execute_mutation``. Wheel facts this module relies on
 """
 
 import logging
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 from anki.errors import NotFoundError, SearchError  # isort: skip
@@ -254,13 +255,70 @@ async def move_cards(
     )
 
 
-async def get_review_queue(registry, username: str, limit: int = 10) -> Dict[str, Any]:
-    """Fetch the scheduler's current queue (due + new cards), questions capped."""
+def _queue_deck_id(col, deck: Optional[str], card_id: Optional[int] = None) -> int:
+    """Resolve which deck's queue a review operation should use.
+
+    The v3 scheduler's ``get_queued_cards`` serves ONLY the currently
+    selected deck (plus its subdecks), and nothing else in the service ever
+    selects a deck — headless collections sit on 'Default' forever, which is
+    why real decks' cards used to be invisible to the review tools. Rules:
+
+    - explicit ``deck`` name -> that deck (must exist; ``decks.id_for_name``
+      only RESOLVES, unlike ``decks.id`` which would create it);
+    - no deck + ``card_id`` (answer_card's default) -> the card's own deck,
+      so any due card can be answered without knowing its deck;
+    - no deck + no card -> the currently selected deck (Anki desktop
+      semantics; 'Default' on a fresh collection).
+    """
+    if deck is not None:
+        deck_id = col.decks.id_for_name(deck)
+        if not deck_id:
+            raise CollectionToolError(
+                f"Deck {deck!r} not found in the collection. "
+                "Call list_decks for the valid deck names."
+            )
+        return int(deck_id)
+    if card_id is not None:
+        card = _get_card_or_none(col, card_id)
+        if card is None:
+            raise CollectionToolError(f"Card {card_id} not found in the collection.")
+        return int(card.did)
+    return int(col.decks.get_current_id())
+
+
+@contextmanager
+def _deck_selection(col, deck_id: int):
+    """Point the scheduler at ``deck_id`` for the duration, then restore.
+
+    ``curDeck`` is PERSISTED collection state; a review read must not
+    silently rewrite it, so the previous selection always goes back (even on
+    error). Selecting a parent deck natively includes its subdecks.
+    """
+    previous = col.decks.get_current_id()
+    col.decks.select(deck_id)
+    try:
+        yield
+    finally:
+        col.decks.select(previous)
+
+
+async def get_review_queue(
+    registry, username: str, limit: int = 10, deck: Optional[str] = None
+) -> Dict[str, Any]:
+    """Fetch the scheduler's current queue (due + new cards), questions capped.
+
+    The queue covers exactly ONE deck (subdecks included): ``deck`` when
+    given, else the collection's currently selected deck. The response names
+    the deck it came from, so an empty queue is self-explaining instead of
+    looking like the collection has no cards.
+    """
     limit = max(1, min(limit, 50))
-    logger.info("Executing get_review_queue for %r: limit=%d", username, limit)
+    logger.info("Executing get_review_queue for %r: limit=%d, deck=%r", username, limit, deck)
 
     def _queue(col) -> Dict[str, Any]:
-        out = col.sched.get_queued_cards(fetch_limit=limit)
+        deck_id = _queue_deck_id(col, deck)
+        with _deck_selection(col, deck_id):
+            out = col.sched.get_queued_cards(fetch_limit=limit)
         items = []
         for queued in out.cards:
             card = col.get_card(queued.card.id)
@@ -278,7 +336,12 @@ async def get_review_queue(registry, username: str, limit: int = 10) -> Dict[str
         total = getattr(out, "card_count", None)
         if total is None:
             total = len(out.cards)
-        return {"total_queue_count": int(total), "cards": items}
+        return {
+            "deck_id": deck_id,
+            "deck_name": col.decks.name(deck_id),
+            "total_queue_count": int(total),
+            "cards": items,
+        }
 
     return await registry.run(username, _queue)
 
@@ -289,6 +352,7 @@ async def answer_card(
     username: str,
     card_id: int,
     rating: int,
+    deck: Optional[str] = None,
     idempotency_key: Optional[str] = None,
 ) -> MutationResponse:
     """Answer a queued card with a 1..4 rating (Again/Hard/Good/Easy).
@@ -298,27 +362,38 @@ async def answer_card(
     ``sched.answer_card``. The card's answer timer is started at answer time —
     an unattended tool has no "question shown" moment, and build_answer
     raises on a never-started timer (probed against the wheel).
+
+    Deck scoping mirrors get_review_queue: by default the card's OWN deck's
+    queue is consulted (any due card is answerable); an explicit ``deck``
+    requires the card to be queued there.
     """
-    logger.info("Executing answer_card for %r: card %d, rating %d", username, card_id, rating)
+    logger.info(
+        "Executing answer_card for %r: card %d, rating %d, deck=%r", username, card_id, rating, deck
+    )
 
     def _answer(col) -> Dict[str, Any]:
-        out = col.sched.get_queued_cards(fetch_limit=50)
-        queued = next((q for q in out.cards if q.card.id == card_id), None)
-        if queued is None:
-            raise CollectionToolError(
-                "card is not currently in the review queue (not due) or the queue is longer "
-                "than the fetch limit"
-            )
-        card = col.get_card(card_id)
-        card.start_timer()
-        answer = col.sched.build_answer(card=card, states=queued.states, rating=_RATING_BY_LEVEL[rating])
-        col.sched.answer_card(answer)
-        reloaded = col.get_card(card_id)
-        after = col.sched.get_queued_cards(fetch_limit=50)
-        remaining = sum(1 for q in after.cards if q.card.id != card_id)
+        deck_id = _queue_deck_id(col, deck, card_id=card_id)
+        with _deck_selection(col, deck_id):
+            out = col.sched.get_queued_cards(fetch_limit=50)
+            queued = next((q for q in out.cards if q.card.id == card_id), None)
+            if queued is None:
+                raise CollectionToolError(
+                    f"card {card_id} is not currently in the review queue (not due), or it sits "
+                    f"deeper than the first 50 queued cards of deck "
+                    f"{col.decks.name(deck_id)!r}. Call get_review_queue with the same deck "
+                    "to see what is currently queued."
+                )
+            card = col.get_card(card_id)
+            card.start_timer()
+            answer = col.sched.build_answer(card=card, states=queued.states, rating=_RATING_BY_LEVEL[rating])
+            col.sched.answer_card(answer)
+            reloaded = col.get_card(card_id)
+            after = col.sched.get_queued_cards(fetch_limit=50)
+            remaining = sum(1 for q in after.cards if q.card.id != card_id)
         return {
             "card_id": card_id,
             "rating": rating,
+            "deck_name": col.decks.name(deck_id),
             "next_due": reloaded.due,
             "remaining_in_queue": remaining,
         }

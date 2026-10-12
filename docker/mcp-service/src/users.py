@@ -30,6 +30,8 @@ import time
 from dataclasses import asdict, dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
 
+from .toolpolicy import is_valid_pattern, validate_patterns
+
 logger = logging.getLogger("anki_mcp.users")
 
 # Path-safety guard: usernames become directory names under DATA_DIR in later
@@ -118,11 +120,19 @@ def _decode_token(encoded: str) -> Optional[str]:
 
 
 def _burn_scrypt(password: str) -> None:
-    """Do scrypt work against a throwaway hash to flatten timing for unknown users."""
+    """scrypt work against a throwaway hash to flatten timing for unknown users."""
     global _dummy_password_hash
     if _dummy_password_hash is None:
         _dummy_password_hash = hash_password("timing-equalizer")
     verify_password_hash(password, _dummy_password_hash)
+
+
+def _load_tool_patterns(record: Dict) -> List[str]:
+    """Tolerant read of a record's disabled_tool_patterns (absent/garbage -> [])."""
+    raw = record.get("disabled_tool_patterns", [])
+    if not isinstance(raw, list):
+        return []
+    return [r for r in raw if isinstance(r, str) and is_valid_pattern(r)]
 
 
 @dataclass
@@ -154,6 +164,11 @@ class User:
     # resets evict grants too, via sessions_invalid_before above. 0.0 accepts
     # every grant (legacy records).
     tokens_invalid_before: float = 0.0
+    # Per-user layer of the tool-disable gate: exact tool names or trailing-*
+    # prefixes (see src/toolpolicy.py). Enforced by the _tool_guard wrapper in
+    # src.main on every MCP tool call; edited on the portal's Tools page.
+    # Empty for records written before the field existed (no rules).
+    disabled_tool_patterns: List[str] = field(default_factory=list)
 
 
 class UserStore:
@@ -212,6 +227,11 @@ class UserStore:
                     tokens_invalid_before=float(
                         record.get("tokens_invalid_before", 0.0)
                     ),
+                    # Tolerant load of the per-user tool-disable rules: absent
+                    # (legacy records) or malformed values both mean "no rules"
+                    # rather than a fatal store, matching the global policy
+                    # store's corrupt-file posture.
+                    disabled_tool_patterns=_load_tool_patterns(record),
                 )
             except (KeyError, TypeError, ValueError) as e:
                 raise ValueError(
@@ -392,6 +412,21 @@ class UserStore:
             user.ankiweb_password = password
             self._save_atomic()
         logger.info("Updated stored AnkiWeb credentials for %r", username)
+
+    def set_disabled_tool_patterns(self, username: str, patterns: List[str]) -> List[str]:
+        """Set the account's tool-disable rules (per-user gate layer).
+
+        Validates through the shared rule grammar (exact name or trailing-*
+        prefix; raises ValueError on malformed entries), stores the normalized
+        list, and returns it.
+        """
+        validated = validate_patterns(patterns)
+        with self._lock:
+            user = self._get_locked(username)
+            user.disabled_tool_patterns = validated
+            self._save_atomic()
+        logger.info("Updated disabled-tool rules for %r: %d pattern(s)", username, len(validated))
+        return list(validated)
 
     def set_role(self, username: str, role: str) -> None:
         """Promote/demote an account between ``"admin"`` and ``"user"``.

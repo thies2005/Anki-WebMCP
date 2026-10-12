@@ -55,12 +55,15 @@ WEB_AUTH_PATHS = frozenset(
         "/portal/backup/confirm",
         "/portal/backup/restore",
         "/portal/backup/download",
+        "/portal/tools",
+        "/portal/tools/disabled",
         "/admin",
         "/admin/create-user",
         "/admin/reset-password",
         "/admin/regenerate-token",
         "/admin/set-role",
         "/admin/delete-user",
+        "/admin/tool-rules",
         *OAUTH_AUTH_PATHS,
     }
 )

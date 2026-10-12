@@ -30,7 +30,7 @@
 ### What this is
 - **One headless service** (no GUI, no browser desktop) that owns Anki collections **in-process** via the official `anki` Python library (pinned `anki==26.9.3`).
 - **Multi-user by design**: every account gets its own collection, its own MCP token, and its own AnkiWeb credentials. Built for a household or small group (comfortable at 2–5 users; no hard cap).
-- **Web portal and admin UI** on the same port: users log in to view/copy their MCP token, enter AnkiWeb credentials, trigger a sync, browse their decks as a collapsible tree, and manage **Version history** snapshots; admins manage accounts at `/admin`.
+- **Web portal and admin UI** on the same port: users log in to view/copy their MCP token, enter AnkiWeb credentials, trigger a sync, browse their decks as a collapsible tree, manage **Version history** snapshots, and control **tool access** (per-user tool-disable rules + a per-account tool activity log) on the Tools page; admins manage accounts and **global tool-disable rules** at `/admin`.
 - **Official AnkiWeb Cloud Sync**, explicit and per-user.
 - **Remote Streamable HTTP MCP server** at `/mcp`, authenticated with per-user bearer tokens, for AI assistants (Claude, Cursor, custom agents).
 
@@ -206,6 +206,13 @@ Expected health output:
 
 **Version history** (portal): a snapshot of the collection is taken before **every sync and every destructive change** (and via the portal's *Back up now* button). The Version history section lists the newest snapshots with timestamp, reason, and size, and each can be **restored** — restoring replaces the current collection, and the replaced state is kept automatically as a `pre-restore` snapshot, so a restore is itself reversible — or **downloaded** as a `.colpkg` file. After a restore, the next AnkiWeb sync reconciles the differences; review before syncing. Snapshots exclude media files.
 
+**Tool access control & activity log** — every MCP tool call passes a two-layer deny gate and is usage-logged:
+
+- **Your rules** (portal → **Tools** page, `/portal/tools`): each user can disable tools for their own account — an exact tool name (`sync_collection`) or a trailing-`*` prefix (`delete_*`, matching `delete_deck`, `delete_notes`, ...). The page also shows the account's recent tool activity (every call logged: reads, writes, and refusals, with duration and error snippets) and a live Enabled/Disabled status table for all tools.
+- **Global rules** (admin console → **Global tool rules**): the admin can disable tools for **every** account (admins included). Deny-only union — a tool matched by either layer is refused; nothing can re-enable a tool matched by the global layer.
+- Refused calls return a structured `ToolDisabledError` naming the matching rule and which layer it came from, so connected clients (claude.ai, Perplexity, ...) see why a tool is unavailable instead of a silent failure.
+- The usage log lives per user at `/data/users/<name>/tool_usage.json` (capped at the 1000 most recent entries, atomic writes; archived with the account on deletion).
+
 ---
 
 ## Exposure Modes
@@ -313,7 +320,7 @@ All tools operate on the **authenticated user's** collection — the token decid
 | `get_note` | `note_id: int` | Fetches complete field values, model name, and tags for a note. |
 | `get_collection_stats` | *none* | Returns reliably supported statistics: cards reviewed today, deck tree counts, and new/learn/review totals. |
 | `sync_collection` | *none* | **Explicitly** synchronizes the collection with the user's AnkiWeb account (snapshot to `backups/` first, then full sync). Use this after mutations when changes should reach other clients — mutations do **not** auto-sync. |
-| `add_notes` | `notes: list[NoteInput]`<br>`idempotency_key?: string`<br>`allow_duplicates?: bool` | Creates flashcards locally with duplicate detection, per-user locking, and ledger-backed exactly-once semantics. |
+| `add_notes` | `notes: list[NoteInput]`<br>`idempotency_key?: string`<br>`allow_duplicates?: bool` | Creates flashcards locally with duplicate detection, per-user locking, and ledger-backed exactly-once semantics. Each note's `NoteInput` takes `note_type` (canonical; `model_name` is accepted as a legacy alias), `deck_name`, `fields`, `tags`. |
 | `update_note_fields` | `note_id: int`<br>`fields: dict[str, str]` | Updates specific note fields under the per-user write lock. |
 | `add_tags` | `note_ids: list[int]`<br>`tags: list[str]` | Adds tags to one or more notes under the per-user write lock. |
 | `create_deck` | `deck_name: string` | Creates a deck (`Parent::Child` creates subdecks); an existing name resolves to its ID. |
@@ -329,8 +336,8 @@ All tools operate on the **authenticated user's** collection — the token decid
 | `unsuspend_cards` | `card_ids: list[int]` | Unsuspends previously suspended cards. |
 | `set_due_date` | `card_ids: list[int]`<br>`days: string` | Sets cards' due date to N days from today (`"3"`) or a random range (`"0-2"`). |
 | `move_cards` | `card_ids: list[int]`<br>`deck_id: int` | Moves cards to another deck (target deck must exist). |
-| `get_review_queue` | `limit?: int (default 10)` | Fetches the scheduler's current review queue with capped questions. |
-| `answer_card` | `card_id: int`<br>`rating: int (1-4)`<br>`idempotency_key?: string` | Answers a queued card (`1`=Again … `4`=Easy, v3 scheduler). **Only answers cards in the review queue** (the first 50 queued cards — new and due alike); deeper cards are refused until they surface. |
+| `get_review_queue` | `limit?: int (default 10)`<br>`deck?: string` | Fetches the scheduler's review queue with capped questions. The queue covers exactly **one** deck (subdecks included): pass `deck` (a name from `list_decks`) to review that deck; without it the collection's currently selected deck is used — `Default` and usually empty on a fresh collection. The response names the deck it came from. |
+| `answer_card` | `card_id: int`<br>`rating: int (1-4)`<br>`deck?: string`<br>`idempotency_key?: string` | Answers a queued card (`1`=Again … `4`=Easy, v3 scheduler). By default the card's **own deck's** queue is consulted, so any currently due card can be answered; pass `deck` to require the card to be queued there. Only the first 50 queued cards of the deck are considered; deeper cards are refused until they surface. |
 | `store_media_file` | `filename: string`<br>`data_base64: string` | Stores a media file (standard base64). **Decoded size cap: 4 MiB**; returns the actual stored name. |
 | `get_media_file` | `filename: string` | Reads a media file back as base64 (files over 4 MiB are refused). |
 | `list_media_files` | `limit?: int (default 200)` | Lists media filenames (sorted), capped at the requested limit. |
