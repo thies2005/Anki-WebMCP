@@ -188,7 +188,7 @@ async def test_bury_then_unbury_round_trip_restores_queue_state(env):
 
     res = await card_tools.unbury_cards(manager, reg, "jonas", card_ids=[cid])
     assert res.success is True, res.error
-    assert res.data["unburied"] == 1
+    assert res.data == {"unburied": 1, "selected": 1}
     # The queue state the bury interrupted is restored exactly.
     assert await _card_state(reg, "jonas", cid) == before
 
@@ -213,9 +213,60 @@ async def test_unbury_also_restores_suspended_cards(env):
 
     res = await card_tools.unbury_cards(manager, reg, "katja", card_ids=cids)
     assert res.success is True, res.error
+    assert res.data == {"unburied": 2, "selected": 2}
     # BOTH restored to their pre-bury/suspend queues (0 = new).
     assert (await _card_state(reg, "katja", cids[0]))[0] == 0
     assert (await _card_state(reg, "katja", cids[1]))[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_unbury_reports_cards_actually_restored_not_selection_size(env):
+    """debt-6: ``unburied`` counts the selection cards that were buried or
+    suspended (queue < 0) just before the call — NOT the selection size."""
+    reg, manager = env
+    cids = await reg.run("nils", lambda col: [
+        _add_basic_note(col, "buried one"), _add_basic_note(col, "never buried"),
+    ])
+
+    def _bury_one(col):
+        col.sched.bury_cards([cids[0]], manual=True)
+
+    await reg.run("nils", _bury_one)
+    assert (await _card_state(reg, "nils", cids[0]))[0] == -3
+    assert (await _card_state(reg, "nils", cids[1]))[0] == 0
+
+    # One buried card out of a two-card selection: 1 restored, 2 selected.
+    res = await card_tools.unbury_cards(manager, reg, "nils", card_ids=cids)
+    assert res.success is True, res.error
+    assert res.data == {"unburied": 1, "selected": 2}
+
+    # A clean selection of never-buried cards still succeeds — and reports 0.
+    res = await card_tools.unbury_cards(manager, reg, "nils", card_ids=[cids[1]])
+    assert res.success is True, res.error
+    assert res.data == {"unburied": 0, "selected": 1}
+
+
+# -- answer_card remaining_in_queue -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_answer_card_remaining_matches_review_queue_total(env):
+    """tools-6: ``remaining_in_queue`` is the deck's TRUE queue — the same
+    per-kind sum get_review_queue reports — not the fetch-limited card list
+    minus the answered card. An AGAIN-answered card re-enters today's
+    learning queue and is still counted (2 new + 1 learning = 3, where the
+    old fetch-prefix count reported 2)."""
+    reg, manager = env
+    cids = await reg.run("olle", lambda col: [
+        _add_basic_note(col, f"q{i}") for i in range(3)
+    ])
+
+    res = await card_tools.answer_card(manager, reg, "olle", cids[0], 1)  # Again
+    assert res.success is True, res.error
+
+    follow = await card_tools.get_review_queue(reg, "olle", deck="Default")
+    assert follow["total_queue_count"] == 3  # 2 new + 1 intraday learning
+    assert res.data["remaining_in_queue"] == follow["total_queue_count"]
 
 
 # -- reposition_new_cards ----------------------------------------------------------

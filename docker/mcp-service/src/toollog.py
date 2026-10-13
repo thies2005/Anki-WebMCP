@@ -45,7 +45,11 @@ class ToolUsageLogger:
 
     Writes hold the per-user asyncio lock while the whole file is rewritten
     (same trade-off as the idempotency ledger: entry counts are capped, so
-    the rewrite is bounded). Reads return copies, newest first.
+    the rewrite is bounded). The atomic rewrite itself (mkstemp -> json.dump
+    -> fsync -> os.replace) runs on a worker thread via
+    ``asyncio.to_thread`` so the event loop is never blocked by disk I/O;
+    the per-user lock is held across that call, so concurrent ``record``
+    calls stay serialized. Reads return copies, newest first.
     """
 
     def __init__(self, data_dir: str, max_entries: int = MAX_ENTRIES):
@@ -136,7 +140,11 @@ class ToolUsageLogger:
             while len(entries) > self.max_entries:
                 entries.pop(0)
             try:
-                self._save_atomic(username, entries)
+                # The mkstemp/json.dump/fsync rewrite runs on a worker thread
+                # so the event loop is never blocked by disk I/O; the per-user
+                # asyncio lock is held across the call, so writers stay
+                # serialized and saves cannot interleave.
+                await asyncio.to_thread(self._save_atomic, username, entries)
             except Exception:
                 logger.exception("Tool-usage log write failed for %r (in-memory kept)", username)
 

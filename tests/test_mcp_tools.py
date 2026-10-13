@@ -11,6 +11,7 @@ import os
 
 import pytest
 import pytest_asyncio
+from pydantic import ValidationError
 
 # src.collections imports anki.collection first — the wheel's anki.notes
 # cannot be the FIRST anki module imported (circular import through anki.cards).
@@ -19,7 +20,7 @@ from anki.notes import Note
 
 from src.errors import CollectionToolError
 from src.logging_util import RedactingFormatter
-from src.models import NoteInput
+from src.models import AddTagsInput, BuryCardsInput, NoteInput
 from src.sync_manager import SyncManager
 from src.users import UserStore
 from src.tools import decks as deck_tools
@@ -346,6 +347,63 @@ async def test_add_notes_duplicate_spaced_field_name_detected(env):
 
 
 @pytest.mark.asyncio
+async def test_add_notes_intra_batch_duplicates_rejected(env):
+    """Two identical notes inside ONE batch fail the pass-1 seen-set gate.
+
+    The pre-existing-collection duplicate check cannot see them (neither note
+    exists yet), so without this gate the batch would silently create N
+    identical notes. The failure is the same 'Duplicate check failed' error
+    the collection check raises, and NOTHING is created.
+    """
+    reg, manager = env
+    notes = [
+        NoteInput(deck_name="Default", model_name="Basic", fields={"Front": "same-q", "Back": "a"}),
+        NoteInput(deck_name="Default", model_name="Basic", fields={"Front": "same-q", "Back": "b"}),
+    ]
+    res = await note_tools.add_notes(manager, reg, "alice", notes, allow_duplicates=False)
+    assert res.success is False
+    assert res.local_status == "failed"
+    assert "Duplicate check failed" in res.error
+    assert "note index(es) [1]" in res.error  # the SECOND copy is flagged
+    count = await reg.run("alice", lambda col: len(col.find_notes("*")))
+    assert count == 0  # zero notes created
+
+    # allow_duplicates=True still creates both.
+    res2 = await note_tools.add_notes(manager, reg, "alice", notes, allow_duplicates=True)
+    assert res2.success is True, res2.error
+    assert res2.data["count"] == 2
+    count = await reg.run("alice", lambda col: len(col.find_notes("*")))
+    assert count == 2
+
+
+@pytest.mark.asyncio
+async def test_add_notes_empty_first_fields_exempt_from_intra_batch_gate(env):
+    """Notes whose stripped first field is empty are exempt, mirroring the
+    collection check's early return: two blank-first-field notes in one batch
+    are not intra-batch duplicates."""
+    reg, manager = env
+    notes = [
+        NoteInput(deck_name="Default", model_name="Basic", fields={"Front": "   ", "Back": "a"}),
+        NoteInput(deck_name="Default", model_name="Basic", fields={"Front": "", "Back": "b"}),
+    ]
+    res = await note_tools.add_notes(manager, reg, "alice", notes, allow_duplicates=False)
+    assert res.success is True, res.error
+    assert res.data["count"] == 2
+
+
+def test_note_input_rejects_malformed_deck_names():
+    """NoteInput now rejects the same deck-name shapes create_deck/rename_deck
+    reject, so add_notes cannot create the mangling shapes (':::' runs, empty
+    hierarchy components, control characters, >200 chars)."""
+    for bad in ("A:::B", "Bad\x01Name", "x" * 201):
+        with pytest.raises(ValidationError):
+            NoteInput(deck_name=bad, note_type="Basic", fields={"Front": "q", "Back": "a"})
+    # Sanity: a well-formed hierarchical name still passes.
+    assert NoteInput(deck_name="Parent::Child", note_type="Basic",
+                     fields={"Front": "q", "Back": "a"}).deck_name == "Parent::Child"
+
+
+@pytest.mark.asyncio
 async def test_add_notes_unknown_model_lists_available(env):
     reg, manager = env
     notes = [NoteInput(deck_name="Default", model_name="No Such Model", fields={"Front": "q"})]
@@ -528,6 +586,40 @@ async def test_add_tags_missing_note_ids_rejected(env):
     assert res.success is False
     assert "not found" in res.error
     assert "99999" in res.error
+
+
+def test_add_tags_input_bounds():
+    """AddTagsInput shares _IdListInput's 500-ID cap and remove_tags' tag rules.
+
+    Deliberate tightening: whitespace-bearing tags used to be silently
+    stripped; they are now rejected, exactly like remove_tags rejects them.
+    """
+    # 501 note IDs rejected; 500 pass.
+    with pytest.raises(ValidationError, match="Batches are limited to 500"):
+        AddTagsInput(note_ids=list(range(1, 502)), tags=["t"])
+    ok = AddTagsInput(note_ids=list(range(1, 501)), tags=["t"])
+    assert ok.note_ids == list(range(1, 501))
+    # 51 tags rejected; 50 pass.
+    with pytest.raises(ValidationError, match="between 1 and 50 tags"):
+        AddTagsInput(note_ids=[1], tags=[f"t{i}" for i in range(51)])
+    assert len(AddTagsInput(note_ids=[1], tags=[f"t{i}" for i in range(50)]).tags) == 50
+    # Whitespace-bearing and control-character tags are rejected (no stripping).
+    with pytest.raises(ValidationError, match="must not contain whitespace"):
+        AddTagsInput(note_ids=[1], tags=["two words"])
+    with pytest.raises(ValidationError, match="control characters"):
+        AddTagsInput(note_ids=[1], tags=["bad\x01tag"])
+
+
+# -- card selection input shape ------------------------------------------------------
+
+
+def test_card_selection_error_names_card_ids():
+    """A card_ids-vs-query violation reports card_ids, not note_ids: the shared
+    XOR rule's error names the field the caller actually sent."""
+    with pytest.raises(ValidationError) as exc:
+        BuryCardsInput(card_ids=[1, 2], query="deck:Default")
+    assert "card_ids" in str(exc.value)
+    assert "note_ids" not in str(exc.value)
 
 
 # -- cross-user isolation -----------------------------------------------------------

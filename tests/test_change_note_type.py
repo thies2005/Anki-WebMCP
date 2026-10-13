@@ -165,6 +165,52 @@ async def test_preview_resolves_maps_and_warns_without_changing_anything(env):
     assert items["Notes"] == "strong verb"
 
 
+@pytest.mark.asyncio
+async def test_preview_honors_explicit_maps(env):
+    """preview_note_type_change with explicit field_map/template_map resolves
+    EXACTLY what change_note_type would apply with the same maps — not the
+    positional default — and its warnings match the mapped fate.
+
+    For SrcVocab(Word, Meaning, Notes) -> TgtVocab(Front, Extra): the explicit
+    map preserves 'Notes' (the default would discard it) and discards
+    'Meaning' (the default would keep it), so the warning sets differ.
+    """
+    reg, manager = env
+    nid = await _setup_vocab_user(reg, "wanda")
+
+    explicit = await note_tools.preview_note_type_change(
+        reg, "wanda", "TgtVocab", note_ids=[nid],
+        field_map={"Front": "Notes", "Extra": "Word"},
+        template_map={"Card 1": "Card 1"},
+    )
+    assert explicit["field_map"] == {"Front": "Notes", "Extra": "Word"}
+    assert explicit["template_map"] == {"Card 1": "Card 1"}
+    # Warnings match the MAPPED fate: 'Notes' is preserved (not warned),
+    # 'Meaning' is discarded (warned).
+    assert not any("'Notes'" in w for w in explicit["warnings"])
+    assert any("'Meaning'" in w and "discarded" in w for w in explicit["warnings"])
+
+    # The same selection previewed WITHOUT maps differs: positional default
+    # Front<-Word, Extra<-Meaning, and 'Notes' — not 'Meaning' — is warned.
+    default = await note_tools.preview_note_type_change(reg, "wanda", "TgtVocab", note_ids=[nid])
+    assert default["field_map"] == {"Front": "Word", "Extra": "Meaning"}
+    assert any("'Notes'" in w and "discarded" in w for w in default["warnings"])
+    assert not any("'Meaning'" in w for w in default["warnings"])
+
+    # The mutation with the same maps applies exactly the previewed resolution:
+    # Front gets the preserved 'Notes' content, 'Meaning' is discarded.
+    res = await note_tools.change_note_type(
+        manager, reg, "wanda", "TgtVocab", note_ids=[nid],
+        field_map={"Front": "Notes", "Extra": "Word"},
+        template_map={"Card 1": "Card 1"}, confirm=True,
+    )
+    assert res.success is True, res.error
+    assert res.data["field_map"] == explicit["field_map"]
+    assert res.data["template_map"] == explicit["template_map"]
+    items = dict(await reg.run("wanda", lambda col: col.get_note(nid).items()))
+    assert items == {"Front": "strong verb", "Extra": "kaufen"}
+
+
 # -- mapping semantics -------------------------------------------------------------
 
 

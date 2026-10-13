@@ -32,10 +32,12 @@ from starlette.requests import Request
 from src.collections import CollectionRegistry
 from src.config import Settings
 from src.main import (
+    LOCAL_UNTIL_SYNCED_SUFFIX,
     MAX_FORM_BODY_BYTES,
     PRELOGIN_COOKIE_NAME,
     PRELOGIN_FIELD_NAME,
     PRELOGIN_TTL_SECONDS,
+    SERVER_INSTRUCTIONS,
     UVICORN_LIMIT_CONCURRENCY,
     _archive_ledger_dir,
     _body_too_large,
@@ -217,6 +219,85 @@ def test_uvicorn_run_kwargs_carry_concurrency_limit(tmp_path):
     assert kwargs["port"] == settings.mcp_port
     assert kwargs["log_level"] == settings.log_level.lower()
     assert kwargs["access_log"] is False
+    # Proxy-aware client IP (authweb-1): X-Forwarded-For is honored from
+    # trusted proxies only, so the login rate limiter does not merge every
+    # caller behind a tunnel/proxy into one bucket.
+    assert kwargs["proxy_headers"] is True
+    assert kwargs["forwarded_allow_ips"] == settings.forwarded_allow_ips
+
+
+def test_uvicorn_forwarded_allow_ips_follows_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("FORWARDED_ALLOW_IPS", "10.0.0.0/8,172.16.0.0/12")
+    settings = Settings(
+        session_secret="s",
+        data_dir=str(tmp_path),
+        users_file=str(tmp_path / "users.json"),
+    )
+    kwargs = _uvicorn_run_kwargs(settings)
+    assert settings.forwarded_allow_ips == "10.0.0.0/8,172.16.0.0/12"
+    assert kwargs["forwarded_allow_ips"] == "10.0.0.0/8,172.16.0.0/12"
+
+
+# ---------------------------------------------------------------------------
+# Truthful sync contract text (synccorr-2 / syncsec-1 / core-2): every
+# client-facing surface must disclose that the pre-tool sync PUSHES pending
+# local changes — none may claim mutations stay local until an explicit sync.
+# ---------------------------------------------------------------------------
+
+
+def _read_readme() -> str:
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(repo_root, "README.md"), encoding="utf-8") as f:
+        return f.read()
+
+
+def test_sync_contract_text_discloses_automatic_push():
+    from src.sync_manager import _UNSYNCED_CHANGES_WARNING
+
+    banned = [
+        "nothing reaches AnkiWeb automatically",
+        "mutations never sync automatically",
+        "mutations do **not** auto-sync",
+        "Changes stay local until sync_collection pushes",
+        "Mutations are LOCAL ONLY",
+    ]
+    surfaces = {
+        "SERVER_INSTRUCTIONS": SERVER_INSTRUCTIONS,
+        "LOCAL_UNTIL_SYNCED_SUFFIX": LOCAL_UNTIL_SYNCED_SUFFIX,
+        "_UNSYNCED_CHANGES_WARNING": _UNSYNCED_CHANGES_WARNING,
+        "README.md": _read_readme(),
+    }
+    for name, text in surfaces.items():
+        lowered = text.lower()
+        for phrase in banned:
+            assert phrase.lower() not in lowered, f"{name} still claims {phrase!r}"
+
+    # Positive disclosure: each surface must state the push semantics, and
+    # the suffix keeps naming sync_collection (mutating-tool descriptions
+    # are pinned to mention it).
+    assert "push" in SERVER_INSTRUCTIONS.lower()
+    assert "two-way" in SERVER_INSTRUCTIONS.lower()
+    assert "sync_collection" in LOCAL_UNTIL_SYNCED_SUFFIX
+    assert "push" in LOCAL_UNTIL_SYNCED_SUFFIX.lower()
+    assert "push" in _UNSYNCED_CHANGES_WARNING.lower()
+
+    readme = surfaces["README.md"]
+    # Opener of the Write Safety section states the two-way pre-tool push.
+    opener = [line for line in readme.splitlines() if line.startswith("The core change from v1:")]
+    assert opener, "README lost the Write Safety opener paragraph"
+    assert "two-way" in opener[0]
+    assert "push" in opener[0].lower()
+    assert "SYNC_BEFORE_TOOLS=false" in opener[0]
+    # The pre-tool bullet states push semantics.
+    bullet = [line for line in readme.splitlines() if "before every tool" in line]
+    assert bullet, "README lost the pre-tool sync bullet"
+    assert "push" in bullet[0].lower()
+    # The sync_collection tool row no longer claims mutations never auto-sync
+    # and discloses the automatic delayed push.
+    sync_rows = [line for line in readme.splitlines() if line.startswith("| `sync_collection`")]
+    assert sync_rows, "README tools table lost its sync_collection row"
+    assert "push" in sync_rows[0].lower()
+    assert "automatically" in sync_rows[0].lower()
 
 
 # ---------------------------------------------------------------------------

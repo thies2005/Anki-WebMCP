@@ -65,17 +65,30 @@ class Settings:
     # configurable via env; values <= 0 are refused at Settings construction.
     mcp_max_sessions: int = field(default_factory=lambda: _env_int_min("MCP_MAX_SESSIONS", 16, 1))
     mcp_session_idle_timeout: int = field(default_factory=lambda: _env_int_min("MCP_SESSION_IDLE_TIMEOUT", 300, 1))
-    # Pre-tool AnkiWeb sync: pull the account's AnkiWeb state ahead of every
-    # MCP tool call so tools always operate on current data. Fail-open (a
-    # failed pre-sync never blocks the tool — it proceeds on local data) and
-    # throttled per user: the FIRST tool call in a cooldown window pulls from
-    # AnkiWeb, the rest run on local data until the window expires (default
-    # 30 minutes; 0 = pull before every call). Only applies to accounts with
-    # saved AnkiWeb credentials; disable entirely with SYNC_BEFORE_TOOLS=false.
+    # Pre-tool AnkiWeb sync: run a full two-way sync with AnkiWeb ahead of
+    # every MCP tool call — pulling the account's remote state so tools
+    # always operate on current data AND pushing the local changes made
+    # since the last window (Anki's protocol has no pull-only delta sync).
+    # Fail-open (a failed pre-sync never blocks the tool — it proceeds on
+    # local data) and throttled per user: the FIRST tool call in a cooldown
+    # window syncs, the rest run on local data until the window expires
+    # (default 30 minutes; 0 = sync before every call). Only applies to
+    # accounts with saved AnkiWeb credentials; disable entirely with
+    # SYNC_BEFORE_TOOLS=false (mutations then stay local until an explicit
+    # sync_collection).
     sync_before_tools: bool = field(default_factory=lambda: _env_bool("SYNC_BEFORE_TOOLS", True))
     sync_before_tools_ttl_seconds: int = field(
         default_factory=lambda: _env_int_min("SYNC_BEFORE_TOOLS_TTL_SECONDS", 1800, 0)
     )
+    # Comma-separated list of proxy IPs whose X-Forwarded-For header uvicorn
+    # may trust when deriving request.client.host (PROXY_HEADERS must name
+    # the header; uvicorn's default set includes x-forwarded-for). Behind the
+    # recommended cloudflared/Traefik exposure the socket peer is the proxy
+    # container, which would otherwise merge every caller into one login
+    # rate-limit bucket. Set to the proxy/tunnel network, or "*" when the
+    # service is ONLY reachable through the proxy (never "*" on a LAN-exposed
+    # port — a spoofed header would then rotate the rate-limit identity).
+    forwarded_allow_ips: str = field(default_factory=lambda: _env_str("FORWARDED_ALLOW_IPS", "127.0.0.1"))
 
     def __post_init__(self):
         # Derive users_file from data_dir instead of double-reading the

@@ -41,9 +41,20 @@ logger = logging.getLogger("anki_mcp.sync_manager")
 _REPLAY_WARNING = "Idempotent operation replay. Returned cached result from {}."
 _LEDGER_WRITE_WARNING = "Failed to write to persistent idempotency ledger."
 _UNSYNCED_CHANGES_WARNING = (
-    "Changes committed locally only. Call sync_collection to push them to "
-    "AnkiWeb and pull remote changes."
+    "Changes committed to the local collection. They are pushed to AnkiWeb "
+    "automatically by the next pre-tool sync (a full two-way sync, at most "
+    "one SYNC_BEFORE_TOOLS_TTL_SECONDS window later), or immediately by "
+    "calling sync_collection."
 )
+
+# Upper bound on how long sync_before_tool WAITS for a concurrent-sync slot
+# before giving up for this call. The pre-tool sync must never queue a tool
+# call behind other users' full syncs: on timeout the tool proceeds on local
+# data (fail-open, same as a failed sync) and the next TTL-window expiry
+# retries. The bound lives inside registry.sync_user (semaphore-acquire
+# timeout) — cancelling mid-sync would release the user lock while the sync
+# thread keeps writing (Collection is not thread-safe).
+PRETOOL_SYNC_ACQUIRE_TIMEOUT_SECONDS = 15.0
 
 
 class SyncManager:
@@ -129,7 +140,12 @@ class SyncManager:
     # -- explicit sync ----------------------------------------------------------
 
     async def sync_before_tool(self, username: str) -> None:
-        """Pull the user's AnkiWeb state before an MCP tool call runs.
+        """Two-way sync the user's collection with AnkiWeb before a tool call.
+
+        This is a FULL two-way sync, not a pull: besides pulling remote
+        changes the tool is about to need, it also PUSHES the local changes
+        made since the last window — automatic AnkiWeb egress, disclosed in
+        every client-facing contract surface.
 
         Contract — fail-open, never blocking, never raising:
         - no-op when the feature is disabled (SYNC_BEFORE_TOOLS=false), when
@@ -138,14 +154,20 @@ class SyncManager:
           when the last attempt is younger than the TTL window
           (SYNC_BEFORE_TOOLS_TTL_SECONDS; 0 = sync before every call);
         - otherwise delegates to registry.sync_user (which snapshots first,
-          then two-way syncs — pulling remote changes the tool is about to
-          need) and swallows every failure with a log line: the tool call
-          proceeds on local data. A failed attempt still consumes the TTL
-          window, so a reachable-but-broken AnkiWeb cannot slow every tool
-          call with back-to-back retries.
+          then runs the two-way delta sync — pulling remote changes AND
+          pushing pending local ones) and swallows every failure with a log
+          line: the tool call proceeds on local data. A failed attempt still
+          consumes the TTL window, so a reachable-but-broken AnkiWeb cannot
+          slow every tool call with back-to-back retries;
+        - the WAIT for a concurrent-sync slot is bounded by
+          PRETOOL_SYNC_ACQUIRE_TIMEOUT_SECONDS (forwarded as acquire_timeout
+          to registry.sync_user): a busy slot skips this sync (warning log)
+          instead of queueing the tool call behind other users' full syncs.
 
         Called from main's _tool_guard ahead of every tool except
-        sync_collection (that tool IS the sync).
+        sync_collection (that tool IS the sync) and except tools whose
+        account is denied sync_collection by a tool rule (the rule doubles
+        as the per-tool opt-out from automatic AnkiWeb egress).
         """
         if not self.settings.sync_before_tools:
             return
@@ -166,6 +188,7 @@ class SyncManager:
                 user.ankiweb_email,
                 user.ankiweb_password,
                 on_step=self._on_step(username),
+                acquire_timeout=PRETOOL_SYNC_ACQUIRE_TIMEOUT_SECONDS,
             )
             if result.get("success"):
                 logger.debug("Pre-tool sync for %r ok", username)

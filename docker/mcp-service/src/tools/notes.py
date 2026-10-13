@@ -146,6 +146,11 @@ def _add_notes_impl(col, notes: List[NoteInput], allow_duplicates: bool) -> Dict
     # ledger record).
     resolved = []
     failures: List[int] = []
+    # Intra-batch duplicate keys: (note type, deck, first field name, stripped
+    # first-field value). The pre-existing-collection check below only sees
+    # notes already IN the collection, so two identical notes inside ONE batch
+    # would both pass it and be silently created; the seen-set closes that gap.
+    seen: set = set()
     for idx, n in enumerate(notes):
         model = col.models.by_name(n.note_type)
         if model is None:
@@ -160,6 +165,22 @@ def _add_notes_impl(col, notes: List[NoteInput], allow_duplicates: bool) -> Dict
                 f"Note index {idx}: unknown field(s) {unknown_fields} for note type "
                 f"{n.note_type!r}. Valid fields for this note type: {valid_fields}."
             )
+        # Mirror _is_first_field_duplicate's key shape, including its empty-
+        # value early return: notes whose stripped first field is empty are
+        # exempt, so two blank-first-field notes are not intra-batch duplicates.
+        try:
+            first_field_name = model["flds"][0]["name"]
+        except (KeyError, IndexError, TypeError):
+            first_field_name = None
+        if first_field_name is not None:
+            value = (n.fields.get(first_field_name) or "").strip()
+            if value:
+                key = (n.note_type, n.deck_name, first_field_name, value)
+                if not allow_duplicates and key in seen:
+                    failures.append(idx)
+                # Recorded even when the gate is off, so the set stays warm;
+                # it is only consulted when allow_duplicates is False.
+                seen.add(key)
         if not allow_duplicates and _is_first_field_duplicate(col, model, n.deck_name, n.fields):
             failures.append(idx)
         resolved.append(model)
@@ -661,12 +682,18 @@ async def preview_note_type_change(
     new_note_type: str,
     note_ids: Optional[List[int]] = None,
     query: Optional[str] = None,
+    field_map: Optional[Dict[str, Optional[str]]] = None,
+    template_map: Optional[Dict[str, Optional[str]]] = None,
 ) -> Dict[str, Any]:
     """Preview a note-type change (read-only): resolved maps and discard warnings.
 
     The exact resolver ``change_note_type`` runs, so what the preview shows is
     what the mutation would do — including which old content is discarded.
+    Explicit maps (when given) resolve through the same resolver the mutation
+    passes them to; without them the backend's default mapping is shown.
     """
+    field_map = field_map or None
+    template_map = template_map or None
     logger.info(
         "Executing preview_note_type_change for %r: new_note_type=%r (%d note id(s), query=%r)",
         username, new_note_type, len(note_ids) if note_ids else 0, query,
@@ -674,12 +701,12 @@ async def preview_note_type_change(
 
     def _preview(col) -> Dict[str, Any]:
         nids = _resolve_change_selection(col, note_ids, query)
-        # Maps are None here: the preview always shows the change AS THE
-        # MUTATION WOULD APPLY IT with the backend's default mapping (the
-        # mutation's explicit maps reuse the exact same resolver).
+        # The maps given here (None when omitted) are exactly the ones
+        # change_note_type would receive for the same arguments, so the
+        # preview shows the change AS THE MUTATION WOULD APPLY IT.
         _request, old_name, new_name, is_cloze, fields, tmpls, warnings = _resolve_change_maps(
             col, col.models.get_single_notetype_of_notes(nids),
-            new_note_type, nids, None, None,
+            new_note_type, nids, field_map, template_map,
         )
         return {
             "old_note_type": old_name,

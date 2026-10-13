@@ -55,11 +55,18 @@ async def env(tmp_path):
 
 
 async def _patch_sync_user(monkeypatch, reg, result):
-    """Replace registry.sync_user with a recording fake returning ``result``."""
+    """Replace registry.sync_user with a recording fake returning ``result``.
+
+    The signature MUST accept ``acquire_timeout``: sync_before_tool forwards
+    it, and a fake missing the kwarg would raise a TypeError that
+    sync_before_tool swallows — silently recording zero syncs instead of
+    failing the test.
+    """
     calls = []
 
     async def fake_sync_user(
-        username, email, password, endpoint=None, on_step=None, full_sync_direction=None
+        username, email, password, endpoint=None, on_step=None,
+        full_sync_direction=None, acquire_timeout=None,
     ):
         calls.append(
             {
@@ -67,6 +74,7 @@ async def _patch_sync_user(monkeypatch, reg, result):
                 "email": email,
                 "password": password,
                 "full_sync_direction": full_sync_direction,
+                "acquire_timeout": acquire_timeout,
             }
         )
         if on_step is not None:
@@ -105,6 +113,7 @@ async def test_sync_success_records_ledger(env, monkeypatch, tmp_path):
             "email": "alice@example.com",
             "password": "ankiweb-pw",
             "full_sync_direction": None,
+            "acquire_timeout": None,  # explicit sync_now waits unbounded
         }
     ]
     # The per-user ledger recorded the success with the ledger's field shapes
@@ -192,11 +201,29 @@ async def test_sync_now_forwards_full_sync_direction_and_flag(env, monkeypatch):
             "email": "alice@example.com",
             "password": "ankiweb-pw",
             "full_sync_direction": "download",
+            "acquire_timeout": None,  # explicit sync_now waits unbounded
         }
     ]
 
 
 # -- pre-tool sync (sync_before_tool) --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pretool_sync_passes_bounded_acquire_timeout(env, monkeypatch):
+    """sync_before_tool bounds its WAIT for a sync slot: acquire_timeout is
+    forwarded to registry.sync_user, so a busy slot skips this sync (inside
+    the registry) instead of queueing the tool call behind other users."""
+    from src.sync_manager import PRETOOL_SYNC_ACQUIRE_TIMEOUT_SECONDS
+
+    reg, store, manager = env
+    monkeypatch.setattr(manager, "settings", _settings())
+    calls = await _patch_sync_user(monkeypatch, reg, {"success": True, "output": "ok"})
+
+    await manager.sync_before_tool("alice")
+
+    assert len(calls) == 1
+    assert calls[0]["acquire_timeout"] == PRETOOL_SYNC_ACQUIRE_TIMEOUT_SECONDS
 
 
 def _settings(sync_before_tools=True, ttl=0):
@@ -445,7 +472,7 @@ async def test_concurrent_same_key_mutations_apply_once(env):
     # Exactly one caller applied the mutation; the other replayed the cached
     # committed result (same assertions as the sequential replay test).
     assert counter["n"] == 1
-    # The local-only nudge warning rides on both responses now, so discriminate
+    # The sync nudge warning rides on both responses now, so discriminate
     # by the replay marker rather than by emptiness of the warnings list.
     committed = [r for r in results if not any("Idempotent operation replay" in w for w in r.warnings)]
     replayed = [r for r in results if any("Idempotent operation replay" in w for w in r.warnings)]
@@ -509,7 +536,7 @@ async def test_maintenance_mode_rejects_mutation(env):
     assert res.sync_status.pre_sync == "skipped"
 
 
-# -- local-only nudge on committed mutations -----------------------------------------
+# -- sync nudge on committed mutations -----------------------------------------
 
 
 def _has_sync_nudge(res) -> bool:
@@ -519,7 +546,11 @@ def _has_sync_nudge(res) -> bool:
 @pytest.mark.asyncio
 async def test_committed_mutation_warns_changes_stay_local(env):
     """Alice has AnkiWeb credentials: a committed mutation must tell the model
-    that the change is local only and sync_collection is needed to push it."""
+    the truth about egress — the change sits locally NOW, but it is pushed to
+    AnkiWeb automatically by the next pre-tool two-way sync (within one TTL
+    window), or immediately by an explicit sync_collection call."""
+    from src.sync_manager import _UNSYNCED_CHANGES_WARNING
+
     reg, store, manager = env
 
     async def mutation():
@@ -529,6 +560,13 @@ async def test_committed_mutation_warns_changes_stay_local(env):
 
     assert res.success is True
     assert _has_sync_nudge(res)
+    # The nudge names sync_collection AND discloses the automatic push — it
+    # must not claim the change stays local until an explicit sync.
+    assert _UNSYNCED_CHANGES_WARNING in res.warnings
+    warning = _UNSYNCED_CHANGES_WARNING.lower()
+    assert "push" in warning
+    assert "automatically" in warning
+    assert "SYNC_BEFORE_TOOLS_TTL_SECONDS" in _UNSYNCED_CHANGES_WARNING
 
 
 @pytest.mark.asyncio

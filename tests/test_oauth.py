@@ -10,6 +10,7 @@ rely on to discover the server.
 
 import base64
 import hashlib
+import json
 import re
 import secrets
 from urllib.parse import parse_qs, urlparse
@@ -515,7 +516,7 @@ async def test_token_endpoint_refuses_oversized_bodies(client):
 
 
 @pytest.mark.asyncio
-async def test_register_field_and_capacity_caps(app, client):
+async def test_register_field_caps(client):
     # Per-field cap: an oversized client_name is invalid metadata.
     res = await _register_client(client)
     assert res.status_code == 201
@@ -525,23 +526,6 @@ async def test_register_field_and_capacity_caps(app, client):
     )
     assert oversized.status_code == 400
     assert oversized.json() == {"error": "invalid_client_metadata"}
-
-    # Capacity cap: once the store is full, further registrations are refused
-    # (unauthenticated growth must be bounded).
-    store = app.state.anki_oauth_store
-    from src.oauth import MAX_CLIENTS
-
-    for i in range(MAX_CLIENTS):
-        store._clients[f"filler-{i}"] = {
-            "client_id": f"filler-{i}",
-            "client_name": "",
-            "redirect_uris": [],
-            "token_endpoint_auth_method": "none",
-            "created_at": 0.0,
-        }
-    full = await _register_client(client)
-    assert full.status_code == 400
-    assert full.json() == {"error": "invalid_client_metadata"}
 
 
 @pytest.mark.asyncio
@@ -623,3 +607,106 @@ async def test_wrong_client_refresh_burns_the_grant(app, client):
         data={"grant_type": "refresh_token", "client_id": registered, "refresh_token": refresh},
     )
     assert rightful.status_code == 400
+
+
+# -- registration capacity self-heals; epoch gate runs before minting ------------
+
+
+@pytest.mark.asyncio
+async def test_registration_self_heals_by_evicting_oldest_unreferenced_client(
+    app, client, monkeypatch
+):
+    """Poisoning /register up to MAX_CLIENTS no longer permanently blocks
+    registration: at capacity the oldest client no refresh grant references
+    is evicted to make room, and it stops being an authorize client."""
+    n = 4
+    monkeypatch.setattr("src.oauth.MAX_CLIENTS", n)
+    ids = []
+    for _ in range(n):
+        res = await _register_client(client)
+        assert res.status_code == 201
+        ids.append(res.json()["client_id"])
+
+    # Registration N+1 still succeeds — the oldest never-referenced client
+    # (ids[0], registered first) is evicted.
+    extra = await _register_client(client)
+    assert extra.status_code == 201
+    store = app.state.anki_oauth_store
+    assert store.get_client(ids[0]) is None
+    for survivor in ids[1:]:
+        assert store.get_client(survivor) is not None
+    assert store.get_client(extra.json()["client_id"]) is not None
+
+    # The evicted client_id no longer authorizes: authorize answers the plain
+    # unknown-client 400, never a redirect.
+    verifier, challenge = _pkce_pair()
+    res = await client.get(
+        "/oauth/authorize",
+        params={
+            "client_id": ids[0],
+            "redirect_uri": ALICE_REDIRECT,
+            "response_type": "code",
+            "state": STATE,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        },
+    )
+    assert res.status_code == 400
+    assert "location" not in res.headers
+
+
+@pytest.mark.asyncio
+async def test_registration_hard_cap_when_every_client_is_referenced(
+    app, client, monkeypatch
+):
+    """When every registered client holds a live refresh grant there is
+    nothing safe to evict: registration at capacity is refused."""
+    n = 3
+    monkeypatch.setattr("src.oauth.MAX_CLIENTS", n)
+    store = app.state.anki_oauth_store
+    ids = []
+    for _ in range(n):
+        res = await _register_client(client)
+        assert res.status_code == 201
+        ids.append(res.json()["client_id"])
+    # Reference every registered client with a live refresh grant...
+    for client_id in ids:
+        store.issue_refresh("alice", client_id)
+    # ...so the next registration has nothing to evict.
+    full = await _register_client(client)
+    assert full.status_code == 400
+    assert full.json() == {"error": "invalid_client_metadata"}
+
+
+@pytest.mark.asyncio
+async def test_epoch_rejected_refresh_mints_no_replacement(app, client, tmp_path):
+    """A refresh grant predating a password reset is refused BEFORE the
+    rotation mints a replacement: 400 invalid_grant, and oauth_state.json
+    holds exactly the records it held — none created after the epoch."""
+    token_body, registered = await _full_flow_tokens(app, client)
+    refresh = token_body["refresh_token"]
+
+    state_file = tmp_path / "oauth_state.json"
+    store = app.state.anki_oauth_store
+    before = json.loads(state_file.read_text())["refresh_tokens"]
+    assert len(before) == 1
+
+    app.state.anki_store.set_password("alice", "post-epoch-password")
+    user = app.state.anki_store.get_user("alice")
+    epoch = max(user.sessions_invalid_before, user.tokens_invalid_before)
+
+    res = await client.post(
+        "/oauth/token",
+        data={"grant_type": "refresh_token", "client_id": registered, "refresh_token": refresh},
+    )
+    assert res.status_code == 400
+    assert res.json() == {"error": "invalid_grant"}
+    assert "access_token" not in res.json()
+
+    # No orphaned replacement was minted: the persisted record count is
+    # unchanged and nothing in the store postdates the revocation epoch (the
+    # presented pre-epoch token is burned, so nothing survives at all).
+    after = json.loads(state_file.read_text())["refresh_tokens"]
+    assert len(after) == len(before)
+    assert all(float(rec["created_at"]) < epoch for rec in after.values())
+    assert len(store._refresh) == 0

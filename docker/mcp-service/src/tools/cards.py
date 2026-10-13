@@ -388,7 +388,12 @@ async def answer_card(
             col.sched.answer_card(answer)
             reloaded = col.get_card(card_id)
             after = col.sched.get_queued_cards(fetch_limit=50)
-            remaining = sum(1 for q in after.cards if q.card.id != card_id)
+            # The deck's TRUE remaining queue: the same per-kind sum
+            # get_review_queue reports (len(after.cards) is only the
+            # fetch-limited prefix, not the whole queue). The answered card
+            # may legitimately still be counted here when it re-enters
+            # today's learning queue (Again / a remaining learning step).
+            remaining = int(after.new_count) + int(after.learning_count) + int(after.review_count)
         return {
             "card_id": card_id,
             "rating": rating,
@@ -409,6 +414,12 @@ async def answer_card(
 
 
 # -- flagging, burying, and new-card repositioning (roadmap phase 4) -----------------
+
+
+# Chunk size for IN-queries over card selections (mirrors notes.py
+# _QUERY_CHUNK): selections are unbounded and SQLite caps host parameters
+# (999 on old builds), so selection-wide reads run in bounded batches.
+_QUERY_CHUNK = 500
 
 
 def _resolve_card_selection(
@@ -510,12 +521,14 @@ async def unbury_cards(
     card_ids: Optional[List[int]] = None,
     query: Optional[str] = None,
 ) -> MutationResponse:
-    """Unbury the selected cards.
+    """Unbury the selected cards, reporting how many were actually restored.
 
     Wheel semantics (probed: the backend operation is
     ``restore_buried_and_suspended_cards``): this restores BURIED AND
     SUSPENDED cards alike, so suspended cards in the selection are
-    unsuspended too — disclosed in the tool description.
+    unsuspended too — disclosed in the tool description. ``unburied`` counts
+    the selection cards that were actually buried or suspended (queue < 0)
+    just before the call; ``selected`` is the selection size.
     """
     logger.info(
         "Executing unbury_cards for %r (%d id(s), query=%r)",
@@ -524,10 +537,19 @@ async def unbury_cards(
 
     def _apply(col) -> Dict[str, Any]:
         cids = _resolve_card_selection(col, card_ids, query, "Cannot unbury cards")
+        # OpChanges carries no count (probed wheel API), so count the cards
+        # the restore actually affects: buried (-3) or suspended (-1) cards
+        # have queue < 0; active queues are >= 0 (probed wheel behavior).
+        restored_count = 0
+        for start in range(0, len(cids), _QUERY_CHUNK):
+            chunk = cids[start : start + _QUERY_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            restored_count += col.db.scalar(
+                f"SELECT COUNT() FROM cards WHERE id IN ({placeholders}) AND queue < 0",
+                *chunk,
+            )
         col.sched.unbury_cards(cids)
-        # OpChanges carries no count (probed wheel API): the selection size is
-        # the honest report.
-        return {"unburied": len(cids)}
+        return {"unburied": int(restored_count), "selected": len(cids)}
 
     async def _mutation() -> Dict[str, Any]:
         return await registry.run(username, _apply)

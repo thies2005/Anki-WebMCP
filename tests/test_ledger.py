@@ -1,5 +1,6 @@
 """Unit tests for persistent IdempotencyLedger."""
 
+import asyncio
 import json
 import logging
 import os
@@ -69,6 +70,50 @@ async def test_ledger_evicts_oldest_entries_beyond_cap(temp_ledger_file):
 
     with open(temp_ledger_file, "r", encoding="utf-8") as f:
         assert len(json.load(f)) == 3
+
+
+# -- concurrent recorders serialize; writes run off the event loop ----------------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_recorders_serialize_without_loss(temp_ledger_file):
+    """Concurrent record_* calls serialize under the ledger lock: every entry
+    lands exactly once and the on-disk file stays valid JSON after the batch.
+
+    The atomic save runs on a worker thread (asyncio.to_thread) while the
+    lock is held, so this also exercises the off-event-loop write path under
+    contention (a lost update or torn write would show up as a missing or
+    duplicated key here).
+    """
+    ledger = IdempotencyLedger(temp_ledger_file)
+
+    successes = [ledger.record_success(f"op-ok-{i}", {"i": i}) for i in range(20)]
+    failures = [ledger.record_failure(f"op-bad-{i}", "rejected") for i in range(5)]
+    await asyncio.gather(*successes, *failures)
+
+    # Nothing lost in memory.
+    for i in range(20):
+        entry = await ledger.get(f"op-ok-{i}")
+        assert entry is not None
+        assert entry["status"] == "committed"
+        assert entry["data"] == {"i": i}
+    for i in range(5):
+        entry = await ledger.get(f"op-bad-{i}")
+        assert entry is not None
+        assert entry["status"] == "failed"
+
+    # The file on disk is valid JSON and holds the same 25 entries exactly
+    # once each (atomic replace: no interleaved or torn write).
+    with open(temp_ledger_file, "r", encoding="utf-8") as f:
+        on_disk = json.load(f)
+    assert len(on_disk) == 25
+    assert sum(1 for e in on_disk.values() if e["status"] == "committed") == 20
+    assert sum(1 for e in on_disk.values() if e["status"] == "failed") == 5
+
+    # A fresh ledger over the same file sees every entry (no lost update).
+    reopened = IdempotencyLedger(temp_ledger_file)
+    assert await reopened.get("op-ok-19") is not None
+    assert await reopened.get("op-bad-4") is not None
 
 
 # -- per-entry key-length bound (MAX_KEY_LEN) -------------------------------------

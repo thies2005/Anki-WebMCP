@@ -22,14 +22,20 @@ services:
       - MAX_OPEN_COLLECTIONS=${MAX_OPEN_COLLECTIONS:-5}
       - MAX_CONCURRENT_SYNCS=${MAX_CONCURRENT_SYNCS:-2}
       - BACKUP_RETENTION=${BACKUP_RETENTION:-20}
-      # Pre-tool AnkiWeb pull: sync from web before every MCP tool call.
+      # Pre-tool AnkiWeb sync: full two-way sync before every MCP tool call
+      # (pulls remote state AND pushes pending local changes).
       - SYNC_BEFORE_TOOLS=${SYNC_BEFORE_TOOLS:-true}
-      # Per-user cooldown for that pull (0 = pull before every call).
+      # Per-user cooldown for that sync (0 = sync before every call).
       - SYNC_BEFORE_TOOLS_TTL_SECONDS=${SYNC_BEFORE_TOOLS_TTL_SECONDS:-1800}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       # Set true when serving HTTPS through a reverse proxy so session/flash
       # cookies carry the Secure attribute.
       - FORCE_SECURE_COOKIES=${FORCE_SECURE_COOKIES:-false}
+      # Comma-separated proxy IPs whose X-Forwarded-For may override the
+      # socket peer for request.client.host (login rate limiting). Set to the
+      # proxy/tunnel network, or "*" when the service is only reachable
+      # through the proxy.
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1}
     volumes:
       - mcp_data:/data
     ports:

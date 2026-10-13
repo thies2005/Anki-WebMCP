@@ -8,6 +8,8 @@ is asserted by RE-READING through col.models.by_name in a fresh registry.run
 not via the dict the mutation happened to hold.
 """
 
+import os
+
 import pytest
 import pytest_asyncio
 from pydantic import ValidationError
@@ -15,6 +17,7 @@ from pydantic import ValidationError
 # src.collections imports anki.collection first — the wheel's anki.notes
 # cannot be the FIRST anki module imported (circular import through anki.cards).
 from src.collections import CollectionRegistry  # isort: skip
+from anki.models import ModelManager
 from anki.notes import Note
 
 from src.errors import CollectionToolError
@@ -257,6 +260,40 @@ async def test_update_note_type_template_rename_collision_is_refused(env):
     )
     assert res.success is False
     assert "Two templates" in res.error and "'Card 2'" in res.error
+
+
+@pytest.mark.asyncio
+async def test_update_note_type_refuses_duplicate_template_entries_and_persists_nothing(env):
+    """debt-3: [A→X, A→B] used to slip past the rename-collision check — the
+    check's next() saw only the FIRST entry per template while the apply loop
+    ran BOTH (later edits silently overwriting earlier ones). A repeated
+    template name is now refused before any write."""
+    reg, manager = env
+
+    def _setup(col):
+        _make_note_type(
+            col, "DupT", ["F1", "F2"],
+            templates=[("Card 1", "{{F1}}", "{{FrontSide}}<hr>{{F2}}"),
+                       ("Card 2", "{{F2}}", "{{FrontSide}}<hr>{{F1}}")],
+        )
+
+    await reg.run("hilde", _setup)
+    res = await notetype_tools.update_note_type(
+        manager, reg, "hilde", "DupT",
+        template_updates=[
+            TemplateUpdateInput(template="Card 1", new_name="X"),
+            TemplateUpdateInput(template="Card 1", new_name="B", front="{{F2}}"),
+        ],
+    )
+    assert res.success is False and res.local_status == "failed"
+    assert "same template twice" in res.error
+    assert "'Card 1'" in res.error
+
+    # Nothing persisted: both templates keep their names and fronts.
+    state = await reg.run("hilde", lambda col: [
+        (t["name"], t["qfmt"]) for t in col.models.by_name("DupT")["tmpls"]
+    ])
+    assert state == [("Card 1", "{{F1}}"), ("Card 2", "{{F2}}")]
 
 
 @pytest.mark.asyncio
@@ -774,6 +811,117 @@ async def test_confirm_false_skips_all_four_destructive_tools_without_snapshots(
         m.name for m in col.models.all_names_and_ids()
     ))
     assert "Empty" in names
+
+
+# -- fail-closed mid-operation aborts (debt-4) ---------------------------------------
+
+# Simulates the wheel's backend dying BETWEEN the pre-op snapshot and the
+# write: the mutation call each destructive tool makes AFTER
+# registry.snapshot_locked is patched to raise once.
+def _crash_mid_operation(*_args, **_kwargs):
+    raise RuntimeError("simulated wheel crash mid-mutation")
+
+
+async def _assert_fail_closed(res, reg, username, reason):
+    """The aborted mutation reports failure and left the reason-tagged
+    pre-op snapshot ON DISK — the recovery path."""
+    assert res.success is False and res.local_status == "failed"
+    assert "simulated wheel crash mid-mutation" in res.error
+    entries = [e for e in reg.list_backups(username) if e["reason"] == reason]
+    assert len(entries) == 1, entries
+    snapshot_path = reg.backup_path(username, entries[0]["filename"])
+    assert os.path.exists(snapshot_path) and os.path.getsize(snapshot_path) > 0
+
+
+@pytest.mark.asyncio
+async def test_remove_field_crash_after_snapshot_fails_closed(env, monkeypatch):
+    reg, manager = env
+
+    def _setup(col):
+        _make_note_type(col, "FragileF", ["Keep", "Drop"])
+        return _add_note_of(col, "FragileF", {"Keep": "k", "Drop": "d"})
+
+    nid = await reg.run("petra", _setup)
+    monkeypatch.setattr(ModelManager, "remove_field", _crash_mid_operation)
+
+    res = await notetype_tools.remove_note_type_field(
+        manager, reg, "petra", "FragileF", "Drop", confirm=True
+    )
+    await _assert_fail_closed(res, reg, "petra", "pre-remove-note-type-field")
+    # Unchanged: the crash hit before any write (update_dict never ran).
+    assert await _field_state(reg, "petra", "FragileF") == (["Keep", "Drop"], [0, 1])
+    items = dict(await reg.run("petra", lambda col: col.get_note(nid).items()))
+    assert items == {"Keep": "k", "Drop": "d"}
+
+
+@pytest.mark.asyncio
+async def test_remove_template_crash_after_snapshot_fails_closed(env, monkeypatch):
+    reg, manager = env
+
+    def _setup(col):
+        _make_note_type(
+            col, "FragileT", ["Front", "Back"],
+            templates=[("Card 1", "{{Front}}", "{{FrontSide}}<hr>{{Back}}"),
+                       ("Card 2", "{{Back}}", "{{FrontSide}}<hr>{{Front}}")],
+        )
+        return _add_note_of(col, "FragileT", {"Front": "f", "Back": "b"})
+
+    nid = await reg.run("quilla", _setup)
+    monkeypatch.setattr(ModelManager, "remove_template", _crash_mid_operation)
+
+    res = await notetype_tools.remove_note_type_template(
+        manager, reg, "quilla", "FragileT", "Card 2", confirm=True
+    )
+    await _assert_fail_closed(res, reg, "quilla", "pre-remove-note-type-template")
+    # Both templates survive, and the template's card was NOT deleted.
+    names = await reg.run("quilla", lambda col: [
+        t["name"] for t in col.models.by_name("FragileT")["tmpls"]
+    ])
+    assert names == ["Card 1", "Card 2"]
+    cards = await reg.run("quilla", lambda col: [int(c.id) for c in col.get_note(nid).cards()])
+    assert len(cards) == 2
+
+
+@pytest.mark.asyncio
+async def test_delete_note_type_crash_after_snapshot_fails_closed(env, monkeypatch):
+    reg, manager = env
+    await reg.run("rolf", lambda col: _make_note_type(col, "Doomed2", ["F1", "F2"]))
+    monkeypatch.setattr(ModelManager, "remove", _crash_mid_operation)
+
+    res = await notetype_tools.delete_note_type(manager, reg, "rolf", "Doomed2", confirm=True)
+    await _assert_fail_closed(res, reg, "rolf", "pre-delete-note-type")
+    # The type is still there.
+    names = await reg.run("rolf", lambda col: sorted(
+        m.name for m in col.models.all_names_and_ids()
+    ))
+    assert "Doomed2" in names
+
+
+@pytest.mark.asyncio
+async def test_restore_to_stock_crash_after_snapshot_fails_closed(env, monkeypatch):
+    reg, manager = env
+
+    def _setup(col):
+        nt = col.models.by_name("Basic")
+        col.models.add_field(nt, col.models.new_field("Extra"))
+        col.models.update_dict(nt)
+        return _add_note_of(col, "Basic", {"Front": "q", "Back": "a", "Extra": "precious"})
+
+    nid = await reg.run("sigge", _setup)
+    monkeypatch.setattr(ModelManager, "restore_notetype_to_stock", _crash_mid_operation)
+
+    res = await notetype_tools.restore_note_type_to_stock(
+        manager, reg, "sigge", "Basic", confirm=True
+    )
+    await _assert_fail_closed(res, reg, "sigge", "pre-restore-note-type-stock")
+    # Schema and note content are untouched (restorable from the snapshot
+    # even if they were not — but here nothing was written at all).
+    fields, items = await reg.run("sigge", lambda col: (
+        [f["name"] for f in col.models.by_name("Basic")["flds"]],
+        dict(col.get_note(nid).items()),
+    ))
+    assert fields == ["Front", "Back", "Extra"]
+    assert items == {"Front": "q", "Back": "a", "Extra": "precious"}
 
 
 # -- input model validation ----------------------------------------------------------

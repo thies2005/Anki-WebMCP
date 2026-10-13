@@ -158,7 +158,7 @@ async def test_search_notes_tool_schema_exposes_only_real_arguments(app_with_use
             # The note-type change pair exposes exactly their real arguments —
             # in particular no ``ctx`` leak and no auth state.
             assert set(tools["preview_note_type_change"]["inputSchema"]["properties"]) == {
-                "new_note_type", "note_ids", "query",
+                "new_note_type", "note_ids", "query", "field_map", "template_map",
             }
             assert set(tools["change_note_type"]["inputSchema"]["properties"]) == {
                 "new_note_type", "note_ids", "query", "field_map", "template_map",
@@ -195,11 +195,20 @@ async def test_search_notes_tool_schema_exposes_only_real_arguments(app_with_use
             assert "sync_collection" not in tools["preview_note_type_change"]["description"]
             assert "sync_collection" not in tools["get_note_type"]["description"]
             assert "sync_collection" not in tools["get_deck_config"]["description"]
+            # tools-3: the preview description tells clients to pass the same
+            # maps they will pass to change_note_type.
+            assert "field_map" in tools["preview_note_type_change"]["description"]
+            assert "template_map" in tools["preview_note_type_change"]["description"]
             # Phase-4 disclosure pins: the unbury description must admit that
             # suspended cards in the selection are restored too, and the deck
             # config update must admit the preset is shared.
             assert "suspended" in tools["unbury_cards"]["description"]
             assert "SHARED" in tools["update_deck_config"]["description"]
+            # tools-1 companion: `unburied` counts cards actually restored,
+            # not the selection size.
+            unbury_desc = tools["unbury_cards"]["description"]
+            assert "unburied" in unbury_desc
+            assert "actually restored" in unbury_desc
 
 
 @pytest.mark.asyncio
@@ -288,11 +297,12 @@ async def test_user_scoping_end_to_end_two_users_isolated(app_with_users):
 
 @pytest.mark.asyncio
 async def test_initialize_result_carries_sync_guidance_instructions(app_with_users):
-    """The initialize handshake must teach clients the local-until-synced rule.
+    """The initialize handshake must teach clients the sync contract.
 
     Connected models (claude.ai, Perplexity, ...) only see the server through
-    tools; without ``instructions`` naming sync_collection they cannot know a
-    separate call is required to reach AnkiWeb.
+    tools; without ``instructions`` naming sync_collection and disclosing the
+    automatic pre-tool two-way push, they cannot know when changes reach
+    AnkiWeb.
     """
     app, settings, alice_token, _ = app_with_users
 
@@ -368,6 +378,48 @@ async def test_tool_descriptions_teach_local_only_semantics(app_with_users):
 
 
 @pytest.mark.asyncio
+async def test_preview_note_type_change_forwards_field_map_over_mcp(app_with_users):
+    """tools-3 wiring end-to-end: the preview tool's field_map/template_map
+    arguments reach the resolver, so the preview reflects the MAPPED change
+    (not the positional default) — exactly what change_note_type would apply
+    with the same maps."""
+    app, settings, alice_token, _ = app_with_users
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+            headers = await _init_session(client, alice_token)
+
+            created = json.loads((await _call_tool(client, headers, "create_note_type", {
+                "name": "SrcRev", "fields": ["Alpha", "Beta"],
+            }))["result"]["content"][0]["text"])
+            assert created.get("success") is not False, created
+
+            added = json.loads((await _call_tool(client, headers, "add_notes", {
+                "notes": [{"deck_name": "Default", "note_type": "SrcRev",
+                           "fields": {"Alpha": "frontish", "Beta": "backish"}}],
+            }))["result"]["content"][0]["text"])
+            assert added["success"] is True, added
+            nid = added["data"]["created_note_ids"][0]
+
+            payload = await _call_tool(client, headers, "preview_note_type_change", {
+                "new_note_type": "Basic", "note_ids": [nid],
+                "field_map": {"Front": "Beta", "Back": "Alpha"},
+            })
+            preview = json.loads(payload["result"]["content"][0]["text"])
+            assert "field_map" in preview, preview  # read envelope: no success key
+            # The MCP-layer map reached the resolver: the resolved field_map
+            # is the SWAPPED mapping, not the positional default.
+            assert preview["field_map"] == {"Front": "Beta", "Back": "Alpha"}
+
+            # Same selection without maps: the positional default differs.
+            payload = await _call_tool(client, headers, "preview_note_type_change", {
+                "new_note_type": "Basic", "note_ids": [nid],
+            })
+            default = json.loads(payload["result"]["content"][0]["text"])
+            assert default["field_map"] == {"Front": "Alpha", "Back": "Beta"}
+
+
+@pytest.mark.asyncio
 async def test_sync_collection_tool_supports_full_sync_direction(app_with_users, monkeypatch):
     """MCP access to the user-chosen full-sync direction: the tools/call
     argument flows through sync_now to registry.sync_user, and the FULL_SYNC
@@ -432,8 +484,11 @@ async def test_tools_sync_from_web_before_running(app_with_users, monkeypatch):
     synced = []
 
     async def fake_sync_user(
-        username, email, password, endpoint=None, on_step=None, full_sync_direction=None
+        username, email, password, endpoint=None, on_step=None,
+        full_sync_direction=None, acquire_timeout=None,
     ):
+        # acquire_timeout MUST be accepted: sync_before_tool forwards it, and
+        # a TypeError here would be swallowed fail-open (zero syncs recorded).
         synced.append(username)
         return {"success": True, "output": "ok"}
 

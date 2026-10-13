@@ -277,21 +277,35 @@ async def test_handle_closed_directly_between_calls_is_replaced_before_fn_runs(m
 
 @pytest.mark.asyncio
 async def test_is_stale_matches_only_backend_type_never_exception_text(make_registry):
-    """The only healthy-handle fallback is exact InvalidInput TYPE identity.
+    """The only healthy-handle fallback is the closed handle's EXACT backend
+    signature: InvalidInput with EMPTY args AND str == "CollectionNotOpen".
 
     The pinned wheel raises InvalidInput with EMPTY args for a closed handle,
-    so exception TEXT must never be matched: tool-layer messages can carry
-    user-controlled model/field names, and text matching classified benign
-    application errors (e.g. KeyError('CollectionNotOpen')) as stale."""
+    but InvalidInput is also what a backend INPUT error on a healthy handle
+    looks like (a bad find_and_replace regex arrives as InvalidInput whose
+    message is a "<pre>regex parse error:..." diagnostic) — so bare type
+    identity classified healthy handles as stale, closing/reopening them and
+    re-executing the operation. And exception TEXT must otherwise never be
+    matched: tool-layer messages can carry user-controlled model/field names,
+    and text matching classified benign application errors (e.g.
+    KeyError('CollectionNotOpen')) as stale."""
     reg = make_registry()
     await reg.run("hana", count_notes)
     healthy = reg._users["hana"].col
     assert healthy.db is not None
 
-    # Backend TYPE identity triggers the fallback regardless of args/text.
+    # The closed handle's exact signature triggers the fallback.
     backend_error = InvalidInput("CollectionNotOpen", None, None, None)
     assert backend_error.args == ()  # wheel shape: EMPTY args, no text to match
+    assert str(backend_error) == "CollectionNotOpen"
     assert CollectionRegistry._is_stale(healthy, backend_error) is True
+    # A backend InvalidInput on a HEALTHY handle whose message is an input
+    # diagnostic (bad regex), not the closed-handle marker: NOT stale — no
+    # close/reopen, no re-execution of fn.
+    input_error = InvalidInput("<pre>regex parse error:\n    (fo\nerror: unclosed group", None, None, None)
+    assert input_error.args == ()  # same EMPTY-args shape as the closed handle
+    assert str(input_error).startswith("<pre>regex parse error")
+    assert CollectionRegistry._is_stale(healthy, input_error) is False
     # Application exceptions on a healthy handle: NEVER stale, whatever text.
     assert CollectionRegistry._is_stale(healthy, KeyError("CollectionNotOpen")) is False
     assert CollectionRegistry._is_stale(healthy, ValueError("backend says CollectionNotOpen")) is False
@@ -366,6 +380,40 @@ async def test_sync_user_unreachable_endpoint_returns_structured_failure(make_re
     assert steps == ["backup", "login"]  # the sync step was never reached
 
 
+@pytest.mark.asyncio
+async def test_sync_user_acquire_timeout_skips_without_lock_backup_or_sync(make_registry):
+    """acquire_timeout bounds ONLY the wait for a global sync slot: with the
+    slot pool saturated, sync_user returns the TimeoutError failure quickly
+    and takes no user lock, no backup, opens no collection — the pre-tool
+    sync degrades to a skip instead of stalling a client's mutation behind
+    someone else's transfer. The slot itself is neither leaked nor consumed."""
+    reg = make_registry(max_concurrent_syncs=1)
+    await reg._sync_semaphore.acquire()  # saturate the only slot
+    try:
+        started = time.monotonic()
+        result = await reg.sync_user("tova", "tova@example.com", "pw", acquire_timeout=0.05)
+        elapsed = time.monotonic() - started
+
+        assert result["success"] is False
+        assert result["error_type"] == "TimeoutError"
+        assert result["error"] == "skipped: no sync slot free within 0.05s"
+        assert elapsed < 5.0  # bounded wait, not an indefinite stall
+        # Nothing happened: no collection opened, no user directory created,
+        # hence no pre-sync backup either.
+        assert not reg.is_open("tova")
+        assert not os.path.exists(os.path.join(reg.data_dir, "users", "tova"))
+    finally:
+        reg._sync_semaphore.release()
+
+    # The slot was released: a plain sync_user proceeds through the gate now
+    # (login fails fast against the discard port — but AFTER the gate, with
+    # the pre-sync backup taken, proving the earlier timeout consumed nothing).
+    result = await reg.sync_user("tova", "tova@example.com", "pw", endpoint="http://127.0.0.1:9")
+    assert result["success"] is False
+    assert result["error_type"] != "TimeoutError"
+    assert [entry["reason"] for entry in reg.list_backups("tova")] == ["pre-sync"]
+
+
 # -- backup pruning --------------------------------------------------------------------
 
 
@@ -388,6 +436,36 @@ async def test_prune_backups_keeps_only_newest_n(make_registry):
 async def test_prune_backups_tolerates_missing_directory(make_registry):
     reg = make_registry()
     assert reg.prune_backups("nobody") == []  # user never opened: no backups dir
+
+
+@pytest.mark.asyncio
+async def test_prune_backups_keeps_safety_snapshots_over_routine_churn(make_registry):
+    """Retention is per CLASS: a destructive-op (SAFETY) snapshot survives the
+    pre-sync churn that age-only pruning used to evict. With
+    backup_retention=3, one pre-delete-notes file and five pre-sync files:
+    the SAFETY file keeps its retention slot even as the OLDEST file on disk,
+    and only the newest max(_ROUTINE_BACKUP_FLOOR, 3 - 1) = 2 ROUTINE files
+    stay alongside it. Returned list == exact sorted on-disk survivors."""
+    reg = make_registry(backup_retention=3)
+    backups_dir = os.path.join(reg.data_dir, "users", "paz", "backups")
+    os.makedirs(backups_dir)
+    safety = "backup-2020-01-01-00.00.00-pre-delete-notes.colpkg"
+    for name in [safety] + [f"backup-2020-01-01-00.00.{second:02d}-pre-sync.colpkg" for second in range(1, 6)]:
+        with open(os.path.join(backups_dir, name), "w", encoding="utf-8") as f:
+            f.write("x")
+
+    kept = reg.prune_backups("paz")
+
+    assert safety in kept  # the destructive-op snapshot survives the churn
+    assert kept == sorted(
+        [
+            "backup-2020-01-01-00.00.00-pre-delete-notes.colpkg",
+            "backup-2020-01-01-00.00.04-pre-sync.colpkg",
+            "backup-2020-01-01-00.00.05-pre-sync.colpkg",
+        ]
+    )
+    assert sorted(os.listdir(backups_dir)) == kept  # returned list IS the disk state
+    assert reg.prune_backups("paz") == kept  # idempotent
 
 
 # -- username validation (path-traversal guard) -------------------------------------------
@@ -866,6 +944,44 @@ async def test_restore_round_trip_brings_deleted_notes_back(make_registry):
 
 
 @pytest.mark.asyncio
+async def test_restore_of_oldest_snapshot_at_retention_cap_reads_target_before_prune(make_registry):
+    """core-1 repro: at the retention cap, the pre-restore snapshot written
+    INSIDE restore_backup pushes the directory over retention and the prune
+    it runs deletes the OLDEST file — exactly the one a "restore the oldest
+    snapshot" call is reading (its reason, pre-restore, is a SAFETY class,
+    but the aging target is routine). The payload is therefore read BEFORE
+    the snapshot: the restore must succeed with the restored state live,
+    never FileNotFoundError."""
+    reg = make_registry(backup_retention=3)
+    await reg.run("petra", add_basic_note, "snapshot state", "back")
+    real = await reg.backup_user("petra", "manual")  # a REAL wheel colpkg
+    backups_dir = os.path.join(reg.data_dir, "users", "petra", "backups")
+    with open(os.path.join(backups_dir, real), "rb") as f:
+        data = f.read()
+    # Three identical valid snapshots at the cap under fixed chronological
+    # names (successive real backups land in the same second and would tie).
+    names = [f"backup-2020-01-01-00.00.0{i}-manual.colpkg" for i in (1, 2, 3)]
+    for name in names:
+        with open(os.path.join(backups_dir, name), "wb") as f:
+            f.write(data)
+    os.remove(os.path.join(backups_dir, real))
+    assert sorted(os.listdir(backups_dir)) == sorted(names)
+
+    # One unbacked change: the live state moves past every snapshot.
+    await reg.run("petra", add_basic_note, "unbacked change", "back")
+    assert await reg.run("petra", count_notes) == 2
+
+    result = await reg.restore_backup("petra", names[0])  # the OLDEST
+
+    assert result["restored_from"] == names[0]
+    assert result["pre_restore_snapshot"].endswith("-pre-restore.colpkg")
+    # The restored state is LIVE: the open handle was detached and the next
+    # run() reopened the restored file — the unbacked change is gone again.
+    assert not reg.is_open("petra")
+    assert await reg.run("petra", count_notes) == 1
+
+
+@pytest.mark.asyncio
 async def test_restore_backup_rejects_traversal_and_unknown_names(make_registry):
     reg = make_registry()
     snapshot = await reg.backup_user("omar", "manual")
@@ -928,3 +1044,32 @@ def test_runtime_can_decompress_the_wheels_zstd_backup_member():
     payload = b"restore-me" * 1000
     frame = zstandard.ZstdCompressor(write_content_size=False).compress(payload)
     assert _zstd_decompress(frame) == payload
+
+
+def test_backport_decompress_roundtrips_and_fails_closed_on_corrupt_frames():
+    """Direct adapter contract: the zstandard streaming adapter must
+    round-trip a content-size-less frame (exactly what the wheel writes) AND
+    fail closed on empty, truncated, and trailing-data input — the three
+    shapes the raw decompressobj silently accepts (empty -> b'', truncated ->
+    partial prefix with eof False, trailing bytes -> unused_data; probed on
+    zstandard 0.25.0). This is tested DIRECTLY because on this Python
+    (3.14+) _zstd_decompress resolves to the stdlib one-shot, which already
+    raises on truncated input — only the module-level function pins the
+    backport path's fail-closed behavior for older runtimes."""
+    pytest.importorskip("zstandard")
+    import zstandard
+
+    from src.collections import _backport_decompress
+
+    payload = b"restore-me" * 1000
+    frame = zstandard.ZstdCompressor(write_content_size=False).compress(payload)
+    assert _backport_decompress(frame) == payload
+
+    truncated = frame[: len(frame) - max(1, len(frame) // 10)]
+    assert truncated != frame  # genuinely cut mid-frame, not a no-op slice
+    with pytest.raises(ValueError):
+        _backport_decompress(truncated)
+    with pytest.raises(ValueError):
+        _backport_decompress(b"")
+    with pytest.raises(ValueError):
+        _backport_decompress(frame + b"trailing garbage")

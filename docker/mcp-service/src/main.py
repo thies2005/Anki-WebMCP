@@ -115,15 +115,24 @@ BACKUP_LIST_LIMIT = 20
 
 # Standing guidance returned in the MCP initialize handshake. Connected models
 # (claude.ai, Perplexity, ...) never see the server's source; without this
-# they have no way to learn that mutations stay local until sync_collection.
+# they have no way to learn the sync contract — including that the pre-tool
+# step PUSHES pending local changes to AnkiWeb (Anki's protocol has no
+# pull-only delta sync).
 SERVER_INSTRUCTIONS = (
-    "Before every tool call this server pulls the account's AnkiWeb state, so "
-    "data from other devices is current without any extra step (if the account "
-    "has no AnkiWeb credentials saved in the web portal, tools simply run on "
-    "the local copy). Mutating tools (notes, decks, cards, tags, note types, "
-    "media, answering reviews) write to this server's local copy only - "
-    "nothing reaches AnkiWeb automatically until you call sync_collection, "
-    "which pushes local changes and pulls remote ones in one two-way sync. "
+    "Before every tool call this server runs a full two-way sync with "
+    "AnkiWeb (at most once per SYNC_BEFORE_TOOLS_TTL_SECONDS window), so "
+    "data from other devices is current AND changes made through these "
+    "tools are pushed to AnkiWeb automatically - the pre-tool step is not "
+    "a pull-only operation. This applies only to accounts with AnkiWeb "
+    "credentials saved in the web portal (without credentials, tools run "
+    "on the local copy and nothing is pushed). Mutating tools (notes, "
+    "decks, cards, tags, note types, media, answering reviews) write to "
+    "this server's local copy; that copy reaches AnkiWeb via the next "
+    "pre-tool sync (within one TTL window), or immediately by calling "
+    "sync_collection, which runs the same two-way sync on demand. To keep "
+    "changes local until an explicit sync instead, the admin can set "
+    "SYNC_BEFORE_TOOLS=false, or a tool rule can disable sync_collection "
+    "for the account (set on the web portal's Tools page). "
     "sync_collection requires AnkiWeb credentials saved in the web portal's "
     "account settings. Review tools are deck-scoped: pass deck to "
     "get_review_queue to review a specific deck (subdecks included; without "
@@ -132,10 +141,13 @@ SERVER_INSTRUCTIONS = (
     "due in its own deck."
 )
 
-# Appended to every mutating tool's description so the local-only rule also
-# reaches clients that ignore the initialize instructions.
+# Appended to every mutating tool's description so the sync contract (an
+# automatic two-way push, not a local-only hold) also reaches clients that
+# ignore the initialize instructions.
 LOCAL_UNTIL_SYNCED_SUFFIX = (
-    " Changes stay local until sync_collection pushes them to AnkiWeb."
+    " Local changes are pushed to AnkiWeb automatically by the next"
+    " pre-tool two-way sync (at most one SYNC_BEFORE_TOOLS_TTL_SECONDS"
+    " window later) or immediately by sync_collection."
 )
 
 # Reference grouping of every registered tool, for the portal/admin rule UIs.
@@ -346,6 +358,10 @@ def _uvicorn_run_kwargs(settings: Settings) -> Dict[str, Any]:
     (limit_concurrency) by source inspection instead of booting uvicorn. The
     concurrency ceiling stays above twice the MCP session cap because every
     stateful MCP session holds a stream that also counts toward it.
+    proxy_headers/forwarded_allow_ips make request.client.host resolve to the
+    X-Forwarded-For value from TRUSTED proxies only (FORWARDED_ALLOW_IPS), so
+    the login rate limiter keys on the real client IP instead of merging
+    every caller behind a tunnel/reverse proxy into one bucket.
     """
     return {
         "host": settings.mcp_host,
@@ -353,6 +369,8 @@ def _uvicorn_run_kwargs(settings: Settings) -> Dict[str, Any]:
         "log_level": settings.log_level.lower(),
         "access_log": False,
         "limit_concurrency": max(UVICORN_LIMIT_CONCURRENCY, 2 * settings.mcp_max_sessions),
+        "proxy_headers": True,
+        "forwarded_allow_ips": settings.forwarded_allow_ips,
     }
 
 
@@ -1186,9 +1204,10 @@ def create_app(custom_settings: Optional[Settings] = None):
     #   1. deny-gate — the admin's global rules (ToolPolicyStore) UNIONED with
     #      the account's own rules (User.disabled_tool_patterns); either match
     #      refuses the call with a structured error naming rule and layer;
-    #   2. pre-tool sync — pull the account's AnkiWeb state first so the tool
-    #      operates on current data (fail-open; SYNC_BEFORE_TOOLS to tune;
-    #      sync_collection is its own sync and skips this step);
+    #   2. pre-tool sync — a full two-way sync with AnkiWeb first, so the tool
+    #      operates on current data AND pending local changes are pushed
+    #      (fail-open; SYNC_BEFORE_TOOLS to tune; sync_collection is its own
+    #      sync and skips this step);
     #   3. usage log — every call (reads included, refusals too) is recorded
     #      to the per-user log the portal's Tools page renders.
     # Captured app-locally like tool_registry above: a later create_app()'s
@@ -1246,12 +1265,22 @@ def create_app(custom_settings: Optional[Settings] = None):
             started = time.monotonic()
             try:
                 if tool_name != "sync_collection":
-                    # Sync from AnkiWeb BEFORE the tool runs so it operates on
-                    # current data. Fail-open no-op without credentials, in
-                    # maintenance mode, inside the TTL window, or on failure
+                    # Two-way sync with AnkiWeb BEFORE the tool runs: pulls
+                    # remote state AND pushes pending local changes. Fail-open
+                    # no-op without credentials, in maintenance mode, inside
+                    # the TTL window, on a busy sync slot, or on failure
                     # (details in SyncManager.sync_before_tool). sync_collection
-                    # itself is excluded — it performs the full sync anyway.
-                    await tool_sync_manager.sync_before_tool(username)
+                    # itself is excluded — it performs the full sync anyway —
+                    # and an account denied sync_collection by a tool rule gets
+                    # no automatic sync either: the rule doubles as the
+                    # per-tool opt-out from automatic AnkiWeb egress.
+                    if _disabled_by("sync_collection", username) is None:
+                        await tool_sync_manager.sync_before_tool(username)
+                    else:
+                        logger.debug(
+                            "Pre-tool sync skipped for %r: a tool rule disables sync_collection",
+                            username,
+                        )
                 result = await fn(*args, **kwargs)
             except Exception as e:
                 # The wrappers convert expected failures themselves; this arm
@@ -1330,9 +1359,11 @@ def create_app(custom_settings: Optional[Settings] = None):
     # 5. sync_collection
     @mcp.tool(
         description="Two-way sync with official AnkiWeb: pushes local changes and pulls remote ones. "
-        "Every other tool already pulls AnkiWeb state automatically before it runs (at most once "
-        "per TTL window), so call this mainly after a batch of mutating tools to PUSH changes "
-        "to AnkiWeb. Requires AnkiWeb credentials saved in "
+        "Every other tool already runs this same two-way sync automatically before it runs (at most "
+        "once per TTL window, accounts with saved credentials only), so changes made through other "
+        "tools are pushed to AnkiWeb automatically within one SYNC_BEFORE_TOOLS_TTL_SECONDS window "
+        "after they are made — call this to push immediately after a batch of mutating tools, or "
+        "when AnkiWeb reports full_sync_required. Requires AnkiWeb credentials saved in "
         "the web portal. If the result reports full_sync_required: true, AnkiWeb demands a full sync "
         "with a direction only the account owner may choose — retry once with full_sync_direction="
         "'upload' (replace AnkiWeb's copy with this service's collection) or 'download' (replace "
@@ -1734,22 +1765,29 @@ def create_app(custom_settings: Optional[Settings] = None):
         "and new note type names, the resolved field/template mapping, and warnings listing every "
         "old field whose content would be discarded and every old template whose cards would be "
         "deleted. Unmapped old content is discarded and cards regenerate on the new note type; "
-        "always run this before change_note_type."
+        "always run this before change_note_type. Pass the same field_map/template_map you will "
+        "pass to change_note_type so the preview reflects the mapped change."
     )
     @_tool_guard
     async def preview_note_type_change(
         new_note_type: str,
         note_ids: Optional[List[int]] = None,
         query: Optional[str] = None,
+        field_map: Optional[Dict[str, Optional[str]]] = None,
+        template_map: Optional[Dict[str, Optional[str]]] = None,
         ctx: Context = None,
     ) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
             return _unauthorized_tool_response()
         try:
-            parsed = PreviewNoteTypeChangeInput(new_note_type=new_note_type, note_ids=note_ids, query=query)
+            parsed = PreviewNoteTypeChangeInput(
+                new_note_type=new_note_type, note_ids=note_ids, query=query,
+                field_map=field_map, template_map=template_map,
+            )
             return await note_tools.preview_note_type_change(
-                tool_registry, username, parsed.new_note_type, parsed.note_ids, parsed.query
+                tool_registry, username, parsed.new_note_type, parsed.note_ids, parsed.query,
+                field_map=parsed.field_map, template_map=parsed.template_map,
             )
         except Exception as e:
             return _tool_error_response(e)
@@ -2266,7 +2304,8 @@ def create_app(custom_settings: Optional[Settings] = None):
     @mcp.tool(
         description="Unbury the selected cards (card_ids or query). NOTE: the scheduler's unbury "
         "restores BURIED AND SUSPENDED cards alike — any suspended card in the selection is "
-        "unsuspended too."
+        "unsuspended too. The reported `unburied` count is the number of cards actually restored "
+        "(they were buried or suspended) out of the selection, not the selection size."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
     @_tool_guard
@@ -3127,6 +3166,7 @@ def create_app(custom_settings: Optional[Settings] = None):
     app.state.anki_registry = collection_registry
     app.state.anki_store = store
     app.state.anki_oauth_store = oauth_store
+    app.state.anki_sync_manager = sync_manager
     app.state.anki_tool_policy = tool_policy_store
     app.state.anki_tool_usage = tool_usage_log
 

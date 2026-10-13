@@ -73,16 +73,40 @@ from .ledger import MAX_ENTRIES as LEDGER_MAX_ENTRIES
 from .ledger import IdempotencyLedger
 from .users import USERNAME_RE
 
+def _backport_decompress(data: bytes) -> bytes:
+    """One-shot zstd decompression via the ``zstandard`` backport, fail-closed.
+
+    Streaming adapter (``decompressobj``) because the wheel writes frames
+    WITHOUT an embedded content size, which the backport's one-shot
+    ``decompress()`` refuses ("could not determine content size in frame
+    header"). Unlike the stdlib one-shot, the streaming path silently ACCEPTS
+    garbage: an empty input decompresses to ``b""``, a truncated frame yields
+    its partial prefix, and trailing bytes after a complete frame land in
+    ``unused_data`` — all probed against zstandard 0.25.0. A restore must
+    never half-apply a corrupt database, so each of those shapes fails LOUD:
+    the frame is accepted only when it decompressed completely (``eof``) with
+    no trailing data. ``zstandard`` is imported INSIDE so importing this
+    module stays safe on runtimes without the backport.
+    """
+    import zstandard
+
+    dobj = zstandard.ZstdDecompressor().decompressobj()
+    out = dobj.decompress(data) + dobj.flush()
+    if not dobj.eof or dobj.unused_data:
+        raise ValueError(
+            "truncated, empty, or trailing-data zstd frame (dobj.eof=%s, %d trailing bytes)"
+            % (dobj.eof, len(dobj.unused_data))
+        )
+    return out
+
+
 def _load_zstd_decompress():
     """One-shot zstd decompression for the wheel's backup member, or None.
 
     Prefers the stdlib ``compression.zstd`` (Python 3.14+, PEP 784) — what the
     Docker image runs. On older Pythons falls back to the ``zstandard``
-    reference backport behind a streaming adapter: the wheel writes frames
-    WITHOUT an embedded content size, which the backport's one-shot
-    ``decompress()`` refuses ("could not determine content size in frame
-    header") while ``decompressobj`` streams them fine. Restore must never be
-    the broken half of the backup/restore pair just because the runtime
+    reference backport behind :func:`_backport_decompress`. Restore must never
+    be the broken half of the backup/restore pair just because the runtime
     predates the stdlib module.
     """
     try:
@@ -92,11 +116,7 @@ def _load_zstd_decompress():
     except ImportError:
         pass
     try:
-        import zstandard
-
-        def _backport_decompress(data: bytes) -> bytes:
-            dobj = zstandard.ZstdDecompressor().decompressobj()
-            return dobj.decompress(data) + dobj.flush()
+        import zstandard  # noqa: F401  (availability probe; the adapter imports it itself)
 
         return _backport_decompress
     except ImportError:
@@ -123,6 +143,18 @@ BACKUP_REASONS = (
     "pre-restore-note-type-stock",
     "manual",
 )
+
+# Backup classes for retention (prune_backups): reasons whose snapshots are
+# ROUTINE churn — written automatically on every sync or on-demand backup, so
+# they arrive in bursts and are interchangeable — versus SAFETY snapshots,
+# which guard one specific destructive operation (pre-delete-notes,
+# pre-change-note-type, ...) and are irreplaceable once gone. Routine churn
+# must never evict a safety snapshot, so the two classes get separate budgets.
+ROUTINE_BACKUP_REASONS = frozenset({"pre-sync", "manual"})
+# The routine budget never falls below this, so a retention cap full of safety
+# snapshots still leaves room for recent pre-sync/manual states (and a bare
+# backups/ directory full of foreign names is pruned to something, not zero).
+_ROUTINE_BACKUP_FLOOR = 2
 
 # backup-<timestamp>[-<reason>].colpkg. The timestamp is second-resolution and
 # zero-padded, so lexicographic order IS chronological order (prune_backups
@@ -364,19 +396,25 @@ class CollectionRegistry:
         Contract: the retry may fire ONLY when the handle was genuinely
         closed. The handle check is authoritative — ``col.close()`` sets
         ``db = None``, and every close path in this registry goes through
-        ``col.close()``. The single fallback is exact backend TYPE identity
-        (``isinstance(exc, InvalidInput)``): the pinned wheel raises
-        ``InvalidInput`` with EMPTY ``args`` for a closed handle, so there is
-        nothing to match in the text and, more importantly, exception TEXT is
-        NEVER matched — tool-layer messages can carry user-controlled strings
-        (model/field names), and an application exception that merely mentions
-        "CollectionNotOpen" on a healthy handle must propagate unchanged
-        without closing the handle and without re-executing ``fn`` (the retry
-        re-runs it, so non-idempotent mutations must not be re-run).
+        ``col.close()``. The single fallback is the closed handle's EXACT
+        backend signature: ``InvalidInput`` with EMPTY ``args`` and
+        ``str(exc) == "CollectionNotOpen"`` (probed on the pinned wheel
+        26.9.3 — a closed handle raises precisely that, while a backend
+        INPUT error on a healthy handle, e.g. a bad find_and_replace regex,
+        raises ``InvalidInput`` whose message is a ``<pre>regex parse
+        error:...`` diagnostic). Exact type identity alone is not enough:
+        it also matched those healthy-handle input errors, closing and
+        reopening a good handle and re-executing ``fn`` (the retry re-runs
+        it, so non-idempotent mutations must not be re-run). Exception TEXT
+        beyond this one exact marker is still NEVER matched — tool-layer
+        messages can carry user-controlled strings (model/field names), and
+        an application exception that merely mentions "CollectionNotOpen"
+        on a healthy handle must propagate unchanged (and is not an
+        ``InvalidInput`` instance anyway, so it cannot match).
         """
         if getattr(col, "db", None) is None:
             return True
-        return isinstance(exc, InvalidInput)
+        return isinstance(exc, InvalidInput) and str(exc) == "CollectionNotOpen"
 
     async def _recover_stale(self, state: _UserState, col: Collection) -> Collection:
         """Drop a stale handle and reopen. Caller holds state.lock."""
@@ -595,11 +633,21 @@ class CollectionRegistry:
     # -- backup pruning ----------------------------------------------------------
 
     def prune_backups(self, username: str) -> List[str]:
-        """Keep only the backup_retention newest files in backups/; returns kept names.
+        """Prune backups/ by retention CLASS; returns the sorted kept names.
 
-        Real Anki backups are named ``backup-YYYY-MM-DD-HH.MM.SS.colpkg``
-        (verified against the wheel), so lexicographic order IS chronological
-        order. Exposed as a method for testability and reuse by sync_user.
+        Files are classified via BACKUP_FILENAME_RE: a file whose reason tag
+        exists and is NOT in ROUTINE_BACKUP_REASONS is SAFETY (a destructive-
+        op snapshot such as pre-delete-notes); everything else — pre-sync and
+        manual churn, plain and foreign names — is ROUTINE. The newest
+        ``backup_retention`` SAFETY files and the newest
+        ``max(_ROUTINE_BACKUP_FLOOR, backup_retention - kept_safety)``
+        ROUTINE files survive; the rest are deleted. Routine pre-sync churn
+        can therefore no longer evict destructive-op snapshots, at the cost
+        of the total exceeding ``backup_retention`` by at most
+        ``_ROUTINE_BACKUP_FLOOR``. Real Anki backups are named
+        ``backup-YYYY-MM-DD-HH.MM.SS[-<reason>].colpkg`` (verified against
+        the wheel), so lexicographic order IS chronological order. Exposed
+        as a method for testability and reuse by sync_user.
         """
         _check_username(username)
         backup_dir = self._backups_dir(username)
@@ -607,7 +655,16 @@ class CollectionRegistry:
             names = sorted(n for n in os.listdir(backup_dir) if os.path.isfile(os.path.join(backup_dir, n)))
         except FileNotFoundError:
             return []
-        keep = set(names[-self.backup_retention :]) if self.backup_retention > 0 else set()
+
+        def _is_safety(name: str) -> bool:
+            match = BACKUP_FILENAME_RE.fullmatch(name)
+            return match is not None and match.group(2) is not None and match.group(2) not in ROUTINE_BACKUP_REASONS
+
+        safety = [name for name in names if _is_safety(name)]
+        routine = [name for name in names if not _is_safety(name)]
+        kept_safety = set(safety[-self.backup_retention :]) if self.backup_retention > 0 else set()
+        routine_budget = max(_ROUTINE_BACKUP_FLOOR, self.backup_retention - len(kept_safety))
+        keep = kept_safety | (set(routine[-routine_budget:]) if routine_budget > 0 else set())
         for name in names:
             if name not in keep:
                 try:
@@ -631,7 +688,11 @@ class CollectionRegistry:
         file appears, the newest existing backup already IS the current state
         and its name is returned. The reason is inserted AFTER the unchanged
         timestamp prefix, so the lexicographic order prune_backups relies on
-        stays chronological. Prunes to ``backup_retention`` on the way out.
+        stays chronological. Prunes on the way out — by retention CLASS:
+        destructive-op (SAFETY) snapshots get ``backup_retention`` slots of
+        their own and routine pre-sync churn cannot evict them, so the
+        directory may hold up to ``backup_retention + _ROUTINE_BACKUP_FLOOR``
+        files in total.
         """
         _check_backup_reason(reason)
         backup_dir = self._backups_dir(username)
@@ -764,6 +825,7 @@ class CollectionRegistry:
         endpoint: Optional[str] = None,
         on_step: Optional[Callable[[str], None]] = None,
         full_sync_direction: Optional[str] = None,
+        acquire_timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Back up, then synchronize the user's collection with AnkiWeb.
 
@@ -785,6 +847,18 @@ class CollectionRegistry:
         collection with AnkiWeb's (a pre-sync backup already protects the
         losing side). It is ignored for every other handshake result, and any
         other value is rejected before any network call.
+
+        ``acquire_timeout`` bounds only the WAIT for a global sync slot (the
+        pre-tool automatic sync passes it so a saturated slot pool degrades to
+        a quick "skipped" instead of stalling a client's mutation behind
+        someone else's transfer): on ``asyncio.TimeoutError`` it returns
+        ``{"success": False, "error_type": "TimeoutError"}`` WITHOUT taking
+        the user lock, backing up, or syncing. ``None`` (the default) waits
+        indefinitely, as sync_collection/portal syncs always have. The bound
+        covers the semaphore acquire ONLY — the sync itself is never wrapped
+        in a timeout, because cancelling mid-``asyncio.to_thread`` would
+        release the user lock while the wheel thread keeps writing
+        (Collection is not thread-safe).
         """
         _check_username(username)
         # Fail BEFORE any network call or directory creation when credentials
@@ -806,8 +880,22 @@ class CollectionRegistry:
             }
 
         state = await self._get_state(username)
-        # Global concurrency gate first, then the user lock (fixed order).
-        async with self._sync_semaphore:
+        # Global concurrency gate first, then the user lock (fixed order). An
+        # acquire_timeout bounds ONLY this wait (see the docstring: the sync
+        # itself is never cancelled mid-transfer); on timeout this returns
+        # without taking the user lock, backing up, or syncing.
+        if acquire_timeout is not None:
+            try:
+                await asyncio.wait_for(self._sync_semaphore.acquire(), timeout=acquire_timeout)
+            except asyncio.TimeoutError:
+                return {
+                    "success": False,
+                    "error": f"skipped: no sync slot free within {acquire_timeout}s",
+                    "error_type": "TimeoutError",
+                }
+        else:
+            await self._sync_semaphore.acquire()
+        try:
             async with state.lock:
                 col = await self._ensure_open(state)
                 state.last_used = time.time()
@@ -919,6 +1007,11 @@ class CollectionRegistry:
                     else:
                         logger.error("Sync failed for %r at step %r: %s", username, step, exc)
                     return result
+        finally:
+            # Covers every exit of the locked body above — returns, backend
+            # exceptions, and cancellations alike — exactly like the former
+            # ``async with self._sync_semaphore:`` did.
+            self._sync_semaphore.release()
 
     @staticmethod
     def _is_ambiguous_sync_failure(exc: Exception) -> bool:
@@ -961,11 +1054,18 @@ class CollectionRegistry:
         async with state.lock:
             col = await self._ensure_open(state)
             state.last_used = time.time()
-            # (a) Snapshot the CURRENT state first: a restore must be reversible.
-            snapshot = await asyncio.to_thread(self._backup_locked, col, username, "pre-restore")
-            # (b) Read the database bytes out of the backup zip (no extractall).
+            # (a) Read the database bytes out of the backup zip (no
+            # extractall) BEFORE the snapshot: the user lock is held across
+            # both steps, so nothing can prune in between, and the prune that
+            # runs inside _backup_locked ((b) below) can then never delete
+            # the file being restored from — its bytes are already in memory.
+            # At the retention cap the new snapshot itself evicts the OLDEST
+            # file, which is exactly the one a "restore the oldest snapshot"
+            # call is reading; reading first turns that race into a no-op.
             backup_path = os.path.join(self._backups_dir(username), filename)
             payload = await asyncio.to_thread(_read_collection_member, backup_path)
+            # (b) Snapshot the CURRENT state: a restore must be reversible.
+            snapshot = await asyncio.to_thread(self._backup_locked, col, username, "pre-restore")
             # (c) Detach + close the open handle (drop_user's pattern): the
             # detach under the registry lock contains no await points, and we
             # hold the user lock, so no other coroutine can observe or use the

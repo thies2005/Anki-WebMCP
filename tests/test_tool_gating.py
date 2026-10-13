@@ -300,6 +300,62 @@ async def test_global_rule_outranks_and_masks_user_duplicate(app_with_users):
 
 
 @pytest.mark.asyncio
+async def test_global_sync_rule_suppresses_pretool_sync(app_with_users, monkeypatch):
+    """A GLOBAL rule disabling sync_collection is also the opt-out from the
+    automatic pre-tool sync: other tools run WITHOUT it (while still
+    succeeding) — the rule is the admin's per-tool control over automatic
+    AnkiWeb egress."""
+    app, _, alice_token, _ = app_with_users
+    app.state.anki_tool_policy.set_patterns(["sync_collection"])
+    # Saved credentials: without the rule the pre-tool sync WOULD run, so an
+    # empty recording discriminates suppression from a credential-less no-op.
+    app.state.anki_store.set_ankiweb_credentials("alice", "a@example.com", "ankiweb-pw")
+    called = []
+
+    async def _recorder(username):
+        called.append(username)
+
+    monkeypatch.setattr(app.state.anki_sync_manager, "sync_before_tool", _recorder)
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+            headers = await _init_session(client, alice_token)
+            ok = _structured(await _call_tool(client, headers, "list_decks", {}))
+            assert ok.get("success") is not False  # the tool itself still works
+            assert "decks" in ok
+            assert called == []  # no pre-tool sync despite saved credentials
+
+
+@pytest.mark.asyncio
+async def test_user_sync_rule_suppresses_pretool_sync_for_that_user_only(
+    app_with_users, monkeypatch
+):
+    """A user-side sync_collection rule suppresses that user's automatic
+    pre-tool sync only — another user without the rule still gets it."""
+    app, _, alice_token, _ = app_with_users
+    store = app.state.anki_store
+    store.set_disabled_tool_patterns("alice", ["sync_collection"])
+    store.set_ankiweb_credentials("alice", "a@example.com", "ankiweb-pw")
+    _, bob_token = store.create_user("bob", "bob-pw")
+    store.set_ankiweb_credentials("bob", "b@example.com", "ankiweb-pw")
+    called = []
+
+    async def _recorder(username):
+        called.append(username)
+
+    monkeypatch.setattr(app.state.anki_sync_manager, "sync_before_tool", _recorder)
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+            alice_headers = await _init_session(client, alice_token)
+            bob_headers = await _init_session(client, bob_token)
+            await _call_tool(client, alice_headers, "list_decks", {})
+            await _call_tool(client, bob_headers, "list_decks", {})
+            # Alice's rule suppressed her pre-tool sync; Bob's ran.
+            assert called == ["bob"]
+
+
+@pytest.mark.asyncio
 async def test_usage_log_records_calls_and_refusals(app_with_users):
     app, _, alice_token, _ = app_with_users
     app.state.anki_store.set_disabled_tool_patterns("alice", ["sync_collection"])

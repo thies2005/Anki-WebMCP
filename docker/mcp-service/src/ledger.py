@@ -104,7 +104,13 @@ class IdempotencyLedger:
                 logger.error("Failed to read idempotency ledger from %s: %s", self.file_path, e)
 
     def _save_atomic(self) -> None:
-        """Persist entries to disk using an atomic rename to prevent corruption on crash."""
+        """Persist entries to disk using an atomic rename to prevent corruption on crash.
+
+        Called via ``asyncio.to_thread`` from ``record_success``/``record_failure``,
+        so the mkstemp/json.dump/fsync work runs on a worker thread while the
+        ledger's asyncio lock stays held — writes remain serialized and the
+        event loop is never blocked by disk I/O.
+        """
         dir_name = os.path.dirname(self.file_path)
         if dir_name:
             os.makedirs(dir_name, exist_ok=True)
@@ -150,7 +156,11 @@ class IdempotencyLedger:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             self._evict_oldest_locked()
-            self._save_atomic()
+            # Atomic rewrite (mkstemp -> fsync -> os.replace) on a worker
+            # thread so disk I/O never blocks the event loop; the ledger
+            # asyncio lock is held across the call, so writers stay
+            # serialized and saves cannot interleave.
+            await asyncio.to_thread(self._save_atomic)
             logger.info("Recorded idempotency key %r with committed status", key[:_LOG_KEY_LEN])
 
     async def record_failure(self, key: str, error: str) -> None:
@@ -166,5 +176,7 @@ class IdempotencyLedger:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             self._evict_oldest_locked()
-            self._save_atomic()
+            # Same worker-thread rewrite discipline as record_success (the
+            # ledger asyncio lock is held across the call).
+            await asyncio.to_thread(self._save_atomic)
             logger.info("Recorded idempotency key %r with failed status", key[:_LOG_KEY_LEN])

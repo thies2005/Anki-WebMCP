@@ -275,8 +275,17 @@ class OAuthStore:
 
     def register_client(
         self, client_name: str, redirect_uris: List[str], token_endpoint_auth_method: str = "none"
-    ) -> dict:
-        """Register a dynamically-registered public client; returns its record."""
+    ) -> Optional[dict]:
+        """Register a dynamically-registered public client; returns its record.
+
+        The MAX_CLIENTS bound is decided HERE — check, evict, add — under the
+        store lock, so concurrent registrations cannot race past the cap. At
+        capacity the oldest client that no live refresh grant references is
+        evicted to make room (self-healing: anonymous registration poisoning
+        cannot permanently brick /register); when every registered client is
+        still referenced by a refresh grant there is nothing safe to evict and
+        None is returned (the caller answers invalid_client_metadata).
+        """
         client_id = secrets.token_urlsafe(16)
         record = {
             "client_id": client_id,
@@ -286,6 +295,25 @@ class OAuthStore:
             "created_at": time.time(),
         }
         with self._lock:
+            if len(self._clients) >= MAX_CLIENTS:
+                referenced = {rec.get("client_id") for rec in self._refresh.values()}
+                candidates = sorted(
+                    (
+                        (known_id, known_record)
+                        for known_id, known_record in self._clients.items()
+                        if known_id not in referenced
+                    ),
+                    key=lambda item: float(item[1].get("created_at", 0.0)),
+                )
+                if not candidates:
+                    return None
+                evicted_id, _evicted_record = candidates[0]
+                del self._clients[evicted_id]
+                logger.warning(
+                    "OAuth client store at capacity (%d): evicted unreferenced client %r",
+                    MAX_CLIENTS,
+                    evicted_id,
+                )
             self._clients[client_id] = record
             self._save_atomic()
         logger.info(
@@ -368,6 +396,17 @@ class OAuthStore:
         return {"username": record["username"], "scope": record["scope"]}
 
     # -- refresh tokens (persisted as sha256 hashes; rotated on use) ---------
+
+    def peek_refresh(self, raw_token: str) -> Optional[dict]:
+        """Non-consuming read of a refresh-token record (a copy), or None.
+
+        Lets the token endpoint resolve the account's revocation epoch BEFORE
+        :meth:`rotate_refresh` burns the presented token, so a pre-epoch grant
+        can be refused without minting a replacement.
+        """
+        with self._lock:
+            record = self._refresh.get(_hash_refresh_token(raw_token))
+        return dict(record) if record is not None else None
 
     def issue_refresh(self, username: str, client_id: str) -> str:
         """Mint a refresh token; only its sha256 is persisted. Returns the raw value."""
@@ -581,14 +620,17 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
         client_name = body.get("client_name")
         if not isinstance(client_name, str) or len(client_name) > MAX_CLIENT_NAME_CHARS:
             return JSONResponse({"error": "invalid_client_metadata"}, status_code=400)
-        # Unauthenticated growth bound: refuse once the store is at capacity.
-        if store.client_count() >= MAX_CLIENTS:
-            logger.warning("OAuth client registration refused: at capacity (%d)", MAX_CLIENTS)
-            return JSONResponse({"error": "invalid_client_metadata"}, status_code=400)
+        # Unauthenticated growth bound lives inside register_client (atomic
+        # check+evict+add under the store lock): a full store self-heals by
+        # evicting the oldest client no refresh grant references, and None
+        # means nothing could be evicted.
         record = store.register_client(
             client_name,
             [str(uri) for uri in body["redirect_uris"]],
         )
+        if record is None:
+            logger.warning("OAuth client registration refused: at capacity (%d)", MAX_CLIENTS)
+            return JSONResponse({"error": "invalid_client_metadata"}, status_code=400)
         return JSONResponse(
             {
                 "client_id": record["client_id"],
@@ -707,15 +749,31 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
     async def _token_refresh(form: Mapping) -> JSONResponse:
         client_id = _param(form, "client_id")
         raw_refresh = _param(form, "refresh_token")
-        rotated = store.rotate_refresh(raw_refresh, client_id)
+        # Grant eviction BEFORE the rotation mints anything: the username
+        # lives inside the hashed refresh record, so peeking it (without
+        # consuming) resolves the account's revocation epochs — password
+        # reset via sessions_invalid_before, token regeneration via
+        # tokens_invalid_before — and they become rotate_refresh's
+        # min_created_at. rotate_refresh checks that bound BEFORE minting the
+        # replacement, so a leaked grant that a password reset or token
+        # regeneration already killed is refused while persisting nothing new
+        # (no orphaned replacement refresh token). Unknown account -> inf
+        # rejects outright; a client_id mismatch is still caught inside
+        # rotate_refresh before the bound, burning the presented token.
+        epoch = float("inf")
+        peeked = store.peek_refresh(raw_refresh)
+        if peeked is not None and peeked.get("client_id") == client_id:
+            user = user_store.get_user(peeked.get("username"))
+            epoch = (
+                float("inf")
+                if user is None
+                else max(user.sessions_invalid_before, user.tokens_invalid_before)
+            )
+        rotated = store.rotate_refresh(raw_refresh, client_id, min_created_at=epoch)
         if rotated is not None:
-            # Grant eviction: the account's revocation epochs (password reset
-            # via sessions_invalid_before, token regeneration via
-            # tokens_invalid_before) gate the already-burned grant, so a
-            # leaked connector grant dies at its next refresh instead of
-            # self-renewing forever. The username lives inside the hashed
-            # refresh record, so rotation runs first and this check follows;
-            # rotate_refresh burned the presented token either way.
+            # Defense in depth: the same epoch gate re-checked after the
+            # rotation, in case the account's epochs moved between the peek
+            # and the rotate; rotate_refresh burned the presented token.
             new_refresh, record = rotated
             user = user_store.get_user(record["username"])
             if user is None or float(record.get("created_at", 0.0)) < max(

@@ -46,6 +46,14 @@ def _add_basic_note(col, front, back="back", deck="Default"):
     return int(note.id)
 
 
+def _add_cloze_note(col, text, extra="", deck="Default"):
+    note = Note(col, col.models.by_name("Cloze"))
+    note["Text"] = text
+    note["Back Extra"] = extra
+    col.add_note(note, col.decks.id(deck))
+    return int(note.id)
+
+
 async def _fronts(reg, username, nids):
     def _get(col):
         return {nid: col.get_note(nid).fields[0] for nid in nids}
@@ -197,11 +205,16 @@ async def test_invalid_regex_backend_error_stays_single_line_in_logs(env, caplog
     InvalidInput whose message embeds the search VERBATIM (Rust regex error
     rendering) — and the keep-line-breaks validator admits \n into that
     pattern. One such call used to author multi-line log records at the two
-    generic %s sinks (the stale-handle warning, which fires on every
-    InvalidInput, and the mutation-failure error): log-forging, CWE-117. Both
-    sinks must %r-escape exception text, so one tool call can never emit a
-    record spanning lines (the invariant tools/notes.py states for its own
-    %r-logged inputs); the client-facing error keeps the raw diagnostic."""
+    generic %s sinks (the stale-handle warning, which fired on every
+    InvalidInput, and the mutation-failure error): log-forging, CWE-117. The
+    stale-handle warning no longer fires here at all — _is_stale now requires
+    the closed handle's exact signature (InvalidInput with
+    str == "CollectionNotOpen"), so a backend INPUT error on a HEALTHY handle
+    is never mistaken for staleness (no close/reopen, no re-execution) — and
+    the one remaining generic sink (the mutation-failure error) %r-escapes
+    exception text, so one tool call can never emit a record spanning lines
+    (the invariant tools/notes.py states for its own %r-logged inputs); the
+    client-facing error keeps the raw diagnostic."""
     reg, manager = env
     nid = await reg.run("ivar", _add_basic_note, "the colour red")
 
@@ -219,15 +232,44 @@ async def test_invalid_regex_backend_error_stays_single_line_in_logs(env, caplog
     assert "2026-10-11 INFO auth login ok admin" in res.error
     assert "regex parse error" in res.error
 
-    # Both generic exception-text sinks fired for this call, and NO record
-    # from this one tool call spans a line.
-    assert any("Stale collection handle" in r.getMessage() for r in caplog.records)
+    # An invalid regex on a healthy handle is NOT staleness: the handle is
+    # never closed/reopened and the operation is executed exactly once (no
+    # stale-handle retry warning fired).
+    assert not any("Stale collection handle" in r.getMessage() for r in caplog.records)
+    # The remaining generic exception-text sink fired for this call, and NO
+    # record from this one tool call spans a line.
     assert any("Local mutation 'find_and_replace' failed" in r.getMessage() for r in caplog.records)
     multiline = [r.getMessage() for r in caplog.records if "\n" in r.getMessage() or "\r" in r.getMessage()]
     assert multiline == []
 
     # The note is untouched (the backend refused before changing anything).
     assert (await _fronts(reg, "ivar", [nid]))[nid] == "the colour red"
+
+
+@pytest.mark.asyncio
+async def test_replace_selection_spans_two_note_types(env):
+    """A mass edit's selection legitimately spans note types — that is why
+    field_name is passed to the backend unvalidated and no single-notetype
+    check exists in the resolver. One call over a Basic note AND a Cloze note
+    must change BOTH and report changed/selected across the mixed selection,
+    with the real field contents updated in each note type."""
+    reg, manager = env
+    basic_id = await reg.run("hilda", _add_basic_note, "the colour red")
+    cloze_id = await reg.run("hilda", _add_cloze_note, "the colour {{c1::blue}}")
+
+    res = await note_tools.find_and_replace(
+        manager, reg, "hilda", search="colour", replacement="color",
+        note_ids=[basic_id, cloze_id],
+    )
+
+    assert res.success is True, res.error
+    assert res.local_status == "committed"
+    assert res.data["changed"] == 2
+    assert res.data["selected"] == 2
+
+    values = await _fronts(reg, "hilda", [basic_id, cloze_id])
+    assert values[basic_id] == "the color red"
+    assert values[cloze_id] == "the color {{c1::blue}}"
 
 
 # -- find_duplicates ---------------------------------------------------------------

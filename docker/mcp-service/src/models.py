@@ -35,7 +35,16 @@ class NoteInput(BaseModel):
         data["note_type"] = legacy
         return data
 
-    @field_validator("deck_name", "note_type")
+    @field_validator("deck_name")
+    @classmethod
+    def validate_deck(cls, v: str) -> str:
+        # Same hierarchy shapes create_deck/rename_deck reject (':::', leading/
+        # trailing '::', control chars, >200 chars, empty). validate_deck_name
+        # is defined later in this module; the validator body resolves it at
+        # call time, so the forward reference is fine.
+        return validate_deck_name(v)
+
+    @field_validator("note_type")
     @classmethod
     def not_empty(cls, v: str) -> str:
         s = v.strip()
@@ -88,30 +97,6 @@ class UpdateNoteFieldsInput(BaseModel):
         if not v:
             raise ValueError("At least one field to update must be provided.")
         return v
-
-
-class AddTagsInput(BaseModel):
-    """Input parameters for add_tags tool."""
-    note_ids: List[int] = Field(..., description="List of note IDs to tag")
-    tags: List[str] = Field(..., description="List of tag strings to add")
-
-    @field_validator("note_ids")
-    @classmethod
-    def validate_note_ids(cls, v: List[int]) -> List[int]:
-        if not v:
-            raise ValueError("At least one note ID must be provided.")
-        for nid in v:
-            if nid <= 0:
-                raise ValueError("Note IDs must be positive integers.")
-        return v
-
-    @field_validator("tags")
-    @classmethod
-    def validate_tags(cls, v: List[str]) -> List[str]:
-        cleaned = [t.strip() for t in v if t.strip()]
-        if not cleaned:
-            raise ValueError("At least one non-empty tag must be provided.")
-        return cleaned
 
 
 class SearchNotesInput(BaseModel):
@@ -182,10 +167,14 @@ def _reject_control_chars_keep_line_breaks(value: str, what: str) -> str:
     return value
 
 
-def _exactly_one_selection(note_ids: Optional[List[int]], query: Optional[str]) -> None:
-    """Shared note_ids-XOR-query rule (preview/change_note_type, find_and_replace)."""
-    if (note_ids is None) == (query is None):
-        raise ValueError("Provide exactly one of note_ids or query.")
+def _exactly_one_selection(
+    ids: Optional[List[int]], query: Optional[str], ids_label: str = "note_ids"
+) -> None:
+    """Shared ids-XOR-query rule (preview/change_note_type, find_and_replace,
+    card tools). ``ids_label`` names the ID list in the error so card tools
+    never report a 'note_ids' violation for a card_ids-vs-query request."""
+    if (ids is None) == (query is None):
+        raise ValueError(f"Provide exactly one of {ids_label} or query.")
 
 
 # -- deck tools -----------------------------------------------------------------
@@ -278,6 +267,25 @@ class _IdListInput(BaseModel):
         return v
 
 
+def validate_tag_list(v: List[str]) -> List[str]:
+    """Shared tag-list rule for add_tags/remove_tags (1-50 tags, non-empty,
+    <=100 chars each, no whitespace, no control chars). One implementation for
+    both tools so add_tags can never drift looser than remove_tags: tags are a
+    space-separated string downstream, so a whitespace-bearing tag would join
+    into two tags the caller never asked for."""
+    if not v or len(v) > 50:
+        raise ValueError("Provide between 1 and 50 tags.")
+    for tag in v:
+        if not tag or not tag.strip():
+            raise ValueError("Tags must not be empty.")
+        if len(tag) > 100:
+            raise ValueError("Each tag is limited to 100 characters.")
+        if any(c.isspace() for c in tag):
+            raise ValueError(f"Tag {tag!r} must not contain whitespace (tags are space-separated).")
+        _reject_control_chars(tag, "Tags")
+    return v
+
+
 class DeleteNotesInput(_IdListInput):
     """Input parameters for delete_notes tool (destructive: snapshots first)."""
     note_ids: List[int] = Field(..., description="Note IDs to delete (1-500 per request)")
@@ -307,17 +315,29 @@ class RemoveTagsInput(_IdListInput):
     @field_validator("tags")
     @classmethod
     def validate_tags(cls, v: List[str]) -> List[str]:
-        if not v or len(v) > 50:
-            raise ValueError("Provide between 1 and 50 tags.")
-        for tag in v:
-            if not tag or not tag.strip():
-                raise ValueError("Tags must not be empty.")
-            if len(tag) > 100:
-                raise ValueError("Each tag is limited to 100 characters.")
-            if any(c.isspace() for c in tag):
-                raise ValueError(f"Tag {tag!r} must not contain whitespace (tags are space-separated).")
-            _reject_control_chars(tag, "Tags")
-        return v
+        return validate_tag_list(v)
+
+
+class AddTagsInput(_IdListInput):
+    """Input parameters for add_tags tool."""
+
+    note_ids: List[int] = Field(..., description="Note IDs to tag (1-500 per request)")
+    # Same tag rules as remove_tags (shared validate_tag_list): 1-50 tags, no
+    # internal whitespace, max 100 chars each. add_tags previously STRIPPED
+    # whitespace-bearing tags; it now rejects them, matching remove_tags.
+    tags: List[str] = Field(
+        ..., description="Tags to add (1-50 tags, no internal whitespace, max 100 chars each)"
+    )
+
+    @field_validator("note_ids")
+    @classmethod
+    def validate_ids(cls, v: List[int]) -> List[int]:
+        return cls._validate_id_list(v, "note ID")
+
+    @field_validator("tags")
+    @classmethod
+    def validate_tags(cls, v: List[str]) -> List[str]:
+        return validate_tag_list(v)
 
 
 class TemplateInput(BaseModel):
@@ -418,6 +438,18 @@ class _NoteTypeChangeInputBase(BaseModel):
 
 class PreviewNoteTypeChangeInput(_NoteTypeChangeInputBase):
     """Input parameters for preview_note_type_change (read-only)."""
+
+    # Same maps as the mutation (without confirm/idempotency_key): the preview
+    # must be able to resolve exactly what change_note_type would apply, not
+    # only the backend's positional default.
+    field_map: Optional[Dict[str, Optional[str]]] = Field(
+        None,
+        description="NEW field name -> OLD field name (or null to discard). Omitted: positional default; new fields not mentioned are discarded.",
+    )
+    template_map: Optional[Dict[str, Optional[str]]] = Field(
+        None,
+        description="NEW template name -> OLD template name (or null). Omitted: positional default; refused when either note type is a Cloze type.",
+    )
 
 
 class ChangeNoteTypeInput(_NoteTypeChangeInputBase):
@@ -892,7 +924,7 @@ class _CardSelectionInput(BaseModel):
 
     @model_validator(mode="after")
     def exactly_one_selection(self) -> "_CardSelectionInput":
-        _exactly_one_selection(self.card_ids, self.query)
+        _exactly_one_selection(self.card_ids, self.query, ids_label="card_ids")
         return self
 
 

@@ -548,10 +548,12 @@ async def test_review_queue_contains_new_card_and_answer_card_answers_it(env):
     assert res.data["card_id"] == cid
     assert res.data["rating"] == 3
     assert isinstance(res.data["next_due"], int)
-    assert res.data["remaining_in_queue"] == 0
+    # remaining_in_queue is the TRUE per-kind queue (the same sum
+    # get_review_queue reports): the GOOD-answered card re-enters today's
+    # learning queue (default new steps [1.0, 10.0]), so it is still counted.
+    assert res.data["remaining_in_queue"] == 1
     # The answer really landed in the review log and moved the card into the
-    # learning pipeline (type 1; a GOOD-answered NEW card returns to today's
-    # queue later, so queue absence is NOT asserted).
+    # learning pipeline (type 1).
     revlog_after = await reg.run("omar", lambda col: col.db.scalar("SELECT COUNT() FROM revlog"))
     assert revlog_after == revlog_before + 1
     ctype, reps = await reg.run("omar", lambda col: (col.get_card(cid).type, col.get_card(cid).reps))

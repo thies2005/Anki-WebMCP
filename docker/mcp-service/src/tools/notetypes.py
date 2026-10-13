@@ -137,6 +137,15 @@ async def update_note_type(
                     f"Unknown template name(s) {unknown} of note type {nt['name']!r}. "
                     f"Valid templates for this note type: {sorted(by_name)}."
                 )
+            # A repeated template name would let later entries silently
+            # overwrite earlier ones (the collision check below sees only the
+            # first entry per template): refuse the batch before any write.
+            duplicates = sorted({t for t in requested if requested.count(t) > 1})
+            if duplicates:
+                raise CollectionToolError(
+                    f"template_updates names the same template twice: {duplicates}; "
+                    "combine the edits into one entry."
+                )
             # Final template names after every rename in this batch: a rename
             # must not collide with the other templates, with a sibling rename
             # target, or with an unrenamed template.
