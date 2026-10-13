@@ -377,7 +377,7 @@ async def test_usage_log_records_calls_and_refusals(app_with_users):
 @pytest.mark.asyncio
 async def test_tools_list_unchanged_names_and_review_deck_params(app_with_users):
     """Schema parity: the @_tool_guard wrapper must not alter tools/list —
-    same 47 names as the portal reference table, and the review tools expose
+    same 48 names as the portal reference table, and the review tools expose
     their new deck argument (and still no ctx leak)."""
     app, _, alice_token, _ = app_with_users
 
@@ -390,7 +390,7 @@ async def test_tools_list_unchanged_names_and_review_deck_params(app_with_users)
             payload = _parse_mcp_response(res)
     tools = {t["name"]: t for t in payload["result"]["tools"]}
     reference = [name for _, names in TOOL_REFERENCE_GROUPS for name in names]
-    assert len(reference) == len(set(reference)) == 47
+    assert len(reference) == len(set(reference)) == 48
     assert set(tools) == set(reference)
     assert set(tools["get_review_queue"]["inputSchema"]["properties"]) == {"limit", "deck"}
     assert set(tools["answer_card"]["inputSchema"]["properties"]) == {

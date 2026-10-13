@@ -51,6 +51,7 @@ from .models import (
     GetMediaInput,
     GetNoteInput,
     GetNoteTypeInput,
+    GetNotesInput,
     ListMediaInput,
     MoveCardsInput,
     PreviewNoteTypeChangeInput,
@@ -159,7 +160,7 @@ TOOL_REFERENCE_GROUPS: List[Tuple[str, List[str]]] = [
         "get_deck_config", "update_deck_config",
     ]),
     ("Notes", [
-        "search_notes", "get_note", "add_notes", "update_note_fields",
+        "search_notes", "get_note", "get_notes", "add_notes", "update_note_fields",
         "add_tags", "remove_tags", "delete_notes", "find_and_replace",
         "find_duplicates",
     ]),
@@ -1319,20 +1320,40 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 2. search_notes
-    @mcp.tool(description="Search notes in the collection by Anki query with bounded pagination.")
+    @mcp.tool(
+        description=(
+            "Search notes in the collection by Anki query with bounded pagination. "
+            "Every result includes note_id, model_name, tags, and all field values — "
+            "prefer this over find_cards plus repeated get_note when you need note "
+            "content. Optional fields=[...] projects each note down to the named "
+            "fields (names missing from a note's type are omitted for that note) to "
+            "shrink large result sets."
+        )
+    )
     @_tool_guard
-    async def search_notes(query: str, limit: int = 50, offset: int = 0, ctx: Context = None) -> Dict[str, Any]:
+    async def search_notes(
+        query: str,
+        limit: int = 50,
+        offset: int = 0,
+        fields: Optional[List[str]] = None,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
             return _unauthorized_tool_response()
         try:
-            SearchNotesInput(query=query, limit=limit, offset=offset)
-            return await note_tools.search_notes(tool_registry, username, query, limit, offset)
+            SearchNotesInput(query=query, limit=limit, offset=offset, fields=fields)
+            return await note_tools.search_notes(tool_registry, username, query, limit, offset, fields)
         except Exception as e:
             return _tool_error_response(e)
 
     # 3. get_note
-    @mcp.tool(description="Retrieve details and fields for a specific note by ID.")
+    @mcp.tool(
+        description=(
+            "Retrieve details and fields for a specific note by ID (single note; "
+            "use get_notes to fetch a batch of IDs in one call)."
+        )
+    )
     @_tool_guard
     async def get_note(note_id: int, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
@@ -1341,6 +1362,26 @@ def create_app(custom_settings: Optional[Settings] = None):
         try:
             GetNoteInput(note_id=note_id)
             return await note_tools.get_note(tool_registry, username, note_id)
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 3b. get_notes (batch)
+    @mcp.tool(
+        description=(
+            "Retrieve details and fields for multiple notes by ID in one call "
+            "(batch get_note, max 200 IDs). Returns the found notes in request "
+            "order — note_id, model_name, tags, and all fields — plus a missing "
+            "list of IDs that are not in the collection."
+        )
+    )
+    @_tool_guard
+    async def get_notes(note_ids: List[int], ctx: Context = None) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            GetNotesInput(note_ids=note_ids)
+            return await note_tools.get_notes(tool_registry, username, note_ids)
         except Exception as e:
             return _tool_error_response(e)
 

@@ -154,7 +154,16 @@ async def test_search_notes_tool_schema_exposes_only_real_arguments(app_with_use
             assert list_res.status_code == 200
             payload = _parse_mcp_response(list_res)
             tools = {t["name"]: t for t in payload["result"]["tools"]}
-            assert set(tools["search_notes"]["inputSchema"]["properties"]) == {"query", "limit", "offset"}
+            assert set(tools["search_notes"]["inputSchema"]["properties"]) == {"query", "limit", "offset", "fields"}
+            # The batch getter exposes exactly its real arguments.
+            assert set(tools["get_notes"]["inputSchema"]["properties"]) == {"note_ids"}
+            # The search description must advertise that results carry all
+            # field values — otherwise clients fall back to find_cards plus
+            # one get_note per card — and steer them to the batch getter.
+            search_desc = tools["search_notes"]["description"]
+            assert "all field values" in search_desc
+            assert "get_note" in search_desc
+            assert "fields" in search_desc
             # The note-type change pair exposes exactly their real arguments —
             # in particular no ``ctx`` leak and no auth state.
             assert set(tools["preview_note_type_change"]["inputSchema"]["properties"]) == {

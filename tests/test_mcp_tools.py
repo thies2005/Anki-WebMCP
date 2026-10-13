@@ -20,7 +20,7 @@ from anki.notes import Note
 
 from src.errors import CollectionToolError
 from src.logging_util import RedactingFormatter
-from src.models import AddTagsInput, BuryCardsInput, NoteInput
+from src.models import AddTagsInput, BuryCardsInput, GetNotesInput, NoteInput, SearchNotesInput
 from src.sync_manager import SyncManager
 from src.users import UserStore
 from src.tools import decks as deck_tools
@@ -177,6 +177,101 @@ async def test_get_note_not_found(env):
     reg, _ = env
     with pytest.raises(CollectionToolError, match="not found"):
         await note_tools.get_note(reg, "alice", 99999)
+
+
+# -- search_notes field projection -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_notes_fields_projection_limits_payload(env):
+    """fields=["Front"] projects every result down to just that field."""
+    reg, _ = env
+    await reg.run("alice", add_basic_note, "q1", "a1")
+    await reg.run("alice", add_basic_note, "q2", "a2")
+
+    res = await note_tools.search_notes(reg, "alice", query="deck:Default", fields=["Front"])
+    assert res["total_matches"] == 2
+    for note in res["notes"]:
+        assert set(note["fields"]) == {"Front"}
+        assert note["fields"]["Front"].startswith("q")
+    # The response meta shape is the pinned compatibility contract — the
+    # projection must not add keys to it.
+    assert set(res) == {"total_matches", "returned_count", "offset", "limit", "notes"}
+
+
+@pytest.mark.asyncio
+async def test_search_notes_fields_missing_names_are_omitted_not_errors(env):
+    """A requested field the note's type lacks is silently absent for that note
+    (searches span note types, so an unknown-to-this-note name is not an error)."""
+    reg, _ = env
+    await reg.run("alice", add_basic_note, "q", "a")
+
+    res = await note_tools.search_notes(reg, "alice", query="deck:Default", fields=["Front", "Nope"])
+    assert res["notes"][0]["fields"] == {"Front": "q"}
+
+
+@pytest.mark.asyncio
+async def test_search_notes_fields_empty_list_behaves_like_none(env):
+    """Direct calls bypass pydantic; an empty projection list must read as
+    'no projection' rather than emptying every note's fields."""
+    reg, _ = env
+    await reg.run("alice", add_basic_note, "q", "a")
+
+    res = await note_tools.search_notes(reg, "alice", query="deck:Default", fields=[])
+    assert res["notes"][0]["fields"] == {"Front": "q", "Back": "a"}
+
+
+# -- get_notes (batch) -------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_notes_returns_full_summaries_in_request_order(env):
+    reg, _ = env
+    n1 = await reg.run("alice", add_basic_note, "one", "1")
+    n2 = await reg.run("alice", add_basic_note, "two", "2")
+
+    res = await note_tools.get_notes(reg, "alice", [n2, n1])
+    assert res["requested"] == 2
+    assert res["returned"] == 2
+    assert res["missing"] == []
+    assert [n["note_id"] for n in res["notes"]] == [n2, n1]
+    assert res["notes"][0]["fields"] == {"Front": "two", "Back": "2"}
+    assert res["notes"][0]["model_name"] == "Basic"
+    assert set(res["notes"][0]) == {"note_id", "model_name", "tags", "fields"}
+
+
+@pytest.mark.asyncio
+async def test_get_notes_reports_missing_ids(env):
+    reg, _ = env
+    real = await reg.run("alice", add_basic_note, "keep", "me")
+
+    res = await note_tools.get_notes(reg, "alice", [real, 999999999, real])
+    assert res["requested"] == 3
+    assert res["returned"] == 2  # duplicates are preserved, like notesInfo
+    assert res["missing"] == [999999999]
+    assert [n["note_id"] for n in res["notes"]] == [real, real]
+
+
+def test_get_notes_input_bounds():
+    with pytest.raises(ValidationError):
+        GetNotesInput(note_ids=[])
+    with pytest.raises(ValidationError):
+        GetNotesInput(note_ids=[0])
+    with pytest.raises(ValidationError):
+        GetNotesInput(note_ids=list(range(1, 202)))  # 201 IDs > 200 cap
+    assert len(GetNotesInput(note_ids=list(range(1, 201))).note_ids) == 200
+
+
+def test_search_notes_input_fields_validation():
+    SearchNotesInput(query="deck:Default", fields=["Front", "Back"])  # ok
+    with pytest.raises(ValidationError):
+        SearchNotesInput(query="deck:Default", fields=[])  # empty = omit it instead
+    with pytest.raises(ValidationError):
+        SearchNotesInput(query="deck:Default", fields=[""])
+    with pytest.raises(ValidationError):
+        SearchNotesInput(query="deck:Default", fields=[f"f{i}" for i in range(21)])  # > 20
+    with pytest.raises(ValidationError):
+        SearchNotesInput(query="deck:Default", fields=["Front\ninjected"])  # control chars
 
 
 # -- get_collection_stats -------------------------------------------------------

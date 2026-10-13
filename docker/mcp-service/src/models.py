@@ -105,6 +105,28 @@ class SearchNotesInput(BaseModel):
     query: str = Field(..., description="Anki search query string, e.g. 'deck:Default' or 'tag:vocab'")
     limit: int = Field(50, ge=1, le=100, description="Max notes to return (1-100, default 50)")
     offset: int = Field(0, ge=0, description="Pagination offset index (default 0)")
+    fields: Optional[List[str]] = Field(
+        None,
+        description="Optional field-name projection: return only these fields per note "
+        "(names missing from a note's type are omitted for that note)",
+    )
+
+    @field_validator("fields")
+    @classmethod
+    def validate_fields(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        if v is None:
+            return None
+        if not v:
+            raise ValueError("Provide at least one field name, or omit 'fields' for all fields.")
+        if len(v) > 20:
+            raise ValueError("The fields projection is limited to 20 field names.")
+        for name in v:
+            if not name or not name.strip():
+                raise ValueError("Field names in the projection must not be empty.")
+            if len(name) > 100:
+                raise ValueError("Each field name is limited to 100 characters.")
+            _reject_control_chars(name, "Field names")
+        return v
 
 
 class GetNoteInput(BaseModel):
@@ -257,11 +279,11 @@ class _IdListInput(BaseModel):
     """Shared shape for tools taking a bounded list of positive Anki object IDs."""
 
     @staticmethod
-    def _validate_id_list(v: List[int], what: str) -> List[int]:
+    def _validate_id_list(v: List[int], what: str, max_ids: int = 500) -> List[int]:
         if not v:
             raise ValueError(f"At least one {what} must be provided.")
-        if len(v) > 500:
-            raise ValueError(f"Batches are limited to 500 {what} per request.")
+        if len(v) > max_ids:
+            raise ValueError(f"Batches are limited to {max_ids} {what} per request.")
         for i in v:
             if i <= 0:
                 raise ValueError(f"{what} must be positive integers.")
@@ -301,6 +323,21 @@ class DeleteNotesInput(_IdListInput):
     @classmethod
     def validate_ids(cls, v: List[int]) -> List[int]:
         return cls._validate_id_list(v, "note ID")
+
+
+class GetNotesInput(_IdListInput):
+    """Input parameters for get_notes tool (batch, read-only get_note).
+
+    Capped tighter than the mutating id-list tools (200, not 500): every
+    requested note returns its full field set, so a batch response scales with
+    content, and clients hit response-size limits long before 500 notes.
+    """
+    note_ids: List[int] = Field(..., description="Note IDs to fetch (1-200 per request)")
+
+    @field_validator("note_ids")
+    @classmethod
+    def validate_ids(cls, v: List[int]) -> List[int]:
+        return cls._validate_id_list(v, "note ID", max_ids=200)
 
 
 class RemoveTagsInput(_IdListInput):

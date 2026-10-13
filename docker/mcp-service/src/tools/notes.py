@@ -57,14 +57,32 @@ def _escape_search_term(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _project_fields(fields: Dict[str, str], wanted: Optional[List[str]]) -> Dict[str, str]:
+    """Reduce a note's fields to the requested projection.
+
+    A search spans note types, so a name valid on one type may not exist on
+    another: unknown names are silently omitted per note rather than erroring.
+    An empty/falsy projection means "no projection" (direct tool calls bypass
+    the pydantic layer that already rejects an empty list).
+    """
+    if not wanted:
+        return fields
+    return {name: fields[name] for name in wanted if name in fields}
+
+
 async def search_notes(
     registry,
     username: str,
     query: str,
     limit: int = 50,
     offset: int = 0,
+    fields: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Search notes in the collection with bounded pagination."""
+    """Search notes in the collection with bounded pagination.
+
+    Each result carries the full notesInfo-equivalent summary; ``fields``
+    optionally projects each note down to the named fields.
+    """
     # Clamp pagination bounds (direct calls bypass the pydantic input model).
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
@@ -84,7 +102,9 @@ async def search_notes(
                 # The note vanished between find_notes and the read (the
                 # phantom-entry case AnkiConnect handled with `{}` entries).
                 continue
-            notes.append(_note_summary(col, note))
+            summary = _note_summary(col, note)
+            summary["fields"] = _project_fields(summary["fields"], fields)
+            notes.append(summary)
         return {"total": total, "notes": notes}
 
     result = await registry.run(username, _search)
@@ -108,6 +128,30 @@ async def get_note(registry, username: str, note_id: int) -> Dict[str, Any]:
         return _note_summary(col, note)
 
     return await registry.run(username, _get)
+
+
+async def get_notes(registry, username: str, note_ids: List[int]) -> Dict[str, Any]:
+    """Batch get_note: full summaries for many notes in one collection read.
+
+    Missing IDs are reported, not fatal (mirrors delete_notes' vocabulary).
+    Duplicates are preserved so the response aligns 1:1 with the request.
+    """
+    logger.info("Executing get_notes for %r, %d ids", username, len(note_ids))
+
+    def _get_all(col) -> Dict[str, Any]:
+        notes: List[Dict[str, Any]] = []
+        missing: List[int] = []
+        for nid in note_ids:
+            note = _get_note_or_none(col, nid)
+            if note is None:
+                missing.append(nid)
+                continue
+            notes.append(_note_summary(col, note))
+        return {"requested": len(note_ids), "notes": notes, "missing": missing}
+
+    result = await registry.run(username, _get_all)
+    result["returned"] = len(result["notes"])
+    return result
 
 
 def _is_first_field_duplicate(col, model, deck_name: str, fields: Dict[str, str]) -> bool:
