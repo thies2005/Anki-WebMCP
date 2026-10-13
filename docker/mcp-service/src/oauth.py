@@ -334,11 +334,6 @@ class OAuthStore:
         copy["redirect_uris"] = list(record["redirect_uris"])
         return copy
 
-    def client_count(self) -> int:
-        """Live client count, for the registration-cap guard."""
-        with self._lock:
-            return len(self._clients)
-
     # -- authorization codes (in memory only; 60s TTL; single-use) -----------
 
     def purge_expired_codes(self) -> None:

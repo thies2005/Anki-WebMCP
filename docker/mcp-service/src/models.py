@@ -38,11 +38,12 @@ class NoteInput(BaseModel):
     @field_validator("deck_name")
     @classmethod
     def validate_deck(cls, v: str) -> str:
-        # Same hierarchy shapes create_deck/rename_deck reject (':::', leading/
-        # trailing '::', control chars, >200 chars, empty). validate_deck_name
-        # is defined later in this module; the validator body resolves it at
-        # call time, so the forward reference is fine.
-        return validate_deck_name(v)
+        # Strip padding first (the legacy not-empty validator did), then reject
+        # the same hierarchy shapes create_deck/rename_deck reject (':::',
+        # leading/trailing '::', control chars, >200 chars, empty).
+        # validate_deck_name is defined later in this module; the validator
+        # body resolves it at call time, so the forward reference is fine.
+        return validate_deck_name(v.strip())
 
     @field_validator("note_type")
     @classmethod

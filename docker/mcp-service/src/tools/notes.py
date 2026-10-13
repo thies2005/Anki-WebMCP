@@ -172,16 +172,33 @@ def _add_notes_impl(col, notes: List[NoteInput], allow_duplicates: bool) -> Dict
             first_field_name = model["flds"][0]["name"]
         except (KeyError, IndexError, TypeError):
             first_field_name = None
+        is_duplicate = False
         if first_field_name is not None:
             value = (n.fields.get(first_field_name) or "").strip()
             if value:
-                key = (n.note_type, n.deck_name, first_field_name, value)
+                # The wheel resolves deck AND note-type names case- and
+                # padding-insensitively (probed: decks.id("default") and
+                # decks.id(" Default ") both return the Default deck, and
+                # models.by_name("basic") returns Basic), so the key must
+                # normalize both the same way — raw strings would let variants
+                # of one physical deck/type evade the gate and create
+                # duplicates the collection check also cannot see.
+                key = (
+                    n.note_type.strip().casefold(),
+                    n.deck_name.strip().casefold(),
+                    first_field_name,
+                    value,
+                )
                 if not allow_duplicates and key in seen:
-                    failures.append(idx)
+                    is_duplicate = True
                 # Recorded even when the gate is off, so the set stays warm;
                 # it is only consulted when allow_duplicates is False.
                 seen.add(key)
-        if not allow_duplicates and _is_first_field_duplicate(col, model, n.deck_name, n.fields):
+        if not is_duplicate and not allow_duplicates and _is_first_field_duplicate(
+            col, model, n.deck_name, n.fields
+        ):
+            is_duplicate = True
+        if is_duplicate:
             failures.append(idx)
         resolved.append(model)
     if failures:

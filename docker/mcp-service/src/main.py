@@ -1689,7 +1689,9 @@ def create_app(custom_settings: Optional[Settings] = None):
         "By default the card's OWN deck's queue is consulted, so any currently due card "
         "can be answered; pass deck to require the card to be queued in that deck. "
         "Only the first 50 queued cards of the deck are considered, so a card deeper in a "
-        "long queue is refused until it reaches the front."
+        "long queue is refused until it reaches the front. remaining_in_queue reports the "
+        "deck's true remaining queue (new + learning + review counts) — a just-answered "
+        "card that re-enters today's learning queue is still counted."
         + LOCAL_UNTIL_SYNCED_SUFFIX
     )
     @_tool_guard

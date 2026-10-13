@@ -377,6 +377,30 @@ async def test_add_notes_intra_batch_duplicates_rejected(env):
 
 
 @pytest.mark.asyncio
+async def test_add_notes_intra_batch_gate_normalizes_deck_and_type_variants(env):
+    """Case/padding variants of one deck or note type cannot evade the gate.
+
+    The wheel resolves deck and note-type names case- and padding-insensitively
+    (decks.id("default") and decks.id(" Default ") both return the Default deck;
+    models.by_name("basic") returns Basic), so raw-string keys would let variants
+    of one physical deck create duplicates the gate exists to refuse. The key
+    normalizes both components the same way.
+    """
+    reg, manager = env
+    notes = [
+        NoteInput(deck_name="Default", model_name="Basic", fields={"Front": "same-q", "Back": "a"}),
+        NoteInput(deck_name=" default ", model_name="basic", fields={"Front": "same-q", "Back": "b"}),
+    ]
+    res = await note_tools.add_notes(manager, reg, "alice", notes, allow_duplicates=False)
+    assert res.success is False
+    assert res.local_status == "failed"
+    assert "Duplicate check failed" in res.error
+    assert "note index(es) [1]" in res.error  # only the SECOND copy is flagged, once
+    count = await reg.run("alice", lambda col: len(col.find_notes("*")))
+    assert count == 0  # zero notes created
+
+
+@pytest.mark.asyncio
 async def test_add_notes_empty_first_fields_exempt_from_intra_batch_gate(env):
     """Notes whose stripped first field is empty are exempt, mirroring the
     collection check's early return: two blank-first-field notes in one batch

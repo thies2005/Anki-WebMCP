@@ -114,7 +114,7 @@ class SyncManager:
         return user.ankiweb_email, user.ankiweb_password
 
     def _sync_nudge(self, username: str) -> Optional[str]:
-        """The local-only warning appended to committed mutation responses.
+        """The sync-nudge warning appended to committed mutation responses.
 
         None when the account has no saved AnkiWeb credentials — sync_collection
         would only fail for them, so there is nothing actionable to point the

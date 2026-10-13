@@ -10,8 +10,11 @@ carrying an ``idempotency_key`` follows a per-user, lock-serialized cycle:
     2. Apply the mutation locally under the user's collection lock.
     3. Commit the record to this ledger (flushed atomically to disk).
 
-AnkiWeb synchronization is EXPLICIT and separate (``sync_collection`` / the
-portal's Sync button) — mutations never auto-sync. If an explicit sync drops
+AnkiWeb synchronization happens either explicitly (``sync_collection`` / the
+portal's Sync button) or automatically via the pre-tool two-way sync, which
+pushes pending local mutations at most one SYNC_BEFORE_TOOLS_TTL_SECONDS
+window after they are made (accounts with saved credentials; disable with
+SYNC_BEFORE_TOOLS=false or a sync_collection tool rule). If a sync drops
 mid-transfer with an unknown outcome, the outcome is surfaced as
 ``outcome_unknown`` and NO record is written for the key (ambiguous-outcome
 no-record semantics): a poisoned record could hide a half-applied mutation, so
