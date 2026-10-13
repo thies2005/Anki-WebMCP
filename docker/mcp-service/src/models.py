@@ -283,7 +283,7 @@ class _IdListInput(BaseModel):
         if not v:
             raise ValueError(f"At least one {what} must be provided.")
         if len(v) > max_ids:
-            raise ValueError(f"Batches are limited to {max_ids} {what} per request.")
+            raise ValueError(f"Batches are limited to {max_ids} {what}s per request.")
         for i in v:
             if i <= 0:
                 raise ValueError(f"{what} must be positive integers.")

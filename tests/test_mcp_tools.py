@@ -221,6 +221,28 @@ async def test_search_notes_fields_empty_list_behaves_like_none(env):
     assert res["notes"][0]["fields"] == {"Front": "q", "Back": "a"}
 
 
+@pytest.mark.asyncio
+async def test_search_notes_fields_projection_spans_note_types(env):
+    """The projection is per note: within one search, a Basic note yields its
+    Front while a Cloze note (no Front field) yields only the names it has."""
+    reg, _ = env
+    await reg.run("alice", add_basic_note, "q", "a")
+
+    def _cloze(col):
+        note = Note(col, col.models.by_name("Cloze"))
+        note["Text"] = "{{c1::salut}}"
+        col.add_note(note, col.decks.id("Default"))
+        return note.id
+
+    await reg.run("alice", _cloze)
+
+    res = await note_tools.search_notes(reg, "alice", query="deck:Default", fields=["Front", "Text"])
+    assert res["total_matches"] == 2
+    by_type = {n["model_name"]: n["fields"] for n in res["notes"]}
+    assert by_type["Basic"] == {"Front": "q"}
+    assert by_type["Cloze"] == {"Text": "{{c1::salut}}"}
+
+
 # -- get_notes (batch) -------------------------------------------------------------
 
 

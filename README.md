@@ -317,8 +317,9 @@ All tools operate on the **authenticated user's** collection — the token decid
 | Tool | Parameters | Description |
 |---|---|---|
 | `list_decks` | *none* | Lists all decks in the collection with their names and IDs. |
-| `search_notes` | `query: string`<br>`limit?: int (1-100, default 50)`<br>`offset?: int (default 0)` | Search notes using standard Anki query syntax (e.g. `deck:Default tag:vocab`) with bounded pagination. |
-| `get_note` | `note_id: int` | Fetches complete field values, model name, and tags for a note. |
+| `search_notes` | `query: string`<br>`limit?: int (1-100, default 50)`<br>`offset?: int (default 0)`<br>`fields?: list[string] (1-20 names)` | Search notes using standard Anki query syntax (e.g. `deck:Default tag:vocab`) with bounded pagination. Every result includes `note_id`, `model_name`, `tags`, and all field values; the optional `fields` projection reduces each note to the named fields (names missing from a note's type are omitted for that note) to shrink large result sets. Prefer this over `find_cards` + repeated `get_note` when you need note content. |
+| `get_note` | `note_id: int` | Fetches complete field values, model name, and tags for a note (single note; use `get_notes` for a batch). |
+| `get_notes` | `note_ids: list[int] (1-200)` | Batch `get_note`: fetches complete field values, model name, and tags for many notes in one call, in request order; IDs not in the collection are reported in a `missing` list. |
 | `get_collection_stats` | *none* | Returns reliably supported statistics: cards reviewed today, deck tree counts, and new/learn/review totals. |
 | `sync_collection` | `full_sync_direction?: 'upload' \| 'download'` | **Explicitly** synchronizes the collection with the user's AnkiWeb account (snapshot to `backups/` first, then full sync). Use this after mutations when changes should reach other clients immediately — without it, pending changes are still pushed automatically by the next pre-tool two-way sync, at most one `SYNC_BEFORE_TOOLS_TTL_SECONDS` window after they are made. If AnkiWeb demands a full sync with a user-chosen direction (desktop's "force full sync" was used), the result carries `full_sync_required: true`; retry once with `full_sync_direction: 'upload'` (overwrite AnkiWeb with this service's collection) or `'download'` (overwrite this service's collection with AnkiWeb's). The web portal's sync page offers the same two choices as buttons. |
 | `add_notes` | `notes: list[NoteInput]`<br>`idempotency_key?: string`<br>`allow_duplicates?: bool` | Creates flashcards locally with duplicate detection, per-user locking, and ledger-backed exactly-once semantics. Each note's `NoteInput` takes `note_type` (canonical; `model_name` is accepted as a legacy alias), `deck_name`, `fields`, `tags`. |
@@ -470,7 +471,7 @@ PYTHONPATH=docker/mcp-service pytest tests/ -v
 - [x] Service starts fail-closed: refuses to run without `SESSION_SECRET`, and without bootstrap credentials on an empty store.
 - [x] Streamable HTTP MCP server on port 8000 requires a valid per-user bearer token.
 - [x] Per-user isolation verified at protocol level: two users' sessions on one instance see only their own notes and collections.
-- [x] All 47 MCP tools execute against real per-user collections with per-user locking and ledger-backed idempotency (destructive ones snapshot-or-abort).
+- [x] All 48 MCP tools execute against real per-user collections with per-user locking and ledger-backed idempotency (destructive ones snapshot-or-abort).
 - [x] `/health` reports 200 healthy and 503 degraded (users store unavailable / data dir not writable).
 
 ---
