@@ -38,6 +38,9 @@ services:
       - MAX_OPEN_COLLECTIONS=${MAX_OPEN_COLLECTIONS:-5}
       - MAX_CONCURRENT_SYNCS=${MAX_CONCURRENT_SYNCS:-2}
       - BACKUP_RETENTION=${BACKUP_RETENTION:-20}
+      # Pre-tool AnkiWeb pull: sync from web before every MCP tool call.
+      - SYNC_BEFORE_TOOLS=${SYNC_BEFORE_TOOLS:-true}
+      - SYNC_BEFORE_TOOLS_TTL_SECONDS=${SYNC_BEFORE_TOOLS_TTL_SECONDS:-1800}
     volumes:
       - anki_mcp_data:/data
     healthcheck:

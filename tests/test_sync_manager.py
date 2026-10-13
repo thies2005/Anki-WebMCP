@@ -58,8 +58,17 @@ async def _patch_sync_user(monkeypatch, reg, result):
     """Replace registry.sync_user with a recording fake returning ``result``."""
     calls = []
 
-    async def fake_sync_user(username, email, password, endpoint=None, on_step=None):
-        calls.append({"username": username, "email": email, "password": password})
+    async def fake_sync_user(
+        username, email, password, endpoint=None, on_step=None, full_sync_direction=None
+    ):
+        calls.append(
+            {
+                "username": username,
+                "email": email,
+                "password": password,
+                "full_sync_direction": full_sync_direction,
+            }
+        )
         if on_step is not None:
             try:
                 on_step("backup")
@@ -90,7 +99,14 @@ async def test_sync_success_records_ledger(env, monkeypatch, tmp_path):
     assert res["message"] == "Synchronization completed successfully."
     assert res["warnings"] == []
     # Credentials came from the account record
-    assert calls == [{"username": "alice", "email": "alice@example.com", "password": "ankiweb-pw"}]
+    assert calls == [
+        {
+            "username": "alice",
+            "email": "alice@example.com",
+            "password": "ankiweb-pw",
+            "full_sync_direction": None,
+        }
+    ]
     # The per-user ledger recorded the success with the ledger's field shapes
     ledger = reg.ledger("alice")
     record = await ledger.get("sync-key-1")
@@ -147,6 +163,134 @@ async def test_sync_ambiguous_outcome_records_nothing(env, monkeypatch):
     # Crucially: no ledger record for the ambiguous outcome
     ledger = reg.ledger("alice")
     assert await ledger.get("sync-ambiguous") is None
+
+
+@pytest.mark.asyncio
+async def test_sync_now_forwards_full_sync_direction_and_flag(env, monkeypatch):
+    """The chosen direction reaches registry.sync_user verbatim, and the
+    FULL_SYNC failure flag flows back so MCP clients can retry informed."""
+    reg, store, manager = env
+    calls = await _patch_sync_user(
+        monkeypatch,
+        reg,
+        {
+            "success": False,
+            "error": "AnkiWeb requires a full sync with a user-chosen direction ...",
+            "error_type": "ValueError",
+            "full_sync_required": True,
+        },
+    )
+
+    res = await manager.sync_now("alice", full_sync_direction="download")
+
+    assert res["success"] is False
+    assert res["full_sync_required"] is True
+    assert "Synchronization error:" in res["message"]
+    assert calls == [
+        {
+            "username": "alice",
+            "email": "alice@example.com",
+            "password": "ankiweb-pw",
+            "full_sync_direction": "download",
+        }
+    ]
+
+
+# -- pre-tool sync (sync_before_tool) --------------------------------------------
+
+
+def _settings(sync_before_tools=True, ttl=0):
+    from src.config import Settings
+
+    return Settings(
+        session_secret="test-session-secret",
+        data_dir="/tmp/anki-pretool-test",
+        sync_before_tools=sync_before_tools,
+        sync_before_tools_ttl_seconds=ttl,
+    )
+
+
+@pytest.mark.asyncio
+async def test_pretool_sync_noop_without_credentials(env, monkeypatch):
+    """Accounts without saved credentials never trigger a pre-tool sync."""
+    reg, store, manager = env
+    monkeypatch.setattr(manager, "settings", _settings())
+    calls = await _patch_sync_user(monkeypatch, reg, {"success": True, "output": "ok"})
+
+    await manager.sync_before_tool("no_creds")
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_pretool_sync_runs_then_throttles_inside_ttl(env, monkeypatch):
+    """With credentials: first call syncs; an immediate second call is
+    throttled by the TTL window (default posture against hammering AnkiWeb)."""
+    reg, store, manager = env
+    monkeypatch.setattr(manager, "settings", _settings(ttl=60))
+    calls = await _patch_sync_user(monkeypatch, reg, {"success": True, "output": "ok"})
+
+    await manager.sync_before_tool("alice")
+    await manager.sync_before_tool("alice")
+
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_pretool_sync_ttl_zero_syncs_every_call(env, monkeypatch):
+    reg, store, manager = env
+    monkeypatch.setattr(manager, "settings", _settings(ttl=0))
+    calls = await _patch_sync_user(monkeypatch, reg, {"success": True, "output": "ok"})
+
+    await manager.sync_before_tool("alice")
+    await manager.sync_before_tool("alice")
+
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_pretool_sync_failure_is_fail_open_and_still_throttles(env, monkeypatch):
+    """A failure dict must not escape, and the failed attempt still consumes
+    the TTL window so a broken AnkiWeb cannot slow every tool call with
+    back-to-back retries."""
+    reg, store, manager = env
+    monkeypatch.setattr(manager, "settings", _settings(ttl=60))
+    calls = await _patch_sync_user(
+        monkeypatch, reg, {"success": False, "error": "SyncError: down", "error_type": "SyncError"}
+    )
+
+    await manager.sync_before_tool("alice")  # returns a failure dict — no raise
+    await manager.sync_before_tool("alice")  # throttled by the failed attempt
+
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_pretool_sync_swallows_exceptions(env, monkeypatch):
+    """A raised exception must never propagate — the tool call proceeds."""
+    reg, store, manager = env
+    monkeypatch.setattr(manager, "settings", _settings(ttl=0))
+
+    async def _explode(*args, **kwargs):
+        raise RuntimeError("network layer exploded")
+
+    monkeypatch.setattr(reg, "sync_user", _explode)
+    await manager.sync_before_tool("alice")  # raises inside — never propagates
+
+
+@pytest.mark.asyncio
+async def test_pretool_sync_skipped_when_disabled_or_in_maintenance(env, monkeypatch):
+    reg, store, manager = env
+    calls = await _patch_sync_user(monkeypatch, reg, {"success": True, "output": "ok"})
+
+    monkeypatch.setattr(manager, "settings", _settings(sync_before_tools=False))
+    await manager.sync_before_tool("alice")
+    assert calls == []
+
+    monkeypatch.setattr(manager, "settings", _settings())
+    manager.set_maintenance_mode(True)
+    await manager.sync_before_tool("alice")
+    assert calls == []
 
 
 @pytest.mark.asyncio

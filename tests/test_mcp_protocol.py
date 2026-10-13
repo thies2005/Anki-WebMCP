@@ -365,3 +365,97 @@ async def test_tool_descriptions_teach_local_only_semantics(app_with_users):
             # Read-only exemplars keep their descriptions free of the suffix
             for readonly in ("list_decks", "search_notes", "get_note"):
                 assert "sync_collection" not in tools[readonly]["description"]
+
+
+@pytest.mark.asyncio
+async def test_sync_collection_tool_supports_full_sync_direction(app_with_users, monkeypatch):
+    """MCP access to the user-chosen full-sync direction: the tools/call
+    argument flows through sync_now to registry.sync_user, and the FULL_SYNC
+    refusal carries full_sync_required so the model can retry informed."""
+    app, settings, alice_token, _ = app_with_users
+
+    from src.main import collection_registry
+
+    calls = []
+
+    async def fake_sync_user(
+        username, email, password, endpoint=None, on_step=None, full_sync_direction=None
+    ):
+        calls.append(full_sync_direction)
+        if full_sync_direction is None:
+            return {
+                "success": False,
+                "error": (
+                    "AnkiWeb requires a full sync with a user-chosen direction "
+                    "(the desktop client's 'force full sync' option was used on this account)."
+                ),
+                "error_type": "ValueError",
+                "full_sync_required": True,
+            }
+        return {
+            "success": True,
+            "output": f"Full {full_sync_direction} completed with user-chosen direction.",
+        }
+
+    monkeypatch.setattr(collection_registry, "sync_user", fake_sync_user)
+    # Credentials are required before the manager reaches the registry.
+    app.state.anki_store.set_ankiweb_credentials("alice", "a@example.com", "ankiweb-pw")
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+            headers = await _init_session(client, alice_token)
+
+            payload = await _call_tool(client, headers, "sync_collection", {})
+            structured = json.loads(payload["result"]["content"][0]["text"])
+            assert structured["success"] is False
+            assert structured["full_sync_required"] is True
+            assert "full sync" in structured["message"].lower()
+
+            payload = await _call_tool(
+                client, headers, "sync_collection", {"full_sync_direction": "upload"}
+            )
+            structured = json.loads(payload["result"]["content"][0]["text"])
+            assert structured["success"] is True
+            assert calls == [None, "upload"]
+
+
+@pytest.mark.asyncio
+async def test_tools_sync_from_web_before_running(app_with_users, monkeypatch):
+    """Pre-tool AnkiWeb pull (SYNC_BEFORE_TOOLS): a tool call first syncs the
+    account's AnkiWeb state; an immediate second tool call is throttled by the
+    TTL window; an account without credentials never attempts one; and
+    sync_collection skips the pre-step because it performs the sync itself."""
+    app, settings, alice_token, bob_token = app_with_users
+
+    from src.main import collection_registry
+
+    synced = []
+
+    async def fake_sync_user(
+        username, email, password, endpoint=None, on_step=None, full_sync_direction=None
+    ):
+        synced.append(username)
+        return {"success": True, "output": "ok"}
+
+    monkeypatch.setattr(collection_registry, "sync_user", fake_sync_user)
+    app.state.anki_store.set_ankiweb_credentials("alice", "a@example.com", "ankiweb-pw")
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+            headers = await _init_session(client, alice_token)
+
+            await _call_tool(client, headers, "list_decks", {})
+            assert synced == ["alice"]  # the pull happened before the tool ran
+
+            # Second call inside the default 30-min TTL window: throttled.
+            await _call_tool(client, headers, "search_notes", {"query": "*", "limit": 1})
+            assert synced == ["alice"]
+
+            # Credential-less account: tools run, no sync attempted.
+            bob_headers = await _init_session(client, bob_token, request_id=10)
+            await _call_tool(client, bob_headers, "list_decks", {}, request_id=11)
+            assert synced == ["alice"]
+
+            # sync_collection does its own sync (no pre-step double-fire).
+            await _call_tool(client, headers, "sync_collection", {}, request_id=12)
+            assert synced == ["alice", "alice"]

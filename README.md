@@ -44,7 +44,7 @@
 ## Prerequisites
 
 - **Docker Engine 24+ and Docker Compose v2.24+** (the exposure-mode override files use the `!override` compose tag, which requires 2.24+).
-- **amd64 or arm64 host** — both are supported natively: the pinned `anki` wheel ships `manylinux_2_35` builds for x86_64 and aarch64 on the multi-arch `python:3.14-slim` base (3.14 required: snapshot restore reads the wheel's zstd-compressed backup member via the stdlib `compression.zstd` module).
+- **amd64 or arm64 host** — both are supported natively: the pinned `anki` wheel ships `manylinux_2_35` builds for x86_64 and aarch64 on the multi-arch `python:3.14-slim` base (snapshot restore reads the wheel's zstd-compressed backup member via the stdlib `compression.zstd` module; on Python < 3.14 it falls back to the `zstandard` package, so local dev and restore never silently break).
 - ~450 MB image and roughly **150–350 MB RAM per open collection** (the pool keeps at most `MAX_OPEN_COLLECTIONS` collections open, LRU-bounded).
 - A free host port `8000` (configurable mapping).
 - A Cloudflare account with a Zero Trust tunnel (only for Exposure Mode 1).
@@ -143,6 +143,7 @@ sequenceDiagram
 - **Crash-Window Semantics**: ledger records are flushed atomically (`tempfile` + `fsync` + `os.replace`). If a power loss lands between the collection write and the ledger commit, the first-field duplicate check prevents accidental duplicates on retry (when `allow_duplicates` is false).
 - **Ambiguous-outcome semantics**: if a sync drops mid-flight with an unknown outcome, the response carries an outcome-UNKNOWN warning and the idempotency key is deliberately **not** recorded — verify collection state before retrying. Deterministic failures (e.g. duplicate rejection) do persist a `failed` record.
 - **Bounded state**: the ledger keeps at most 1000 recent keys (each key capped at 256 characters); at most `BACKUP_RETENTION` snapshots per user (default **20**, env-tunable) covering pre-sync, pre-destructive-change, manual, and pre-restore snapshots; at most `MAX_OPEN_COLLECTIONS` collections open at once (idle ones close after `IDLE_TIMEOUT_MINUTES`); at most `MCP_MAX_SESSIONS` concurrent MCP sessions across all users, reaped after `MCP_SESSION_IDLE_TIMEOUT` seconds idle.
+- **Sync-from-web before every tool**: for accounts with saved AnkiWeb credentials, the FIRST tool call in each cooldown window pulls the account's AnkiWeb state (snapshot first, then a two-way sync), so tools always start from current data; the rest of the window's calls run on local data. The pull is **fail-open** — if AnkiWeb is unreachable the tool proceeds on the local copy — and the window is `SYNC_BEFORE_TOOLS_TTL_SECONDS` per user (default **1800s = 30 min**, `0` = pull before every call). Turn it off with `SYNC_BEFORE_TOOLS=false`; accounts without credentials are silently skipped, and `sync_collection` is excluded (it performs the full sync itself).
 
 ---
 
@@ -319,7 +320,7 @@ All tools operate on the **authenticated user's** collection — the token decid
 | `search_notes` | `query: string`<br>`limit?: int (1-100, default 50)`<br>`offset?: int (default 0)` | Search notes using standard Anki query syntax (e.g. `deck:Default tag:vocab`) with bounded pagination. |
 | `get_note` | `note_id: int` | Fetches complete field values, model name, and tags for a note. |
 | `get_collection_stats` | *none* | Returns reliably supported statistics: cards reviewed today, deck tree counts, and new/learn/review totals. |
-| `sync_collection` | *none* | **Explicitly** synchronizes the collection with the user's AnkiWeb account (snapshot to `backups/` first, then full sync). Use this after mutations when changes should reach other clients — mutations do **not** auto-sync. |
+| `sync_collection` | `full_sync_direction?: 'upload' \| 'download'` | **Explicitly** synchronizes the collection with the user's AnkiWeb account (snapshot to `backups/` first, then full sync). Use this after mutations when changes should reach other clients — mutations do **not** auto-sync. If AnkiWeb demands a full sync with a user-chosen direction (desktop's "force full sync" was used), the result carries `full_sync_required: true`; retry once with `full_sync_direction: 'upload'` (overwrite AnkiWeb with this service's collection) or `'download'` (overwrite this service's collection with AnkiWeb's). The web portal's sync page offers the same two choices as buttons. |
 | `add_notes` | `notes: list[NoteInput]`<br>`idempotency_key?: string`<br>`allow_duplicates?: bool` | Creates flashcards locally with duplicate detection, per-user locking, and ledger-backed exactly-once semantics. Each note's `NoteInput` takes `note_type` (canonical; `model_name` is accepted as a legacy alias), `deck_name`, `fields`, `tags`. |
 | `update_note_fields` | `note_id: int`<br>`fields: dict[str, str]` | Updates specific note fields under the per-user write lock. |
 | `add_tags` | `note_ids: list[int]`<br>`tags: list[str]` | Adds tags to one or more notes under the per-user write lock. |

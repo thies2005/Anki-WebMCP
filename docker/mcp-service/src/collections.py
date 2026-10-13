@@ -25,7 +25,8 @@ Design invariants (verified against the anki==26.9.3 wheel):
   ``collection.anki2`` is only a downgrade STUB (a SQLite file whose single
   note tells users to re-import in a newer client — restoring it would wipe
   the user's data). Restoring therefore reads ``collection.anki21b`` via the
-  stdlib ``compression.zstd`` (Python 3.14+, PEP 784) and falls back to a raw
+  stdlib ``compression.zstd`` (Python 3.14+, PEP 784), falling back to the
+  ``zstandard`` package on older Pythons, and falls back to a raw
   ``collection.anki2`` member only for legacy packages that lack 21b
   (all verified against the pinned wheel 26.9.3).
 
@@ -72,12 +73,37 @@ from .ledger import MAX_ENTRIES as LEDGER_MAX_ENTRIES
 from .ledger import IdempotencyLedger
 from .users import USERNAME_RE
 
-try:
-    # Python 3.14+ (PEP 784): decompresses the collection.anki21b member the
-    # pinned wheel writes into every .colpkg backup (see module docstring).
-    from compression import zstd
-except ImportError:  # pragma: no cover - Python < 3.14
-    zstd = None
+def _load_zstd_decompress():
+    """One-shot zstd decompression for the wheel's backup member, or None.
+
+    Prefers the stdlib ``compression.zstd`` (Python 3.14+, PEP 784) — what the
+    Docker image runs. On older Pythons falls back to the ``zstandard``
+    reference backport behind a streaming adapter: the wheel writes frames
+    WITHOUT an embedded content size, which the backport's one-shot
+    ``decompress()`` refuses ("could not determine content size in frame
+    header") while ``decompressobj`` streams them fine. Restore must never be
+    the broken half of the backup/restore pair just because the runtime
+    predates the stdlib module.
+    """
+    try:
+        from compression import zstd
+
+        return zstd.decompress
+    except ImportError:
+        pass
+    try:
+        import zstandard
+
+        def _backport_decompress(data: bytes) -> bytes:
+            dobj = zstandard.ZstdDecompressor().decompressobj()
+            return dobj.decompress(data) + dobj.flush()
+
+        return _backport_decompress
+    except ImportError:
+        return None
+
+
+_zstd_decompress = _load_zstd_decompress()
 
 logger = logging.getLogger("anki_mcp.collections")
 
@@ -130,8 +156,9 @@ def _plan_sync_followup(out: SyncOutput) -> Tuple[str, Optional[int]]:
     - ``"upload"``   — the local collection must replace the server's. Run
       ``full_upload_or_download(upload=True)`` (no media USN).
     - ``"error"``    — FULL_SYNC asks for a user-chosen direction (desktop
-      "on next sync, force full sync" option); an unattended service cannot
-      make that choice, so the caller surfaces it as a failure.
+      "on next sync, force full sync" option); the caller surfaces it as a
+      failure unless the caller-supplied ``full_sync_direction`` settles it
+      (see :meth:`sync_user`).
 
     Regression context: the first sync of a real account returns
     ``required: FULL_DOWNLOAD`` and, until this is acted on, the collection
@@ -202,13 +229,14 @@ def _read_collection_member(path: str) -> bytes:
     with zipfile.ZipFile(path) as archive:
         names = set(archive.namelist())
         if "collection.anki21b" in names:
-            if zstd is None:
+            if _zstd_decompress is None:
                 raise ValueError(
                     f"Backup {os.path.basename(path)!r} stores its database in the zstd-compressed "
-                    "'collection.anki21b' member but this Python (< 3.14) has no stdlib zstd; "
-                    "restore requires Python 3.14+"
+                    "'collection.anki21b' member but no zstd implementation is available; "
+                    "restore requires Python 3.14+ (stdlib compression.zstd) or the "
+                    "'zstandard' package (pip install zstandard)"
                 )
-            return zstd.decompress(_bounded_read(archive, "collection.anki21b"))
+            return _zstd_decompress(_bounded_read(archive, "collection.anki21b"))
         if "collection.anki2" in names:
             return _bounded_read(archive, "collection.anki2")
         raise ValueError(
@@ -735,6 +763,7 @@ class CollectionRegistry:
         ankiweb_password: str,
         endpoint: Optional[str] = None,
         on_step: Optional[Callable[[str], None]] = None,
+        full_sync_direction: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Back up, then synchronize the user's collection with AnkiWeb.
 
@@ -746,6 +775,16 @@ class CollectionRegistry:
           hit DURING ``sync_collection`` (the server may or may not have
           applied the transfer — the idempotency ledger must not poison the
           key). Login-stage failures are NOT ambiguous: nothing was synced.
+        - additionally ``"full_sync_required": True`` when the server demands
+          a full sync with a USER-CHOSEN direction and no ``full_sync_direction``
+          was supplied; the failure is definitive (nothing was transferred).
+
+        ``full_sync_direction`` settles that demand on this service instead of
+        the desktop client: ``"upload"`` replaces AnkiWeb's copy with this
+        service's collection, ``"download"`` replaces this service's
+        collection with AnkiWeb's (a pre-sync backup already protects the
+        losing side). It is ignored for every other handshake result, and any
+        other value is rejected before any network call.
         """
         _check_username(username)
         # Fail BEFORE any network call or directory creation when credentials
@@ -754,6 +793,15 @@ class CollectionRegistry:
             return {
                 "success": False,
                 "error": "AnkiWeb credentials not set for this user; configure them before syncing",
+                "error_type": "ValueError",
+            }
+        if full_sync_direction not in (None, "upload", "download"):
+            return {
+                "success": False,
+                "error": (
+                    f"Invalid full_sync_direction {full_sync_direction!r}: "
+                    "must be 'upload' or 'download' (or omitted)"
+                ),
                 "error_type": "ValueError",
             }
 
@@ -789,16 +837,35 @@ class CollectionRegistry:
                         auth.endpoint = out.new_endpoint
 
                     followup, server_media_usn = _plan_sync_followup(out)
+                    user_chosen = False
                     if followup == "error":
-                        # Deliberately a ValueError (not SyncError): nothing was
-                        # transferred, so the outcome is definitive and must not
-                        # be classified as ambiguous by the handler below.
-                        raise ValueError(
-                            "AnkiWeb requires a full sync with a user-chosen direction "
-                            "(the desktop client's 'force full sync' option was used on this "
-                            "account). Open the desktop client, run a full sync there to settle "
-                            "the direction, then sync this service again."
-                        )
+                        # FULL_SYNC: the server demands a direction only the
+                        # account owner can pick (wrong choice = data loss on
+                        # one side). Without an explicit choice this is a
+                        # definitive refusal (ValueError, NOT SyncError):
+                        # nothing was transferred, so the handler below must
+                        # not classify it as ambiguous. With a choice, fall
+                        # through to the matching bulk transfer — mirroring
+                        # the desktop client, the download case carries the
+                        # handshake's server_media_usn.
+                        if full_sync_direction is None:
+                            return {
+                                "success": False,
+                                "error": (
+                                    "AnkiWeb requires a full sync with a user-chosen direction "
+                                    "(the desktop client's 'force full sync' option was used on this "
+                                    "account). Open the desktop client, run a full sync there to settle "
+                                    "the direction, then sync this service again — or retry with "
+                                    "full_sync_direction='upload' (replace AnkiWeb's copy with this "
+                                    "service's collection) or 'download' (replace this service's "
+                                    "collection with AnkiWeb's)."
+                                ),
+                                "error_type": "ValueError",
+                                "full_sync_required": True,
+                            }
+                        user_chosen = True
+                        followup = full_sync_direction
+                        server_media_usn = int(out.server_media_usn) if full_sync_direction == "download" else None
                     if followup == "download":
                         if on_step is not None:
                             on_step("full-download")
@@ -810,7 +877,9 @@ class CollectionRegistry:
                         )
                         output = (
                             "Full download from AnkiWeb completed "
-                            f"(host {out.host_number}); collection and media pulled to this service."
+                            f"(host {out.host_number})"
+                            + (" with user-chosen direction" if user_chosen else "")
+                            + "; collection and media pulled to this service."
                         )
                     elif followup == "upload":
                         if on_step is not None:
@@ -823,11 +892,18 @@ class CollectionRegistry:
                         )
                         output = (
                             "Full upload to AnkiWeb completed "
-                            f"(host {out.host_number}); collection and media pushed from this service."
+                            f"(host {out.host_number})"
+                            + (" with user-chosen direction" if user_chosen else "")
+                            + "; collection and media pushed from this service."
                         )
                     else:
                         output = str(out)
-                    logger.info("Sync completed for %r (follow-up: %s)", username, followup)
+                    logger.info(
+                        "Sync completed for %r (follow-up: %s%s)",
+                        username,
+                        followup,
+                        ", user-chosen" if user_chosen else "",
+                    )
                     return {"success": True, "output": output}
                 except Exception as exc:
                     result: Dict[str, Any] = {

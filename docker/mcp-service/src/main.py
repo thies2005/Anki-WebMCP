@@ -117,13 +117,15 @@ BACKUP_LIST_LIMIT = 20
 # (claude.ai, Perplexity, ...) never see the server's source; without this
 # they have no way to learn that mutations stay local until sync_collection.
 SERVER_INSTRUCTIONS = (
-    "Mutating tools (notes, decks, cards, tags, note types, media, answering "
-    "reviews) write to this server's local copy of the Anki collection only - "
-    "nothing reaches AnkiWeb automatically. After finishing a batch of changes, "
-    "call sync_collection to push them to AnkiWeb and pull changes made on "
-    "other devices; call it before reading when data from other devices must "
-    "be current. sync_collection requires AnkiWeb credentials saved in the web "
-    "portal's account settings. Review tools are deck-scoped: pass deck to "
+    "Before every tool call this server pulls the account's AnkiWeb state, so "
+    "data from other devices is current without any extra step (if the account "
+    "has no AnkiWeb credentials saved in the web portal, tools simply run on "
+    "the local copy). Mutating tools (notes, decks, cards, tags, note types, "
+    "media, answering reviews) write to this server's local copy only - "
+    "nothing reaches AnkiWeb automatically until you call sync_collection, "
+    "which pushes local changes and pulls remote ones in one two-way sync. "
+    "sync_collection requires AnkiWeb credentials saved in the web portal's "
+    "account settings. Review tools are deck-scoped: pass deck to "
     "get_review_queue to review a specific deck (subdecks included; without "
     "it the currently selected deck is used, which is 'Default' and usually "
     "empty on a fresh collection); answer_card can answer any card currently "
@@ -840,11 +842,13 @@ def _portal_page(
     return _page("Anki MCP - Portal", body, css=_APP_CSS, main_class="app")
 
 
-def _sync_result_page(result: Dict[str, Any]) -> str:
+def _sync_result_page(result: Dict[str, Any], csrf_token: str) -> str:
     """Render the sync_user result dict on a dedicated page.
 
     A dedicated page (not a flash cookie) because sync output/error text is
-    unbounded and would not fit the cookie budget.
+    unbounded and would not fit the cookie budget. When the failure is the
+    FULL_SYNC direction demand, the page offers the two explicit choices as
+    separate CSRF-protected buttons — the direction is never pre-selected.
     """
     if result.get("success"):
         detail = (
@@ -861,6 +865,25 @@ def _sync_result_page(result: Dict[str, Any]) -> str:
             f'<p class="error">Sync failed ({html.escape(str(result.get("error_type", "Error")))}): '
             f'{html.escape(str(result.get("error", "unknown error")))}.{unknown_note}</p>'
         )
+        if result.get("full_sync_required"):
+            token = html.escape(csrf_token)
+            detail += f"""
+<section>
+  <h2>Choose full-sync direction</h2>
+  <p>AnkiWeb requires a full sync with a direction only you can choose.
+  A snapshot of this service's collection was already taken; the losing
+  side is overwritten wholesale, so pick deliberately.</p>
+  <form method="post" action="/portal/sync">
+    <input type="hidden" name="csrf_token" value="{token}">
+    <input type="hidden" name="full_sync_direction" value="upload">
+    <button type="submit">Upload &mdash; overwrite AnkiWeb with this service's collection</button>
+  </form>
+  <form method="post" action="/portal/sync">
+    <input type="hidden" name="csrf_token" value="{token}">
+    <input type="hidden" name="full_sync_direction" value="download">
+    <button type="submit">Download &mdash; overwrite this service's collection with AnkiWeb's</button>
+  </form>
+</section>"""
     return _page(
         "Anki MCP - Sync result",
         f"<h1>Sync result</h1>\n{detail}\n<p><a href=\"/\">Back to portal</a></p>",
@@ -1159,11 +1182,14 @@ def create_app(custom_settings: Optional[Settings] = None):
     # decorator and the function: @mcp.tool derives the client-visible schema
     # from the ORIGINAL signature (inspect.signature follows functools.wraps'
     # __wrapped__), so tool names and schemas are unchanged, while every call
-    # passes through two things the wrapper owns:
+    # passes through three things the wrapper owns:
     #   1. deny-gate — the admin's global rules (ToolPolicyStore) UNIONED with
     #      the account's own rules (User.disabled_tool_patterns); either match
     #      refuses the call with a structured error naming rule and layer;
-    #   2. usage log — every call (reads included, refusals too) is recorded
+    #   2. pre-tool sync — pull the account's AnkiWeb state first so the tool
+    #      operates on current data (fail-open; SYNC_BEFORE_TOOLS to tune;
+    #      sync_collection is its own sync and skips this step);
+    #   3. usage log — every call (reads included, refusals too) is recorded
     #      to the per-user log the portal's Tools page renders.
     # Captured app-locally like tool_registry above: a later create_app()'s
     # stores must never gate or log this app's calls.
@@ -1189,7 +1215,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         return None
 
     def _tool_guard(fn):
-        """Schema-preserving per-tool wrapper: deny-gate + usage-log."""
+        """Schema-preserving per-tool wrapper: deny-gate + pre-tool sync + usage-log."""
         tool_name = fn.__name__
 
         @functools.wraps(fn)
@@ -1219,6 +1245,13 @@ def create_app(custom_settings: Optional[Settings] = None):
                 }
             started = time.monotonic()
             try:
+                if tool_name != "sync_collection":
+                    # Sync from AnkiWeb BEFORE the tool runs so it operates on
+                    # current data. Fail-open no-op without credentials, in
+                    # maintenance mode, inside the TTL window, or on failure
+                    # (details in SyncManager.sync_before_tool). sync_collection
+                    # itself is excluded — it performs the full sync anyway.
+                    await tool_sync_manager.sync_before_tool(username)
                 result = await fn(*args, **kwargs)
             except Exception as e:
                 # The wrappers convert expected failures themselves; this arm
@@ -1297,17 +1330,25 @@ def create_app(custom_settings: Optional[Settings] = None):
     # 5. sync_collection
     @mcp.tool(
         description="Two-way sync with official AnkiWeb: pushes local changes and pulls remote ones. "
-        "Call this after a batch of mutating tools (their changes stay local until then), and before "
-        "reads when data from other devices must be current. Requires AnkiWeb credentials saved in "
-        "the web portal."
+        "Every other tool already pulls AnkiWeb state automatically before it runs (at most once "
+        "per TTL window), so call this mainly after a batch of mutating tools to PUSH changes "
+        "to AnkiWeb. Requires AnkiWeb credentials saved in "
+        "the web portal. If the result reports full_sync_required: true, AnkiWeb demands a full sync "
+        "with a direction only the account owner may choose — retry once with full_sync_direction="
+        "'upload' (replace AnkiWeb's copy with this service's collection) or 'download' (replace "
+        "this service's collection with AnkiWeb's; a local backup is taken first). The argument is "
+        "ignored for regular syncs."
     )
     @_tool_guard
-    async def sync_collection(ctx: Context) -> Dict[str, Any]:
-        username = _username_from_context(ctx)
+    async def sync_collection(
+        full_sync_direction: Optional[str] = None,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
             return _unauthorized_tool_response()
         try:
-            return await sync_tools.sync_collection(tool_sync_manager, username)
+            return await sync_tools.sync_collection(tool_sync_manager, username, full_sync_direction)
         except Exception as e:
             return _tool_error_response(e)
 
@@ -2639,17 +2680,34 @@ def create_app(custom_settings: Optional[Settings] = None):
                 "AnkiWeb credentials are not set — save them below before syncing.",
                 kind="error",
             )
+        # Optional user-chosen direction for the FULL_SYNC demand; the strict
+        # allowlist keeps anything but the two literal choices (or absent)
+        # from reaching the registry, whose wrong-direction sync is
+        # irreversible for the losing side.
+        full_sync_direction = str(form.get("full_sync_direction", "")).strip()
+        if full_sync_direction not in ("", "upload", "download"):
+            return _bad_request(
+                "Could not sync: full_sync_direction must be 'upload' or 'download'.",
+                back_href="/",
+                back_label="Back to portal",
+            )
         # The result dict is rendered on a dedicated page: sync output is
         # unbounded and would not fit the flash cookie.
         try:
             result = await portal_registry.sync_user(
-                user.username, user.ankiweb_email, user.ankiweb_password
+                user.username, user.ankiweb_email, user.ankiweb_password,
+                full_sync_direction=full_sync_direction or None,
             )
         except ValueError as e:
             # Account deleted mid-request; mirror the admin handlers' 400.
             return _bad_request(f"Could not sync: {e}", back_href="/", back_label="Back to portal")
-        logger.info("Portal sync for %r: success=%s", user.username, result.get("success"))
-        return HTMLResponse(_sync_result_page(result))
+        logger.info(
+            "Portal sync for %r: success=%s%s",
+            user.username,
+            result.get("success"),
+            f", direction={full_sync_direction!r}" if full_sync_direction else "",
+        )
+        return HTMLResponse(_sync_result_page(result, issue_csrf(session_value)))
 
     # -- Portal version history (snapshots): create / confirm / restore / ------
     #    download. Session-authenticated like every portal route; every POST is

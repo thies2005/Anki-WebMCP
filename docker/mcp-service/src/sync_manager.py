@@ -28,6 +28,7 @@ warning explains this to the client.
 
 import asyncio
 import logging
+import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from .collections import CollectionRegistry
@@ -64,6 +65,13 @@ class SyncManager:
         # mutation itself, and different users get different locks.
         self._locks_guard = asyncio.Lock()
         self._mutation_locks: Dict[str, asyncio.Lock] = {}
+        # Pre-tool sync (sync_before_tool): per-user monotonic timestamp of the
+        # last attempt, guarded by one small lock so the TTL check-and-set is
+        # atomic. The timestamp is recorded BEFORE the sync runs (and kept even
+        # on failure): a failed attempt must also throttle, or every tool call
+        # would pay a full network timeout while AnkiWeb is down.
+        self._pretool_guard = asyncio.Lock()
+        self._last_pretool_sync: Dict[str, float] = {}
 
     @property
     def maintenance_mode(self) -> bool:
@@ -120,13 +128,74 @@ class SyncManager:
 
     # -- explicit sync ----------------------------------------------------------
 
-    async def sync_now(self, username: str, idempotency_key: Optional[str] = None) -> Dict[str, Any]:
+    async def sync_before_tool(self, username: str) -> None:
+        """Pull the user's AnkiWeb state before an MCP tool call runs.
+
+        Contract — fail-open, never blocking, never raising:
+        - no-op when the feature is disabled (SYNC_BEFORE_TOOLS=false), when
+          the worker is in maintenance mode, when the account is unknown or
+          has no saved AnkiWeb credentials (sync stays opt-in per user), or
+          when the last attempt is younger than the TTL window
+          (SYNC_BEFORE_TOOLS_TTL_SECONDS; 0 = sync before every call);
+        - otherwise delegates to registry.sync_user (which snapshots first,
+          then two-way syncs — pulling remote changes the tool is about to
+          need) and swallows every failure with a log line: the tool call
+          proceeds on local data. A failed attempt still consumes the TTL
+          window, so a reachable-but-broken AnkiWeb cannot slow every tool
+          call with back-to-back retries.
+
+        Called from main's _tool_guard ahead of every tool except
+        sync_collection (that tool IS the sync).
+        """
+        if not self.settings.sync_before_tools:
+            return
+        if self._maintenance_mode:
+            return
+        user = self.store.get_user(username)
+        if user is None or not (user.ankiweb_email and user.ankiweb_password):
+            return
+        async with self._pretool_guard:
+            now = time.monotonic()
+            last = self._last_pretool_sync.get(username)
+            if last is not None and (now - last) < self.settings.sync_before_tools_ttl_seconds:
+                return
+            self._last_pretool_sync[username] = now
+        try:
+            result = await self.registry.sync_user(
+                username,
+                user.ankiweb_email,
+                user.ankiweb_password,
+                on_step=self._on_step(username),
+            )
+            if result.get("success"):
+                logger.debug("Pre-tool sync for %r ok", username)
+            else:
+                logger.warning(
+                    "Pre-tool sync for %r failed (tool proceeds on local data): %s",
+                    username,
+                    result.get("error"),
+                )
+        except Exception as exc:
+            logger.error(
+                "Pre-tool sync for %r raised (tool proceeds on local data): %s", username, exc
+            )
+
+    async def sync_now(
+        self,
+        username: str,
+        idempotency_key: Optional[str] = None,
+        full_sync_direction: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Synchronize the user's collection with AnkiWeb.
 
         Response shape (schema-compatible with the legacy ``sync_collection``
         tool output): ``{"success", "sync_status", "message", "warnings"}``.
         ``idempotency_key`` is accepted for replay/ledger semantics but the
         MCP surface passes none (the tool takes no arguments, unchanged).
+        ``full_sync_direction`` ("upload"/"download") is forwarded to
+        :meth:`CollectionRegistry.sync_user` and only matters when AnkiWeb
+        demands a user-chosen full-sync direction; a failure of that kind
+        carries ``full_sync_required: True`` back to the client.
         """
         if self._maintenance_mode:
             # Same gate as the mutation path, translated to this method's dict
@@ -170,7 +239,8 @@ class SyncManager:
                     }
 
         result = await self.registry.sync_user(
-            username, email, password, on_step=self._on_step(username)
+            username, email, password, on_step=self._on_step(username),
+            full_sync_direction=full_sync_direction,
         )
 
         if result.get("success"):
@@ -215,6 +285,10 @@ class SyncManager:
         }
         if result.get("outcome_unknown"):
             response["outcome_unknown"] = True
+        if result.get("full_sync_required"):
+            # Lets MCP clients (and the LLM driving them) retry with an
+            # explicit full_sync_direction instead of a blind re-call.
+            response["full_sync_required"] = True
         return response
 
     # -- mutation write-safety -----------------------------------------------------

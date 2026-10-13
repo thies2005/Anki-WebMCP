@@ -635,7 +635,81 @@ async def test_sync_user_full_sync_direction_is_a_definitive_failure(make_regist
 
     assert result["success"] is False
     assert "full sync" in result["error"].lower()
+    assert result["error_type"] == "ValueError"
+    assert result["full_sync_required"] is True  # portal/MCP render a direction choice off this
     assert "outcome_unknown" not in result  # definitive refusal, not ambiguous
+    assert fake.calls == [("login", "user@example.com", None), ("sync_collection", "")]  # no transfer
+
+
+@pytest.mark.asyncio
+async def test_sync_user_full_sync_with_chosen_upload_direction(make_registry, monkeypatch):
+    """FULL_SYNC + full_sync_direction='upload' runs the bulk upload instead
+    of failing — mirroring the desktop client's user-picked direction."""
+    from anki.sync_pb2 import SyncCollectionResponse
+
+    reg = make_registry()
+    fake = _FakeSyncCollection(_sync_response(SyncCollectionResponse.ChangesRequired.FULL_SYNC))
+
+    async def fake_ensure_open(state):
+        return fake
+
+    monkeypatch.setattr(reg, "_ensure_open", fake_ensure_open)
+
+    result = await reg.sync_user("alice", "user@example.com", "pw", full_sync_direction="upload")
+
+    assert result["success"] is True, result
+    assert "Full upload" in result["output"]
+    assert "user-chosen direction" in result["output"]
+    # Upload carries no media USN, pushes local data to the server.
+    assert fake.calls[2] == ("full", "", None, True)
+
+
+@pytest.mark.asyncio
+async def test_sync_user_full_sync_with_chosen_download_direction_carries_media_usn(
+    make_registry, monkeypatch
+):
+    """FULL_SYNC + full_sync_direction='download' pulls the server copy
+    wholesale, with the handshake's server_media_usn and against the
+    redirected endpoint — exactly like the FULL_DOWNLOAD follow-up."""
+    from anki.sync_pb2 import SyncCollectionResponse
+
+    reg = make_registry()
+    fake = _FakeSyncCollection(
+        _sync_response(
+            SyncCollectionResponse.ChangesRequired.FULL_SYNC,
+            new_endpoint="https://sync30.ankiweb.net/",
+            server_media_usn=231400,
+        )
+    )
+
+    async def fake_ensure_open(state):
+        return fake
+
+    monkeypatch.setattr(reg, "_ensure_open", fake_ensure_open)
+
+    result = await reg.sync_user("alice", "user@example.com", "pw", full_sync_direction="download")
+
+    assert result["success"] is True, result
+    assert "Full download" in result["output"]
+    assert "user-chosen direction" in result["output"]
+    assert fake.calls[2] == ("full", "https://sync30.ankiweb.net/", 231400, False)
+
+
+@pytest.mark.asyncio
+async def test_sync_user_rejects_invalid_full_sync_direction_before_any_network(make_registry, monkeypatch):
+    reg = make_registry()
+
+    async def explode(state):
+        raise AssertionError("_ensure_open must not be reached for an invalid direction")
+
+    monkeypatch.setattr(reg, "_ensure_open", explode)
+
+    result = await reg.sync_user("alice", "user@example.com", "pw", full_sync_direction="sideways")
+
+    assert result["success"] is False
+    assert result["error_type"] == "ValueError"
+    assert "full_sync_direction" in result["error"]
+    assert "full_sync_required" not in result  # not the server's FULL_SYNC demand
 
 
 # -- backup engine ---------------------------------------------------------------
@@ -831,10 +905,26 @@ async def test_sync_user_still_takes_a_pre_sync_backup(make_registry, monkeypatc
     assert [entry["reason"] for entry in entries] == ["pre-sync"]
 
 
-def test_runtime_has_stdlib_zstd_for_restore():
+def test_runtime_can_decompress_the_wheels_zstd_backup_member():
     """Restore reads the wheel's zstd-compressed collection.anki21b backup
-    member, which needs the stdlib compression.zstd module (Python 3.14+).
-    This pins the runtime floor: the Docker image and CI must never regress
-    to a Python where restore dies at runtime (caught by CI after the Docker
-    image was still 3.12 while local dev was 3.14)."""
-    from compression import zstd  # noqa: F401
+    member. This pins the invariant the 2026 Docker incident taught (the image
+    regressed to a Python where restore died at runtime while backups kept
+    succeeding — unreadable safety snapshots): every runtime running this
+    suite must offer a zstd implementation the service's own import chain can
+    use — stdlib compression.zstd (Python 3.14+, preferred) or the
+    'zstandard' backport. And it must actually decompress a frame WITHOUT an
+    embedded content size (exactly what the wheel writes; the backport's
+    one-shot decompress refuses those, hence the service's streaming adapter).
+    """
+    from src.collections import _zstd_decompress
+
+    assert _zstd_decompress is not None, (
+        "no zstd available for backup restore: use Python 3.14+ or "
+        "pip install zstandard"
+    )
+    # Frame built the way the wheel builds its member: no content-size field.
+    import zstandard
+
+    payload = b"restore-me" * 1000
+    frame = zstandard.ZstdCompressor(write_content_size=False).compress(payload)
+    assert _zstd_decompress(frame) == payload

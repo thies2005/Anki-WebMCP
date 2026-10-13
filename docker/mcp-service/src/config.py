@@ -65,6 +65,17 @@ class Settings:
     # configurable via env; values <= 0 are refused at Settings construction.
     mcp_max_sessions: int = field(default_factory=lambda: _env_int_min("MCP_MAX_SESSIONS", 16, 1))
     mcp_session_idle_timeout: int = field(default_factory=lambda: _env_int_min("MCP_SESSION_IDLE_TIMEOUT", 300, 1))
+    # Pre-tool AnkiWeb sync: pull the account's AnkiWeb state ahead of every
+    # MCP tool call so tools always operate on current data. Fail-open (a
+    # failed pre-sync never blocks the tool — it proceeds on local data) and
+    # throttled per user: the FIRST tool call in a cooldown window pulls from
+    # AnkiWeb, the rest run on local data until the window expires (default
+    # 30 minutes; 0 = pull before every call). Only applies to accounts with
+    # saved AnkiWeb credentials; disable entirely with SYNC_BEFORE_TOOLS=false.
+    sync_before_tools: bool = field(default_factory=lambda: _env_bool("SYNC_BEFORE_TOOLS", True))
+    sync_before_tools_ttl_seconds: int = field(
+        default_factory=lambda: _env_int_min("SYNC_BEFORE_TOOLS_TTL_SECONDS", 1800, 0)
+    )
 
     def __post_init__(self):
         # Derive users_file from data_dir instead of double-reading the

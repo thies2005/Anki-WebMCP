@@ -509,7 +509,7 @@ async def test_portal_sync_runs_again_when_maintenance_mode_ends(app, client, mo
     app.state.anki_store.set_ankiweb_credentials("alice", "user@example.com", "anki-pw")
     calls = []
 
-    async def _fake_sync(username, email, password):
+    async def _fake_sync(username, email, password, endpoint=None, on_step=None, full_sync_direction=None):
         calls.append(username)
         return {"success": True, "output": "ok", "outcome_unknown": False}
 

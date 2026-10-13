@@ -338,6 +338,74 @@ async def test_sync_now_without_credentials_is_inline_notice_and_no_call(
     assert "AnkiWeb credentials are not set" in notice.text
 
 
+@pytest.mark.asyncio
+async def test_sync_full_sync_failure_offers_direction_choice_and_retry(client, monkeypatch):
+    """The FULL_SYNC refusal page renders both direction buttons, and posting
+    one forwards it to sync_user — the choice is the user's, never defaulted."""
+    from src.main import collection_registry, user_store
+
+    calls = []
+
+    async def fake_sync_user(username, email, password, endpoint=None, on_step=None, full_sync_direction=None):
+        calls.append({"username": username, "full_sync_direction": full_sync_direction})
+        if full_sync_direction is None:
+            return {
+                "success": False,
+                "error": (
+                    "AnkiWeb requires a full sync with a user-chosen direction "
+                    "(the desktop client's 'force full sync' option was used on this account)."
+                ),
+                "error_type": "ValueError",
+                "full_sync_required": True,
+            }
+        return {"success": True, "output": f"Full {full_sync_direction} completed with user-chosen direction."}
+
+    monkeypatch.setattr(collection_registry, "sync_user", fake_sync_user)
+    user_store.set_ankiweb_credentials("alice", "user@example.com", "ankiweb-pw")
+    _login(client)
+    csrf = _csrf_from((await client.get("/")).text)
+
+    res = await client.post("/portal/sync", data={"csrf_token": csrf})
+
+    assert res.status_code == 200
+    assert "full_sync_required" not in res.text  # internal flag never leaks raw
+    assert "Choose full-sync direction" in res.text
+    assert 'name="full_sync_direction" value="upload"' in res.text
+    assert 'name="full_sync_direction" value="download"' in res.text
+    # The retry forms carry a fresh, session-valid CSRF token.
+    retry_csrf = _csrf_from(res.text)
+    res2 = await client.post(
+        "/portal/sync",
+        data={"csrf_token": retry_csrf, "full_sync_direction": "download"},
+    )
+    assert res2.status_code == 200
+    assert "Sync succeeded" in res2.text
+    assert calls == [
+        {"username": "alice", "full_sync_direction": None},
+        {"username": "alice", "full_sync_direction": "download"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_rejects_unknown_direction_before_any_sync(client, monkeypatch):
+    from src.main import collection_registry, user_store
+
+    async def _must_not_run(*args, **kwargs):
+        raise AssertionError("sync_user must not be called for an invalid direction")
+
+    monkeypatch.setattr(collection_registry, "sync_user", _must_not_run)
+    user_store.set_ankiweb_credentials("alice", "user@example.com", "ankiweb-pw")
+    _login(client)
+    csrf = _csrf_from((await client.get("/")).text)
+
+    res = await client.post(
+        "/portal/sync", data={"csrf_token": csrf, "full_sync_direction": "sideways"}
+    )
+
+    assert res.status_code == 400
+    assert "full_sync_direction" in res.text
+
+
 # ---------------------------------------------------------------------------
 # CSRF sweep: every state-changing POST requires a valid token (400/403)
 # ---------------------------------------------------------------------------

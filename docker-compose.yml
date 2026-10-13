@@ -22,6 +22,10 @@ services:
       - MAX_OPEN_COLLECTIONS=${MAX_OPEN_COLLECTIONS:-5}
       - MAX_CONCURRENT_SYNCS=${MAX_CONCURRENT_SYNCS:-2}
       - BACKUP_RETENTION=${BACKUP_RETENTION:-20}
+      # Pre-tool AnkiWeb pull: sync from web before every MCP tool call.
+      - SYNC_BEFORE_TOOLS=${SYNC_BEFORE_TOOLS:-true}
+      # Per-user cooldown for that pull (0 = pull before every call).
+      - SYNC_BEFORE_TOOLS_TTL_SECONDS=${SYNC_BEFORE_TOOLS_TTL_SECONDS:-1800}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       # Set true when serving HTTPS through a reverse proxy so session/flash
       # cookies carry the Secure attribute.

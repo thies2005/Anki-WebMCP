@@ -121,6 +121,31 @@ def test_mcp_session_knobs_reject_garbage_and_non_positive(monkeypatch):
         Settings()
 
 
+def test_sync_before_tools_defaults_on_with_ttl(monkeypatch):
+    for name in ("SYNC_BEFORE_TOOLS", "SYNC_BEFORE_TOOLS_TTL_SECONDS"):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings()
+    assert settings.sync_before_tools is True
+    assert settings.sync_before_tools_ttl_seconds == 1800  # first pull per 30-min window
+
+
+def test_sync_before_tools_reads_env_and_allows_zero_ttl(monkeypatch):
+    monkeypatch.setenv("SYNC_BEFORE_TOOLS", "false")
+    monkeypatch.setenv("SYNC_BEFORE_TOOLS_TTL_SECONDS", "0")
+    settings = Settings()
+    assert settings.sync_before_tools is False
+    assert settings.sync_before_tools_ttl_seconds == 0  # 0 = sync before every call
+
+
+def test_sync_before_tools_rejects_garbage_and_negative_ttl(monkeypatch):
+    monkeypatch.setenv("SYNC_BEFORE_TOOLS_TTL_SECONDS", "soon")
+    with pytest.raises(ValueError, match="SYNC_BEFORE_TOOLS_TTL_SECONDS"):
+        Settings()
+    monkeypatch.setenv("SYNC_BEFORE_TOOLS_TTL_SECONDS", "-1")
+    with pytest.raises(ValueError, match="SYNC_BEFORE_TOOLS_TTL_SECONDS"):
+        Settings()
+
+
 # -- main() startup gating ---------------------------------------------------
 
 
