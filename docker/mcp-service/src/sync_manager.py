@@ -334,6 +334,21 @@ class SyncManager:
                 self._mutation_locks[username] = lock
             return lock
 
+    async def drop_user(self, username: str) -> None:
+        """Forget the per-user sync state of a deleted account (audit F-01).
+
+        Both maps are keyed by the username string, so an account recreated
+        under the same name would otherwise inherit the previous holder's
+        pre-tool-sync TTL stamp and serialize behind their (possibly still
+        held) mutation lock. Each pop runs under the guard that owns its map:
+        ``_pretool_guard`` for the TTL stamp, ``_locks_guard`` for the lock
+        table — mirroring how the maps are mutated everywhere else.
+        """
+        async with self._pretool_guard:
+            self._last_pretool_sync.pop(username, None)
+        async with self._locks_guard:
+            self._mutation_locks.pop(username, None)
+
     async def execute_mutation(
         self,
         username: str,

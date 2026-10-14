@@ -165,10 +165,16 @@ def test_set_password_unknown_user_raises(users_file):
 # -- session revocation epoch ------------------------------------------------
 
 
-def test_new_user_session_epoch_defaults_to_zero(users_file):
+def test_new_user_epochs_start_at_creation(users_file):
+    # Audit F-01: a fresh record starts with BOTH revocation epochs AT its
+    # creation instant, so cookies/grants minted for a previous account that
+    # reused the username are dead on arrival. (Records written before the
+    # fields existed still load tolerantly at 0.0 — see the legacy test.)
     store = UserStore(users_file)
     store.create_user("kay", "pw")
-    assert store.get("kay").sessions_invalid_before == 0.0
+    user = store.get("kay")
+    assert user.sessions_invalid_before == user.created_at
+    assert user.tokens_invalid_before == user.created_at
 
 
 def test_legacy_record_without_epoch_field_loads_tolerantly(users_file):
@@ -197,7 +203,8 @@ def test_legacy_record_without_epoch_field_loads_tolerantly(users_file):
 def test_set_password_bumps_session_epoch(users_file):
     store = UserStore(users_file)
     store.create_user("lem", "pw")
-    assert store.get("lem").sessions_invalid_before == 0.0
+    # Fresh records start at their creation instant (audit F-01), not 0.0.
+    assert store.get("lem").sessions_invalid_before == store.get("lem").created_at
     before = time.time()
     store.set_password("lem", "pw2")
     epoch = store.get("lem").sessions_invalid_before
@@ -224,7 +231,8 @@ def test_other_mutations_do_not_bump_session_epoch(users_file):
     store.regenerate_token("nan")
     store.set_ankiweb_credentials("nan", "nan@example.com", "anki-pw")
     store.set_role("nan", "admin")
-    assert store.get("nan").sessions_invalid_before == 0.0
+    # Still at its creation-time initial value: none of these bumps the epoch.
+    assert store.get("nan").sessions_invalid_before == store.get("nan").created_at
 
 
 def test_set_ankiweb_credentials_round_trip(users_file):

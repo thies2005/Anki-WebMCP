@@ -20,6 +20,7 @@ import pytest
 
 from src.config import Settings
 from src.main import create_app
+from src.oauth import public_base_url
 from src.users import UserStore
 
 # POST /login requires the prelogin CSRF pair issued by GET /login; the
@@ -710,3 +711,89 @@ async def test_epoch_rejected_refresh_mints_no_replacement(app, client, tmp_path
     assert len(after) == len(before)
     assert all(float(rec["created_at"]) < epoch for rec in after.values())
     assert len(store._refresh) == 0
+
+
+# -- 10. public_base_url hardening (audit F-03) --------------------------------------------
+#
+# The origin feeds the WWW-Authenticate challenge and both discovery
+# documents, so a crafted Host header must never smuggle quotes/attributes
+# into those values, and X-Forwarded-Proto must never be trusted directly —
+# only the scope scheme (which Uvicorn's ProxyHeadersMiddleware upgrades
+# solely for trusted peers) decides http vs https.
+
+
+def _bare_request(host=None, scheme="http", headers=()):
+    """A minimal Starlette Request built straight from an ASGI scope."""
+    from starlette.requests import Request
+
+    scope_headers = list(headers)
+    if host is not None:
+        scope_headers.append((b"host", host.encode("latin-1")))
+    return Request(
+        {
+            "type": "http",
+            "scheme": scheme,
+            "http_version": "1.1",
+            "method": "GET",
+            "path": "/",
+            "query_string": b"",
+            "headers": scope_headers,
+            "server": ("testserver", 80),
+        }
+    )
+
+
+def _no_env(monkeypatch):
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+
+
+def test_public_base_url_rejects_injection_host_header(monkeypatch):
+    _no_env(monkeypatch)
+    request = _bare_request(host='evil.com", error="invalid_token')
+    assert public_base_url(request) == "http://localhost"
+
+
+def test_public_base_url_uses_first_comma_component_only(monkeypatch):
+    _no_env(monkeypatch)
+    assert public_base_url(_bare_request(host="a.example, b.example")) == "http://a.example"
+    assert public_base_url(_bare_request(host="a.example, b<d>.example")) == "http://a.example"
+
+
+def test_public_base_url_accepts_hostname_with_optional_port(monkeypatch):
+    _no_env(monkeypatch)
+    assert public_base_url(_bare_request(host="anki.example.com")) == "http://anki.example.com"
+    assert public_base_url(_bare_request(host="anki.example.com:8443")) == "http://anki.example.com:8443"
+
+
+def test_public_base_url_rejects_out_of_range_port(monkeypatch):
+    _no_env(monkeypatch)
+    assert public_base_url(_bare_request(host="anki.example.com:0")) == "http://localhost"
+    assert public_base_url(_bare_request(host="anki.example.com:70000")) == "http://localhost"
+
+
+def test_public_base_url_accepts_bracketed_ipv6_only(monkeypatch):
+    _no_env(monkeypatch)
+    assert public_base_url(_bare_request(host="[fe80::1]")) == "http://[fe80::1]"
+    assert public_base_url(_bare_request(host="[::1]:8080")) == "http://[::1]:8080"
+    # Unbracketed IPv6-ish garbage is not a trusted host shape.
+    assert public_base_url(_bare_request(host="fe80::1")) == "http://localhost"
+
+
+def test_public_base_url_scheme_from_scope_never_forwarded_header(monkeypatch):
+    _no_env(monkeypatch)
+    # The raw header is never read: an untrusted client cannot force https.
+    request = _bare_request(
+        host="anki.example.com",
+        scheme="http",
+        headers=[(b"x-forwarded-proto", b"https")],
+    )
+    assert public_base_url(request) == "http://anki.example.com"
+    # The scope scheme (set by trusted-proxy middleware) is honored, and an
+    # unknown scheme value collapses to http.
+    assert public_base_url(_bare_request(scheme="https", host="ok.example")) == "https://ok.example"
+    assert public_base_url(_bare_request(scheme="ftp", host="ok.example")) == "http://ok.example"
+
+
+def test_public_base_url_env_override_wins(monkeypatch):
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://anki.example.com///")
+    assert public_base_url(_bare_request(host="attacker.example")) == "https://anki.example.com"

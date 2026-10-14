@@ -265,3 +265,25 @@ async def test_web_route_table_matches_auth_exempt_set(app):
     )
     assert "/mcp" not in WEB_AUTH_PATHS
     assert "/health" not in WEB_AUTH_PATHS
+
+
+# -- challenge injection (audit F-03) -----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mcp_challenge_not_injectable_via_host_header(client):
+    """A crafted Host header cannot break out of the quoted resource_metadata.
+
+    The hostile value must collapse to the localhost fallback, leaving exactly
+    one well-formed quoted attribute in the WWW-Authenticate challenge.
+    """
+    async with client as c:
+        res = await c.post(
+            "/mcp",
+            headers={"Host": 'evil.com", error="invalid_token'},
+            json={},
+        )
+    assert res.status_code == 401
+    assert res.headers["www-authenticate"] == (
+        'Bearer resource_metadata="http://localhost/.well-known/oauth-protected-resource"'
+    )

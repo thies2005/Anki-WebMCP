@@ -36,6 +36,7 @@ import html
 import json
 import logging
 import os
+import re
 import secrets
 import tempfile
 import threading
@@ -43,6 +44,8 @@ import time
 from typing import Dict, List, Mapping, Optional, Tuple
 from urllib.parse import quote, urlparse
 
+from starlette.datastructures import FormData
+from starlette.formparsers import MultiPartException
 from starlette.requests import Request
 from starlette.responses import (
     HTMLResponse,
@@ -92,23 +95,80 @@ MAX_BODY_BYTES = 64 * 1024
 # The one scope this server issues; anything else requested is coerced to it.
 SCOPE = "mcp"
 
+# Token-endpoint responses (RFC 6749 5.1) must not be cached by any hop.
+_NO_STORE_HEADERS = {"Cache-Control": "no-store", "Pragma": "no-cache"}
 
-def _body_too_large(request: Request) -> bool:
+
+def _body_too_large(request: Request, max_bytes: int = MAX_BODY_BYTES) -> bool:
     """True when the request body must be refused before parsing.
 
     Reads headers only (no body bytes consumed) so an oversized form or JSON
     body is refused before starlette's parsers allocate for it. Chunked bodies
     are refused outright: the parser's per-field caps do not bound multipart
-    file parts, and browsers never chunk these posts.
+    file parts, and browsers never chunk these posts. Audit F-05: a declared
+    Content-Length that fails int() parsing or is negative is also refused —
+    int("-1") used to slip under the cap. A missing Content-Length passes
+    here only because _enforce_body_limit bounds the bytes it streams.
     """
     if request.headers.get("transfer-encoding"):
         return True
     raw = request.headers.get("content-length", "")
     try:
-        return int(raw) > MAX_BODY_BYTES
+        val = int(raw)
     except ValueError:
-        # Unparseable/absent without transfer-encoding: nothing sane to read.
+        # Unparseable/absent without transfer-encoding: a *present* garbage
+        # length is refused fail-closed; absent is left to the streaming cap.
         return raw != ""
+    return val < 0 or val > max_bytes
+
+
+async def _enforce_body_limit(
+    request: Request, max_bytes: int = MAX_BODY_BYTES
+) -> bool:
+    """True when the body fits ``max_bytes``; False when it must be refused.
+
+    Header check first, then the body itself is streamed chunk by chunk and
+    cut off the moment the accumulated size exceeds the cap — audit F-05: a
+    declared Content-Length is a claim (absent over HTTP/2 or a chunked hop),
+    not a bound. On success the bytes are cached as ``request._body`` so the
+    subsequent form()/json() parse reads this bounded in-memory buffer
+    instead of re-reading the socket.
+    """
+    if _body_too_large(request, max_bytes):
+        return False
+    buf = bytearray()
+    async for chunk in request.stream():
+        buf.extend(chunk)
+        if len(buf) > max_bytes:
+            return False
+    request._body = bytes(buf)
+    return True
+
+
+async def _read_bounded_form(
+    request: Request,
+    too_large: Response,
+    malformed: Response,
+    max_bytes: int = MAX_BODY_BYTES,
+) -> Tuple[Optional[FormData], Optional[Response]]:
+    """Parse the form under the streaming body cap with file parts banned.
+
+    Returns ``(form, None)`` on success, or ``(None, response)`` —
+    ``too_large`` when the body exceeds the cap (declared or while
+    streaming), ``malformed`` when starlette's parser rejects the form body.
+    ``max_files=0`` refuses every multipart file part at part-begin, before
+    starlette spools anything to /tmp, and ``max_fields=20`` bounds the
+    per-request field count (audit F-05). The error responses are passed in
+    by the caller so each endpoint keeps its own shape (HTML for the
+    browser-facing consent page, JSON for the machine token endpoint).
+    """
+    if not await _enforce_body_limit(request, max_bytes):
+        return None, too_large
+    try:
+        form = await request.form(max_files=0, max_fields=20)
+    except (MultiPartException, ValueError):
+        return None, malformed
+    return form, None
 
 
 def _pkce_s256(verifier: str) -> str:
@@ -122,18 +182,48 @@ def _hash_refresh_token(raw_token: str) -> str:
     return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
 
 
-def public_base_url(request: Request) -> str:
-    """Externally visible origin for this deployment, proxy headers first.
+# Audit F-03: the only Host values trusted for URL construction — a plain
+# hostname (letters, digits, dot, underscore, hyphen) or a bracketed IPv6
+# literal, optionally with a numeric port. Quotes, spaces, commas and slashes
+# can therefore never reach the WWW-Authenticate challenge or the discovery
+# metadata built on top of public_base_url().
+_VALID_HOST_RE = re.compile(
+    r"^(?:[A-Za-z0-9._-]+|\[[0-9a-fA-F:]+\])(?::[0-9]{1,5})?$"
+)
 
-    Behind a reverse proxy (the Docker deployment) ``request.url`` reflects
-    the internal hop, so ``X-Forwarded-Proto`` and the Host header win when
-    present. The result NEVER carries a trailing slash, so callers can safely
-    build ``f"{base}/path"`` discovery URLs from it.
+
+def public_base_url(request: Request) -> str:
+    """Externally visible origin for this deployment, never with a trailing
+    slash so callers can safely build ``f"{base}/path"`` discovery URLs.
+
+    ``PUBLIC_BASE_URL`` wins when set. Otherwise the origin is derived from
+    the ASGI scope: the scheme comes from ``request.url.scheme`` — never from
+    the raw ``X-Forwarded-Proto`` header, because Uvicorn's
+    ProxyHeadersMiddleware populates the scope scheme only when the peer IP
+    is trusted (FORWARDED_ALLOW_IPS) — and the Host header's first
+    comma-separated component must match :data:`_VALID_HOST_RE` (with an
+    in-range port) or the host falls back to ``localhost``.
     """
-    forwarded_proto = request.headers.get("x-forwarded-proto", "")
-    scheme = forwarded_proto.split(",")[0].strip() if forwarded_proto else request.url.scheme
-    host = request.headers.get("host") or request.url.netloc
-    return f"{scheme}://{host}".rstrip("/")
+    configured = os.environ.get("PUBLIC_BASE_URL", "").strip()
+    if configured:
+        return configured.rstrip("/")
+
+    scheme = (request.url.scheme or "http").split(",")[0].strip().lower()
+    if scheme not in ("http", "https"):
+        scheme = "http"
+
+    raw_host = (
+        request.headers.get("host") or request.url.netloc or "localhost"
+    ).split(",")[0].strip()
+    host = raw_host if _VALID_HOST_RE.match(raw_host) else "localhost"
+    if ":" in host and not host.endswith("]"):
+        try:
+            port_ok = 1 <= int(host.rsplit(":", 1)[1]) <= 65535
+        except ValueError:
+            port_ok = False
+        if not port_ok:
+            host = "localhost"
+    return f"{scheme}://{host}"
 
 
 def _redirect_uri_allowed(uri: str) -> bool:
@@ -359,6 +449,10 @@ class OAuthStore:
                 "username": username,
                 "scope": scope,
                 "code_challenge": code_challenge,
+                # Audit F-02: lets the token exchange refuse codes minted
+                # before the user's revocation epochs (password reset, token
+                # regeneration, account recreation).
+                "created_at": time.time(),
                 "expires_at": time.time() + CODE_TTL_SECONDS,
             }
         logger.info("Issued authorization code for %r (client %r)", username, client_id)
@@ -367,7 +461,7 @@ class OAuthStore:
     def redeem_code(
         self, code: str, client_id: str, redirect_uri: str, code_verifier: str
     ) -> Optional[dict]:
-        """Consume an authorization code; ``{"username", "scope"}`` or None.
+        """Consume an authorization code; ``{"username", "scope", "created_at"}`` or None.
 
         The code is deleted on ANY redemption attempt (pop first), so an
         intercepted-and-replayed code is dead even when the first attempt
@@ -388,7 +482,42 @@ class OAuthStore:
             return None
         if not hmac.compare_digest(_pkce_s256(code_verifier), record["code_challenge"]):
             return None
-        return {"username": record["username"], "scope": record["scope"]}
+        return {
+            "username": record["username"],
+            "scope": record["scope"],
+            "created_at": float(record.get("created_at") or 0.0),
+        }
+
+    def drop_user(self, username: str) -> None:
+        """Drop every authorization code and refresh grant for ``username``.
+
+        Audit F-01: codes and grants are keyed by the username string, so an
+        account deleted and recreated under the same name would otherwise
+        inherit the previous holder's in-flight connector credentials. Codes
+        are in-memory only (nothing to persist); removed refresh grants are
+        persisted immediately so a restart cannot resurrect them.
+        """
+        with self._lock:
+            self._codes = {
+                code: record
+                for code, record in self._codes.items()
+                if record.get("username") != username
+            }
+            stale_refresh = [
+                token_hash
+                for token_hash, record in self._refresh.items()
+                if record.get("username") == username
+            ]
+            for token_hash in stale_refresh:
+                del self._refresh[token_hash]
+            if stale_refresh:
+                self._save_atomic()
+        if stale_refresh:
+            logger.info(
+                "Dropped OAuth state for %r (%d refresh grant(s), codes included)",
+                username,
+                len(stale_refresh),
+            )
 
     # -- refresh tokens (persisted as sha256 hashes; rotated on use) ---------
 
@@ -538,7 +667,13 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
         if issued_at is None:
             return None
         user = user_store.get_user(username)
-        if user is None or issued_at < user.sessions_invalid_before:
+        if user is None:
+            return None
+        # Audit F-01: the floor includes created_at (defense in depth), so a
+        # username REUSED after deletion rejects cookies minted for the
+        # previous account even if a legacy load left the epochs at 0.0.
+        cutoff = max(float(user.created_at or 0.0), float(user.sessions_invalid_before or 0.0))
+        if issued_at < cutoff:
             return None
         return username
 
@@ -603,8 +738,11 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
     # -- dynamic client registration (RFC 7591) ---------------------------------
 
     async def dynamic_register(request: Request) -> JSONResponse:
-        # Pre-auth endpoint: cap the body before JSON parsing allocates for it.
-        if _body_too_large(request):
+        # Pre-auth endpoint: cap the body before JSON parsing allocates for
+        # it. _enforce_body_limit streams under the cap and caches the bytes,
+        # so request.json() parses the bounded buffer instead of re-reading
+        # the socket (audit F-05).
+        if not await _enforce_body_limit(request):
             return JSONResponse({"error": "invalid_request", "error_description": "body too large"}, status_code=413)
         try:
             body = await request.json()
@@ -656,15 +794,20 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
         return HTMLResponse(_consent_page(str(client.get("client_name", "")), values_or_error, csrf_token))
 
     async def authorize_post(request: Request) -> Response:
-        # Pre-auth-reachable endpoint (the browser may post here with only a
-        # stale cookie): cap the body before the form parser allocates for it.
-        if _body_too_large(request):
-            return PlainTextResponse("Request body too large.", status_code=413)
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
         username = _session_username(request)
         if username is None:
             return RedirectResponse("/login", status_code=302)
-        form = await request.form()
+        # Pre-auth-reachable endpoint (the browser may post here with only a
+        # stale cookie): the form parse is capped on the streamed bytes with
+        # multipart file parts banned (audit F-05).
+        form, err = await _read_bounded_form(
+            request,
+            too_large=PlainTextResponse("Request body too large.", status_code=413),
+            malformed=PlainTextResponse("Malformed form body.", status_code=400),
+        )
+        if err is not None:
+            return err
         if not verify_csrf(session_value, _param(form, "csrf_token")):
             return PlainTextResponse("Invalid or missing CSRF token.", status_code=403)
         client, values_or_error = _validate_authorize(form)
@@ -698,11 +841,22 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
     )
 
     async def token_endpoint(request: Request) -> JSONResponse:
-        # Pre-auth endpoint (that is the point of OAuth): cap the body before
-        # the form parser allocates or spools multipart file parts for it.
-        if _body_too_large(request):
-            return JSONResponse({"error": "invalid_request", "error_description": "body too large"}, status_code=413)
-        form = await request.form()
+        # Pre-auth endpoint (that is the point of OAuth): the form parse is
+        # capped on the streamed bytes and multipart file parts are banned
+        # before starlette can spool them (audit F-05).
+        form, err = await _read_bounded_form(
+            request,
+            too_large=JSONResponse(
+                {"error": "invalid_request", "error_description": "body too large"},
+                status_code=413,
+            ),
+            malformed=JSONResponse(
+                {"error": "invalid_request", "error_description": "malformed form body"},
+                status_code=400,
+            ),
+        )
+        if err is not None:
+            return err
         grant_type = _param(form, "grant_type")
         if grant_type == "authorization_code":
             return await _token_authorization_code(form)
@@ -722,6 +876,33 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
             logger.warning("OAuth code redemption failed (client %r)", client_id)
             return JSONResponse({"error": "invalid_grant"}, status_code=400)
         username = redeemed["username"]
+        # Audit F-02: a code minted before a revocation epoch is dead. The
+        # gate mirrors the refresh path's epoch logic: password reset via
+        # sessions_invalid_before, token regeneration via
+        # tokens_invalid_before, and account recreation via created_at (the
+        # F-01 floor). Unknown account -> inf rejects outright, so a code
+        # cannot outlive the account it was consented for.
+        user = user_store.get_user(username)
+        if user is None:
+            cutoff = float("inf")
+        else:
+            cutoff = max(
+                float(user.created_at or 0.0),
+                float(user.sessions_invalid_before or 0.0),
+                float(user.tokens_invalid_before or 0.0),
+            )
+        if user is None or float(redeemed.get("created_at") or 0.0) < cutoff:
+            logger.warning(
+                "OAuth code redeemed for revoked user %r (client %r)", username, client_id
+            )
+            return JSONResponse(
+                {
+                    "error": "invalid_grant",
+                    "error_description": "User session or token was revoked",
+                },
+                status_code=400,
+                headers=_NO_STORE_HEADERS,
+            )
         raw_token = user_store.peek_token(username)
         if not raw_token:
             # Legacy record without token_plaintext: the raw token was never
@@ -748,13 +929,15 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
         # lives inside the hashed refresh record, so peeking it (without
         # consuming) resolves the account's revocation epochs — password
         # reset via sessions_invalid_before, token regeneration via
-        # tokens_invalid_before — and they become rotate_refresh's
+        # tokens_invalid_before, and (audit F-01) account recreation via the
+        # created_at floor — and they become rotate_refresh's
         # min_created_at. rotate_refresh checks that bound BEFORE minting the
-        # replacement, so a leaked grant that a password reset or token
-        # regeneration already killed is refused while persisting nothing new
-        # (no orphaned replacement refresh token). Unknown account -> inf
-        # rejects outright; a client_id mismatch is still caught inside
-        # rotate_refresh before the bound, burning the presented token.
+        # replacement, so a leaked grant that a password reset, token
+        # regeneration, or account recreation already killed is refused while
+        # persisting nothing new (no orphaned replacement refresh token).
+        # Unknown account -> inf rejects outright; a client_id mismatch is
+        # still caught inside rotate_refresh before the bound, burning the
+        # presented token.
         epoch = float("inf")
         peeked = store.peek_refresh(raw_refresh)
         if peeked is not None and peeked.get("client_id") == client_id:
@@ -762,7 +945,11 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
             epoch = (
                 float("inf")
                 if user is None
-                else max(user.sessions_invalid_before, user.tokens_invalid_before)
+                else max(
+                    float(user.created_at or 0.0),
+                    float(user.tokens_invalid_before or 0.0),
+                    float(user.sessions_invalid_before or 0.0),
+                )
             )
         rotated = store.rotate_refresh(raw_refresh, client_id, min_created_at=epoch)
         if rotated is not None:
@@ -772,7 +959,9 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
             new_refresh, record = rotated
             user = user_store.get_user(record["username"])
             if user is None or float(record.get("created_at", 0.0)) < max(
-                user.sessions_invalid_before, user.tokens_invalid_before
+                float(user.created_at or 0.0),
+                float(user.tokens_invalid_before or 0.0),
+                float(user.sessions_invalid_before or 0.0),
             ):
                 rotated = None
         if rotated is None:

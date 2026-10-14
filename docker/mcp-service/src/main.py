@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.context import Context
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import FormData
+from starlette.formparsers import MultiPartException
 from starlette.requests import Request
 from starlette.responses import (
     FileResponse,
@@ -28,7 +30,13 @@ import uvicorn
 
 from .auth import AuthMiddleware
 from .collections import CollectionRegistry
-from .config import Settings, get_settings, load_or_create_session_secret, validate_deployment_config
+from .config import (
+    Settings,
+    _env_int,
+    get_settings,
+    load_or_create_session_secret,
+    validate_deployment_config,
+)
 from .logging_util import setup_logging
 from .models import (
     AddNotesInput,
@@ -332,7 +340,7 @@ def _verify_prelogin(session_secret: str, value: str) -> bool:
         return False
 
 
-def _body_too_large(request: Request) -> bool:
+def _body_too_large(request: Request, max_bytes: int = MAX_FORM_BODY_BYTES) -> bool:
     """True when the request body must be refused before parsing.
 
     Reads headers only and touches no body bytes, so an oversized form POST is
@@ -341,15 +349,65 @@ def _body_too_large(request: Request) -> bool:
     A chunked body (no Content-Length) is refused outright: browsers never
     chunk form posts, and starlette's per-field caps do not bound multipart
     file parts, so admitting chunked would reopen the pre-auth spool path.
+    Audit F-05: a declared Content-Length that fails int() parsing or is
+    negative is also refused — int("-1") used to slip under the cap. A
+    missing Content-Length passes here only because _enforce_body_limit
+    bounds the bytes it actually streams.
     """
     if request.headers.get("transfer-encoding"):
         return True
     raw = request.headers.get("content-length", "")
     try:
-        return int(raw) > MAX_FORM_BODY_BYTES
+        val = int(raw)
     except ValueError:
-        # Unparseable/absent without transfer-encoding: nothing sane to read.
+        # Unparseable/absent without transfer-encoding: a *present* garbage
+        # length is refused fail-closed; absent is left to the streaming cap.
         return raw != ""
+    return val < 0 or val > max_bytes
+
+
+async def _enforce_body_limit(
+    request: Request, max_bytes: int = MAX_FORM_BODY_BYTES
+) -> bool:
+    """True when the body fits ``max_bytes``; False when it must be refused.
+
+    Header check first, then the body itself is streamed chunk by chunk and
+    cut off the moment the accumulated size exceeds the cap — audit F-05: a
+    declared Content-Length is a claim (absent over HTTP/2 or a chunked hop),
+    not a bound. On success the bytes are cached as ``request._body`` so the
+    subsequent form()/json() parse reads this bounded in-memory buffer
+    instead of re-reading the socket.
+    """
+    if _body_too_large(request, max_bytes):
+        return False
+    buf = bytearray()
+    async for chunk in request.stream():
+        buf.extend(chunk)
+        if len(buf) > max_bytes:
+            return False
+    request._body = bytes(buf)
+    return True
+
+
+async def _read_bounded_form(
+    request: Request, max_bytes: int = MAX_FORM_BODY_BYTES
+) -> Tuple[Optional[FormData], Optional[Response]]:
+    """Parse the form under the streaming body cap with file parts banned.
+
+    Returns ``(form, None)`` on success, or ``(None, response)`` where the
+    response is a clean 413 (body over the cap, declared or while streaming)
+    or a 400 (form body starlette's parser rejects). ``max_files=0`` refuses
+    every multipart file part at part-begin — before starlette spools
+    anything to /tmp — and ``max_fields=20`` bounds the per-request field
+    count (audit F-05).
+    """
+    if not await _enforce_body_limit(request, max_bytes):
+        return None, HTMLResponse(_message_page("Request body too large."), status_code=413)
+    try:
+        form = await request.form(max_files=0, max_fields=20)
+    except (MultiPartException, ValueError):
+        return None, HTMLResponse(_message_page("Malformed form body."), status_code=400)
+    return form, None
 
 
 def _uvicorn_run_kwargs(settings: Settings) -> Dict[str, Any]:
@@ -1159,6 +1217,195 @@ def _archive_ledger_dir(data_dir: str, username: str, archive_path: Optional[str
     dest = os.path.join(dest_root, "ledgers")
     os.rename(src, dest)
     return dest
+
+
+MCP_SESSION_ID_HEADER = "mcp-session-id"
+MCP_DEFAULT_MAX_SESSIONS_PER_USER = 16
+
+
+class BoundedSessionManager:
+    """Per-user ownership and fairness for the /mcp session table (audit F-04).
+
+    The SDK's ``StreamableHTTPSessionManager`` owns the transports and the
+    global ``MCP_MAX_SESSIONS`` cap; this guard layers two things on top that
+    a shared multi-user deployment needs and the SDK cannot know, because our
+    per-user token auth never sets the OAuth ``scope["user"]`` the SDK would
+    bind sessions with:
+
+    * every session id is bound to the ``(username, token_hash)`` that created
+      it. A request presenting another user's session id is refused with 403
+      WITHOUT touching that session (no cross-user session theft); a request
+      from the same username whose token hash has since changed (rotated or
+      reset) has the stale session closed underneath it and is answered 401,
+      so the client re-initializes under its current token.
+    * a per-user cap (``MCP_MAX_SESSIONS_PER_USER``, default 16, clamped to
+      ``1..max_sessions``): a user opening one session too many first has
+      their OWN oldest session evicted, so one account can neither pin more
+      than its share of the pool nor lock other users out via the global 503.
+
+    AuthMiddleware delegates every authenticated ``{mcp_path}`` request here
+    (:meth:`handle_request`); the portal/admin handlers call
+    :meth:`drop_user_sessions` when an account's credential changes or the
+    account is deleted, so no transport outlives the token that created it.
+    """
+
+    def __init__(
+        self,
+        session_manager: Any,
+        user_store: UserStore,
+        mcp_path: str,
+        max_sessions: int,
+    ):
+        self._sdk = session_manager  # SDK StreamableHTTPSessionManager
+        self._users = user_store
+        self.mcp_path = mcp_path
+        self.max_sessions = max_sessions
+        cap = _env_int("MCP_MAX_SESSIONS_PER_USER", MCP_DEFAULT_MAX_SESSIONS_PER_USER)
+        self.max_per_user = max(1, min(cap, max_sessions))
+        # session_id -> (username, token_hash) of the credential that created it.
+        self._session_owners: Dict[str, Tuple[str, str]] = {}
+        # Monotonic time of each session's last request through this guard:
+        # the eviction victim is the caller's own least-recently-used session.
+        self._last_seen: Dict[str, float] = {}
+        # Serializes per-user admission (count + evict) so two concurrent
+        # opens by one account cannot both pass the cap check.
+        self._admission_lock = asyncio.Lock()
+
+    async def handle_request(self, request: Request, call_next) -> Response:
+        """Ownership gate + per-user fairness for one authenticated /mcp request."""
+        username: Optional[str] = getattr(request.state, "username", None)
+        session_id = request.headers.get(MCP_SESSION_ID_HEADER)
+
+        if session_id is not None:
+            self._reap_expired()
+            if session_id in self._sdk._server_instances:
+                refusal = await self._enforce_owner(session_id, username)
+                if refusal is not None:
+                    return refusal
+                self._last_seen[session_id] = time.monotonic()
+            # Unknown/expired id: fall through — the SDK answers 404.
+        elif session_id is None and request.method == "POST":
+            # A POST without a session id is the only request that opens a
+            # session: make room under this account's cap BEFORE dispatching,
+            # so the SDK's own admission (which answers 503 at the global cap)
+            # actually has a slot to hand out.
+            await self._make_room_for(username)
+
+        response = await call_next(request)
+
+        if session_id is None and request.method == "POST":
+            # Bind whichever session this request created: the SDK puts the
+            # new id in the response headers (absent when it answered 503 or
+            # the request never established a session).
+            self._bind_created_session(response, username)
+        return response
+
+    async def _enforce_owner(self, session_id: str, username: Optional[str]) -> Optional[Response]:
+        """Refuse (and for same-user token changes, close) a foreign/stale session."""
+        owner = self._session_owners.get(session_id)
+        if owner is None:
+            return None  # Unbound session (created before this guard): pass through.
+        owner_name, owner_token_hash = owner
+        if username == owner_name:
+            current = self._users.get_user(username)
+            if current is not None and current.token_hash == owner_token_hash:
+                return None
+            # Same account, but the credential that created this session no
+            # longer exists (token rotated/reset, account deleted): the stale
+            # transport must not outlive its token. Close it, then 401.
+            await self._close_session(session_id)
+            logger.warning(
+                "Closed /mcp session %.16s of %r: token hash changed since it was created",
+                session_id,
+                username,
+            )
+            return JSONResponse(
+                {"error": "Session was created with a revoked token; re-authenticate and initialize a new session"},
+                status_code=401,
+            )
+        # Different account: refuse WITHOUT touching the other user's session.
+        logger.warning(
+            "Refused /mcp session %.16s: requested by %r, owned by %r",
+            session_id,
+            username,
+            owner_name,
+        )
+        return JSONResponse({"error": "Session belongs to another user"}, status_code=403)
+
+    async def _make_room_for(self, username: Optional[str]) -> None:
+        """At the user's cap, evict their own least-recently-used session."""
+        if not username:
+            return
+        self._reap_expired()
+        if len(self._owned_sessions(username)) < self.max_per_user:
+            return
+        async with self._admission_lock:
+            # Recount under the lock: a concurrent open by the same account
+            # may have evicted or been admitted in the meantime.
+            owned = self._owned_sessions(username)
+            if len(owned) < self.max_per_user:
+                return
+            victim = min(owned, key=lambda sid: self._last_seen.get(sid, 0.0))
+            await self._close_session(victim)
+            logger.info(
+                "Evicted /mcp session %.16s of %r at the per-user cap (%d)",
+                victim,
+                username,
+                self.max_per_user,
+            )
+
+    def _bind_created_session(self, response: Response, username: Optional[str]) -> None:
+        """Bind a newly created session id to the (username, current token hash)."""
+        if not username:
+            return
+        new_session_id = response.headers.get(MCP_SESSION_ID_HEADER)
+        if not new_session_id:
+            return
+        user = self._users.get_user(username)
+        if user is None:
+            return
+        self._session_owners[new_session_id] = (username, user.token_hash)
+        self._last_seen[new_session_id] = time.monotonic()
+
+    def _owned_sessions(self, username: str) -> List[str]:
+        return [sid for sid, (owner, _h) in self._session_owners.items() if owner == username]
+
+    def _reap_expired(self) -> None:
+        """Drop owner/last-seen entries whose session the SDK already discarded.
+
+        The SDK forgets a session itself (client DELETE, idle timeout, failed
+        initialize); our side of the table is cleaned here, on every request
+        that touches an existing session.
+        """
+        for sid in [s for s in self._session_owners if s not in self._sdk._server_instances]:
+            self._session_owners.pop(sid, None)
+            self._last_seen.pop(sid, None)
+
+    async def _close_session(self, session_id: str) -> None:
+        """Terminate one transport and remove it from every tracking table."""
+        self._session_owners.pop(session_id, None)
+        self._last_seen.pop(session_id, None)
+        transport = self._sdk._server_instances.pop(session_id, None)
+        if transport is not None and not transport.is_terminated:
+            # Shielded like the SDK's own _discard_session: the transport
+            # must be torn down even if the caller is being cancelled.
+            with anyio.CancelScope(shield=True):
+                await transport.terminate()
+
+    async def drop_user_sessions(self, username: str) -> int:
+        """Close and remove every /mcp session owned by ``username``.
+
+        Called when an account's token is regenerated, its password is reset,
+        or the account is deleted: transports created under the old credential
+        must not survive it.
+        """
+        self._reap_expired()
+        owned = self._owned_sessions(username)
+        for sid in owned:
+            await self._close_session(sid)
+        if owned:
+            logger.info("Dropped %d /mcp session(s) of %r", len(owned), username)
+        return len(owned)
 
 
 def create_app(custom_settings: Optional[Settings] = None):
@@ -2422,6 +2669,19 @@ def create_app(custom_settings: Optional[Settings] = None):
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
+    # Session ownership + per-user fairness on top of the SDK's table
+    # (audit F-04): binds every mcp-session-id to the (username, token_hash)
+    # that created it, refuses cross-user reuse, and caps sessions per user.
+    # Captured app-locally like portal_registry above; AuthMiddleware (added
+    # below, OUTSIDE this guard) delegates the authenticated /mcp traffic to
+    # it, and the portal/admin handlers drop sessions on credential changes.
+    session_guard = BoundedSessionManager(
+        session_manager=mcp.session_manager,
+        user_store=user_store,
+        mcp_path=settings.mcp_path,
+        max_sessions=settings.mcp_max_sessions,
+    )
+
     # Healthcheck endpoint (exempt from authentication)
     async def health_endpoint(request: Request) -> JSONResponse:
         # Real but CHEAP probes — this runs per healthcheck (Docker/K8s hit it
@@ -2497,8 +2757,12 @@ def create_app(custom_settings: Optional[Settings] = None):
         user = store.get(username)
         if user is None:
             return None
-        if issued_at < user.sessions_invalid_before:
-            return None  # issued before a password-reset epoch bump
+        # Audit F-01: the floor includes created_at (defense in depth), so a
+        # username REUSED after deletion rejects cookies minted for the
+        # previous account even if a legacy load left the epochs at 0.0.
+        cutoff = max(float(user.created_at or 0.0), float(user.sessions_invalid_before or 0.0))
+        if issued_at < cutoff:
+            return None  # issued before the account existed or before a reset
         return user
 
     # Shared guards and flash plumbing for the session-cookie routes below.
@@ -2576,13 +2840,13 @@ def create_app(custom_settings: Optional[Settings] = None):
         return _login_form_response(next_path=nxt)
 
     async def login_submit(request: Request) -> Response:
-        # Body cap BEFORE the form parse: starlette's per-field caps do not
-        # bound a request's total body (and file parts spool to disk), so the
-        # declared Content-Length gates all parse work on this unauthenticated
-        # route. One header read, zero body bytes consumed.
-        if _body_too_large(request):
-            return HTMLResponse(_message_page("Request body too large."), status_code=413)
-        form = await request.form()
+        # Body cap BEFORE the form parse on this unauthenticated route: the
+        # limit is enforced on the streamed bytes (a declared Content-Length
+        # is only a claim) and multipart file parts are banned outright
+        # (audit F-05).
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
         nxt = _safe_next(form.get("next"))
         # Login CSRF first — ahead of the rate limiter and any password work:
         # a cross-site forged POST can neither read the prelogin cookie (Same-
@@ -2675,13 +2939,16 @@ def create_app(custom_settings: Optional[Settings] = None):
         return response
 
     async def logout_submit(request: Request) -> Response:
-        if _body_too_large(request):
-            return HTMLResponse(_message_page("Request body too large."), status_code=413)
         session_value = request.cookies.get(SESSION_COOKIE_NAME)
         user = get_session_user(request)
         if user is None or not session_value:
             return RedirectResponse("/login", status_code=303)
-        form = await request.form()
+        # Body cap enforced at the parse itself: an unauthenticated caller is
+        # redirected without a single body byte read, an authenticated one is
+        # capped on the streamed bytes with file parts banned (audit F-05).
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
         if not verify_csrf(session_value, str(form.get("csrf_token", ""))):
             return HTMLResponse(
                 _message_page("Invalid or missing CSRF token."), status_code=403
@@ -2700,9 +2967,9 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
-        if _body_too_large(request):
-            return HTMLResponse(_message_page("Request body too large."), status_code=413)
-        form = await request.form()
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
         try:
@@ -2710,6 +2977,9 @@ def create_app(custom_settings: Optional[Settings] = None):
         except ValueError as e:
             # Account deleted mid-request; mirror the admin handlers' 400.
             return _bad_request(f"Could not regenerate token: {e}", back_href="/", back_label="Back to portal")
+        # Audit F-04: /mcp transports created under the old token must not
+        # outlive it — close them so the client re-initializes on the new one.
+        await session_guard.drop_user_sessions(user.username)
         logger.info("Portal token regeneration for %r", user.username)
         # One-time reveal via the flash cookie; only the sha256 ever authenticates.
         return _redirect_with_flash("/", raw_token, kind="token")
@@ -2719,9 +2989,9 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
-        if _body_too_large(request):
-            return HTMLResponse(_message_page("Request body too large."), status_code=413)
-        form = await request.form()
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
         email = str(form.get("email", "")).strip()
@@ -2731,6 +3001,11 @@ def create_app(custom_settings: Optional[Settings] = None):
                 "/", "Both AnkiWeb email and password are required.", kind="error"
             )
         await run_in_threadpool(store.set_ankiweb_credentials, user.username, email, password)
+        # The spec's portal_change_password maps to this route — the portal's
+        # only credential-mutation handler — so the account's /mcp sessions
+        # are dropped here too (F-04): the user re-initializes from scratch
+        # after changing any of their stored credentials.
+        await session_guard.drop_user_sessions(user.username)
         logger.info("Portal AnkiWeb credentials update for %r", user.username)
         return _redirect_with_flash("/", "AnkiWeb credentials saved.", kind="success")
 
@@ -2739,9 +3014,9 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
-        if _body_too_large(request):
-            return HTMLResponse(_message_page("Request body too large."), status_code=413)
-        form = await request.form()
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
         # Maintenance gate (audit fix): this handler calls the registry's
@@ -2826,9 +3101,9 @@ def create_app(custom_settings: Optional[Settings] = None):
                 kind="error",
             )
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
-        if _body_too_large(request):
-            return HTMLResponse(_message_page("Request body too large."), status_code=413)
-        form = await request.form()
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
         try:
@@ -2867,9 +3142,9 @@ def create_app(custom_settings: Optional[Settings] = None):
                 kind="error",
             )
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
-        if _body_too_large(request):
-            return HTMLResponse(_message_page("Request body too large."), status_code=413)
-        form = await request.form()
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
         filename = str(form.get("file", ""))
@@ -2933,9 +3208,9 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
-        if _body_too_large(request):
-            return HTMLResponse(_message_page("Request body too large."), status_code=413)
-        form = await request.form()
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
         username = str(form.get("username", "")).strip()
@@ -2956,9 +3231,9 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
-        if _body_too_large(request):
-            return HTMLResponse(_message_page("Request body too large."), status_code=413)
-        form = await request.form()
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
         username = str(form.get("username", "")).strip()
@@ -2969,6 +3244,9 @@ def create_app(custom_settings: Optional[Settings] = None):
             await run_in_threadpool(store.set_password, username, new_password)
         except ValueError as e:
             return _bad_request(f"Could not reset password: {e}")
+        # Audit F-04: close the target account's /mcp sessions along with the
+        # web-session epoch the store just bumped.
+        await session_guard.drop_user_sessions(username)
         logger.info("Admin %r reset password of %r", admin.username, username)
         return _redirect_with_flash("/admin", f"Password updated for {username}.", kind="success")
 
@@ -2977,9 +3255,9 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
-        if _body_too_large(request):
-            return HTMLResponse(_message_page("Request body too large."), status_code=413)
-        form = await request.form()
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
         username = str(form.get("username", "")).strip()
@@ -2987,6 +3265,9 @@ def create_app(custom_settings: Optional[Settings] = None):
             raw_token = await run_in_threadpool(store.regenerate_token, username)
         except ValueError as e:
             return _bad_request(f"Could not regenerate token: {e}")
+        # Audit F-04: /mcp transports created under the old token must not
+        # outlive it — close them so the client re-initializes on the new one.
+        await session_guard.drop_user_sessions(username)
         logger.info("Admin %r regenerated token of %r", admin.username, username)
         return _redirect_with_flash("/admin", raw_token, kind="token")
 
@@ -2995,9 +3276,9 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
-        if _body_too_large(request):
-            return HTMLResponse(_message_page("Request body too large."), status_code=413)
-        form = await request.form()
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
         username = str(form.get("username", "")).strip()
@@ -3028,9 +3309,9 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
-        if _body_too_large(request):
-            return HTMLResponse(_message_page("Request body too large."), status_code=413)
-        form = await request.form()
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
         username = str(form.get("username", "")).strip()
@@ -3084,6 +3365,18 @@ def create_app(custom_settings: Optional[Settings] = None):
         # archived collection. Unknown usernames and never-opened users are a
         # harmless no-op.
         await portal_registry.drop_user(username)
+        # Audit F-04: and close every /mcp session the deleted account owned,
+        # so no transport keyed to its credential survives the deletion.
+        await session_guard.drop_user_sessions(username)
+        # Audit F-01: also drop the per-username state in the OAuth store
+        # (authorization codes + refresh grants), the tool-usage log buffer
+        # and the sync manager's TTL stamp/mutation lock — all keyed by the
+        # username string, so a recreated account would otherwise inherit the
+        # previous holder's connector grants, tool history and sync state.
+        # Unknown usernames are a harmless no-op in each.
+        oauth_store.drop_user(username)
+        tool_usage_log.drop_user(username)
+        await tool_sync_manager.drop_user(username)
         try:
             # And move the on-disk ledger aside (into the same deleted/
             # archive), or a recreate — even after a restart — would reload
@@ -3126,9 +3419,9 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
-        if _body_too_large(request):
-            return HTMLResponse(_message_page("Request body too large."), status_code=413)
-        form = await request.form()
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
         try:
@@ -3155,9 +3448,9 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
-        if _body_too_large(request):
-            return HTMLResponse(_message_page("Request body too large."), status_code=413)
-        form = await request.form()
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
         try:
@@ -3202,14 +3495,18 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # Per-user token auth for the MCP surface; the web routes above are in the
     # middleware's explicit exempt allowlist (they carry their own session-
-    # cookie authentication) along with /health and OPTIONS.
-    app.add_middleware(AuthMiddleware, store=store, settings=settings)
+    # cookie authentication) along with /health and OPTIONS. The middleware
+    # hands authenticated /mcp requests to the session guard (F-04), so it is
+    # constructed AFTER authentication — the guard reads the authenticated
+    # username off request.state — and registered here via closure capture.
+    app.add_middleware(AuthMiddleware, store=store, settings=settings, session_guard=session_guard)
 
     # Introspection handles for tests/ops: the registry and store THIS app owns.
     app.state.anki_registry = collection_registry
     app.state.anki_store = store
     app.state.anki_oauth_store = oauth_store
     app.state.anki_sync_manager = sync_manager
+    app.state.anki_session_guard = session_guard
     app.state.anki_tool_policy = tool_policy_store
     app.state.anki_tool_usage = tool_usage_log
 

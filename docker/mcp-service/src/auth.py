@@ -91,7 +91,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
     construction contract, carried over).
     """
 
-    def __init__(self, app, store: UserStore, settings: Optional[Settings] = None):
+    def __init__(self, app, store: UserStore, settings: Optional[Settings] = None, session_guard=None):
         super().__init__(app)
         if store is None:
             raise ValueError(
@@ -100,6 +100,12 @@ class AuthMiddleware(BaseHTTPMiddleware):
             )
         self.store = store
         self.settings = settings or get_settings()
+        # Optional BoundedSessionManager (audit F-04): binds mcp-session-ids to
+        # the authenticated (username, token_hash), refuses cross-user reuse,
+        # and caps sessions per user. Created by create_app AFTER this
+        # middleware in the stack, so the guard always sees an authenticated
+        # request.state here.
+        self.session_guard = session_guard
 
     async def dispatch(self, request: Request, call_next) -> Response:
         # Permit health checks, CORS preflights, and the cookie-authenticated
@@ -130,6 +136,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # session task; tool wrappers read it via the tool Context.
         request.state.username = user.username
         request.state.user = user
+
+        # Audit F-04: the MCP endpoint's session table is guarded by the app's
+        # BoundedSessionManager (ownership binding + per-user cap). It runs
+        # here — after authentication, before the SDK sees the request — so a
+        # session id can never be exercised by a different credential than the
+        # one that created it.
+        if self.session_guard is not None and request.url.path == self.session_guard.mcp_path:
+            return await self.session_guard.handle_request(request, call_next)
         return await call_next(request)
 
     @staticmethod

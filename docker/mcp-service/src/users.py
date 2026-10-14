@@ -362,12 +362,24 @@ class UserStore:
             if username in self._users:
                 raise ValueError(f"Username already exists: {username!r}")
             raw_token = secrets.token_urlsafe(TOKEN_BYTES)
+            # Audit F-01: a fresh record starts with BOTH revocation epochs AT
+            # its creation instant, so cookies, OAuth grants and codes minted
+            # for a previous account that reused this username predate the new
+            # account's epochs and are rejected. Second resolution (not
+            # sub-second) on purpose: webauth stamps cookie issued-at at whole
+            # seconds, so a sub-second epoch would floor above the account's
+            # very first login and reject it. set_password and
+            # regenerate_token keep stamping sub-second epochs.
+            now = float(int(time.time()))
             user = User(
                 username=username,
                 password_hash=hash_password(password),
                 token_hash=hash_token(raw_token),
                 role=role,
                 token_plaintext=_encode_token(raw_token),
+                created_at=now,
+                sessions_invalid_before=now,
+                tokens_invalid_before=now,
             )
             self._users[username] = user
             self._save_atomic()

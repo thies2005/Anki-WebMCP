@@ -153,3 +153,17 @@ class ToolUsageLogger:
         async with self._lock_for(username):
             entries = self._entries_for(username)
             return [dict(e) for e in reversed(entries[-limit:])]
+
+    def drop_user(self, username: str) -> None:
+        """Forget the in-memory log buffer and lock for a deleted account.
+
+        Audit F-01: the buffer is keyed by the username string, so an account
+        recreated under the same name would otherwise start with the previous
+        holder's tool history. The on-disk log rides along with the archived
+        data directory in the deletion flow; this clears only the
+        process-local state. Popping the lock keeps the same benign-race
+        posture as ``_lock_for``: a concurrent writer either finishes on the
+        old buffer or lazily recreates both entries.
+        """
+        self._logs.pop(username, None)
+        self._locks.pop(username, None)

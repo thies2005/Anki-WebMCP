@@ -41,6 +41,7 @@ from src.main import (
     UVICORN_LIMIT_CONCURRENCY,
     _archive_ledger_dir,
     _body_too_large,
+    _enforce_body_limit,
     _issue_prelogin,
     _uvicorn_run_kwargs,
     _verify_prelogin,
@@ -196,6 +197,10 @@ def test_body_too_large_boundary():
     # multipart file parts, so chunked must never reach the parser).
     assert _body_too_large(request_with(b"")) is False
     assert _body_too_large(request_with(b"abc")) is True
+    # Audit F-05: a negative declared length must count as too large —
+    # int("-1") used to slip under the cap.
+    assert _body_too_large(request_with(b"-1")) is True
+    assert _body_too_large(request_with(b"-999999999")) is True
     req = Request(
         {
             "type": "http",
@@ -205,6 +210,64 @@ def test_body_too_large_boundary():
         }
     )
     assert _body_too_large(req) is True
+
+
+def _streaming_request(chunks):
+    """A urlencoded POST with no Content-Length, body arriving in ASGI chunks."""
+    pending = list(chunks)
+
+    async def receive():
+        if pending:
+            return {"type": "http.request", "body": pending.pop(0), "more_body": False}
+        return {"type": "http.disconnect"}
+
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/login",
+            "headers": [(b"content-type", b"application/x-www-form-urlencoded")],
+        },
+        receive=receive,
+    )
+
+
+@pytest.mark.asyncio
+async def test_enforce_body_limit_caps_undeclared_streams():
+    # Audit F-05: with no Content-Length at all (HTTP/2 or a chunked hop),
+    # the cap applies to the bytes actually streamed — and an admitted body
+    # is cached as request._body, so the follow-up form()/json() parse reads
+    # the bounded in-memory buffer instead of re-reading the socket.
+    over = _streaming_request([b"a=1&" + b"x" * (MAX_FORM_BODY_BYTES + 1)])
+    assert await _enforce_body_limit(over) is False
+
+    req = _streaming_request([b"username=alice&password=ok"])
+    assert await _enforce_body_limit(req) is True
+    form = await req.form()
+    assert form["username"] == "alice"
+
+
+@pytest.mark.asyncio
+async def test_login_refuses_multipart_file_parts(app, client):
+    # Audit F-05: max_files=0 refuses any file part at part-begin, before
+    # starlette spools it to /tmp on this unauthenticated route.
+    boundary = "XbOuNdArY"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="username"\r\n\r\n'
+        "alice\r\n"
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="avatar"; filename="a.bin"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+        + "A" * 64
+        + f"\r\n--{boundary}--\r\n"
+    ).encode()
+    res = await client.post(
+        "/login",
+        content=body,
+        headers={"content-type": f"multipart/form-data; boundary={boundary}"},
+    )
+    assert res.status_code in (400, 413)
 
 
 def test_uvicorn_run_kwargs_carry_concurrency_limit(tmp_path):
@@ -451,6 +514,18 @@ async def test_login_oversized_body_413_before_parse(app, client, monkeypatch):
     assert res.status_code == 413
     assert calls == [], "the body must be refused before any parse or scrypt work"
 
+    # Audit F-05: a negative declared Content-Length counts as too large too.
+    res = await client.post(
+        "/login",
+        content=b"",
+        headers={
+            "content-length": "-5",
+            "content-type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert res.status_code == 413
+    assert calls == [], "the body must be refused before any parse or scrypt work"
+
     # No limiter key: a normal login right after still succeeds.
     res = await login_via_form(client, "alice", ALICE_PASSWORD)
     assert res.status_code == 303
@@ -476,8 +551,14 @@ async def test_other_form_routes_share_the_body_cap(client):
 
 @pytest.mark.asyncio
 async def test_password_reset_via_admin_route_kills_pre_reset_session(app, client, tmp_path):
-    # A cookie issued well before the reset: the portal accepts it...
-    old_alice = _session_value_issued_at(SECRET, "alice", time.time() - 100)
+    # A cookie issued after the account was created but well before the reset:
+    # the portal accepts it... (anchored at created_at: the F-01 username-reuse
+    # floor rejects anything stamped before the account existed, so "old" now
+    # means "issued at account creation" — which the int issued-at stamp, equal
+    # to the second-resolution created_at, expresses exactly.)
+    old_alice = _session_value_issued_at(
+        SECRET, "alice", app.state.anki_store.get("alice").created_at
+    )
     client.cookies.set(SESSION_COOKIE_NAME, old_alice)
     assert (await client.get("/")).status_code == 200
 
@@ -529,8 +610,12 @@ async def test_password_reset_via_admin_route_kills_pre_reset_session(app, clien
 async def test_backdated_session_rejected_after_store_epoch_bump(app, client):
     # Store-level variant of the same wiring: any cookie issued before the
     # epoch set by set_password fails the portal gate, and a cookie issued
-    # AFTER the bump (fresh login) still works.
-    old_cookie = _session_value_issued_at(SECRET, "alice", time.time() - 100)
+    # AFTER the bump (fresh login) still works. (Anchored at created_at: the
+    # F-01 username-reuse floor rejects cookies stamped before the account
+    # existed, so the pre-reset cookie is issued at account creation.)
+    old_cookie = _session_value_issued_at(
+        SECRET, "alice", app.state.anki_store.get("alice").created_at
+    )
     client.cookies.set(SESSION_COOKIE_NAME, old_cookie)
     assert (await client.get("/")).status_code == 200
 
