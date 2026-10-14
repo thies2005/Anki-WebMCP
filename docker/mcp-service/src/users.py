@@ -28,6 +28,7 @@ import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .toolpolicy import is_valid_pattern, validate_patterns
@@ -415,7 +416,45 @@ class UserStore:
             # makes a password reset actually terminate outstanding sessions.
             user.sessions_invalid_before = time.time()
             self._save_atomic()
+            # Audit F-12: the generated first-boot admin credentials file
+            # (initial-admin-password.txt, written by main next to this store)
+            # is a stale plaintext secret once the admin has set their own
+            # password — remove it. missing_ok keeps the common cases (explicit
+            # ADMIN_PASSWORD, non-admin users, already deleted) silent, and an
+            # OSError other than absence is logged rather than raised so a
+            # wedged volume cannot turn a password change into an error.
+            if user.role == "admin":
+                bootstrap_path = Path(self.file_path).parent / "initial-admin-password.txt"
+                if bootstrap_path.exists():
+                    try:
+                        bootstrap_path.unlink(missing_ok=True)
+                        logger.info(
+                            "Removed bootstrap credentials file %s after password change", bootstrap_path
+                        )
+                    except OSError as e:
+                        logger.warning(
+                            "Could not remove bootstrap credentials file %s after "
+                            "password change: %s",
+                            bootstrap_path,
+                            e,
+                        )
         logger.info("Updated password for %r (older web sessions invalidated)", username)
+
+    def bump_sessions_invalid_before(self, username: str) -> None:
+        """Stamp the account's session-revocation epoch NOW and save atomically.
+
+        Audit F-13: logout calls this so a session cookie copied before the
+        logout dies server-side — cookie deletion alone only helps the one
+        browser that performed it. Same eviction step a password reset takes
+        (set_password stamps the same epoch), without touching the password
+        hash or the MCP token. Raises the same ValueError as the other
+        mutators for an unknown username (callers resolve the account first).
+        """
+        with self._lock:
+            user = self._get_locked(username)
+            user.sessions_invalid_before = time.time()
+            self._save_atomic()
+        logger.info("Bumped session-revocation epoch for %r (older web sessions invalidated)", username)
 
     def set_ankiweb_credentials(self, username: str, email: str, password: str) -> None:
         with self._lock:

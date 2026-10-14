@@ -44,6 +44,7 @@ import time
 from typing import Dict, List, Mapping, Optional, Tuple
 from urllib.parse import quote, urlparse
 
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import FormData
 from starlette.formparsers import MultiPartException
 from starlette.requests import Request
@@ -756,8 +757,11 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
         # Unauthenticated growth bound lives inside register_client (atomic
         # check+evict+add under the store lock): a full store self-heals by
         # evicting the oldest client no refresh grant references, and None
-        # means nothing could be evicted.
-        record = store.register_client(
+        # means nothing could be evicted. Audit F-14: the registration fsyncs
+        # oauth_state.json, so run the synchronous store write in the
+        # threadpool instead of blocking the event loop on the disk.
+        record = await run_in_threadpool(
+            store.register_client,
             client_name,
             [str(uri) for uri in body["redirect_uris"]],
         )
@@ -849,10 +853,12 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
             too_large=JSONResponse(
                 {"error": "invalid_request", "error_description": "body too large"},
                 status_code=413,
+                headers=_NO_STORE_HEADERS,
             ),
             malformed=JSONResponse(
                 {"error": "invalid_request", "error_description": "malformed form body"},
                 status_code=400,
+                headers=_NO_STORE_HEADERS,
             ),
         )
         if err is not None:
@@ -862,7 +868,11 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
             return await _token_authorization_code(form)
         if grant_type == "refresh_token":
             return await _token_refresh(form)
-        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+        # Audit F-13: every /oauth/token response (success AND error) is
+        # no-store per RFC 6749 5.1 — token values must never land in a cache.
+        return JSONResponse(
+            {"error": "unsupported_grant_type"}, status_code=400, headers=_NO_STORE_HEADERS
+        )
 
     async def _token_authorization_code(form: Mapping) -> JSONResponse:
         client_id = _param(form, "client_id")
@@ -874,7 +884,9 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
         )
         if redeemed is None:
             logger.warning("OAuth code redemption failed (client %r)", client_id)
-            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+            return JSONResponse(
+                {"error": "invalid_grant"}, status_code=400, headers=_NO_STORE_HEADERS
+            )
         username = redeemed["username"]
         # Audit F-02: a code minted before a revocation epoch is dead. The
         # gate mirrors the refresh path's epoch logic: password reset via
@@ -910,16 +922,21 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
             return JSONResponse(
                 {"error": "server_error", "error_description": _TOKEN_NOT_VIEWABLE},
                 status_code=400,
+                headers=_NO_STORE_HEADERS,
             )
         logger.info("OAuth access token issued to client %r for %r", client_id, username)
+        # Audit F-14: minting the grant fsyncs oauth_state.json; offload the
+        # synchronous store write so the event loop never blocks on the disk.
+        refresh_token = await run_in_threadpool(store.issue_refresh, username, client_id)
         return JSONResponse(
             {
                 "access_token": raw_token,
                 "token_type": "Bearer",
                 "scope": redeemed["scope"],
-                "refresh_token": store.issue_refresh(username, client_id),
+                "refresh_token": refresh_token,
                 # Deliberately NO expires_in: the MCP token has no expiry.
-            }
+            },
+            headers=_NO_STORE_HEADERS,
         )
 
     async def _token_refresh(form: Mapping) -> JSONResponse:
@@ -951,7 +968,12 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
                     float(user.sessions_invalid_before or 0.0),
                 )
             )
-        rotated = store.rotate_refresh(raw_refresh, client_id, min_created_at=epoch)
+        # Audit F-14: the rotation (when it succeeds) fsyncs oauth_state.json;
+        # run the synchronous store write in the threadpool so the event loop
+        # never blocks on the disk.
+        rotated = await run_in_threadpool(
+            store.rotate_refresh, raw_refresh, client_id, min_created_at=epoch
+        )
         if rotated is not None:
             # Defense in depth: the same epoch gate re-checked after the
             # rotation, in case the account's epochs moved between the peek
@@ -966,7 +988,9 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
                 rotated = None
         if rotated is None:
             logger.warning("OAuth refresh token rejected (client %r)", client_id)
-            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+            return JSONResponse(
+                {"error": "invalid_grant"}, status_code=400, headers=_NO_STORE_HEADERS
+            )
         new_refresh, record = rotated
         username = record["username"]
         raw_token = user_store.peek_token(username)
@@ -974,6 +998,7 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
             return JSONResponse(
                 {"error": "server_error", "error_description": _TOKEN_NOT_VIEWABLE},
                 status_code=400,
+                headers=_NO_STORE_HEADERS,
             )
         logger.info("OAuth refresh token rotated for %r (client %r)", username, client_id)
         return JSONResponse(
@@ -982,7 +1007,8 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
                 "token_type": "Bearer",
                 "scope": SCOPE,
                 "refresh_token": new_refresh,
-            }
+            },
+            headers=_NO_STORE_HEADERS,
         )
 
     app.add_route(

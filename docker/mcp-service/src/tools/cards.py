@@ -88,7 +88,10 @@ async def find_cards(
     logger.info("Executing find_cards for %r: query=%r, limit=%d, offset=%d", username, query, limit, offset)
 
     def _find(col) -> Dict[str, Any]:
-        card_ids = list(col.find_cards(query))
+        try:
+            card_ids = list(col.find_cards(query))
+        except SearchError as exc:
+            raise CollectionToolError(f"Invalid search query {query!r}: {exc}") from exc
         total = len(card_ids)
         rows = []
         for cid in card_ids[offset : offset + limit]:

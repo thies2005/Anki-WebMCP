@@ -10,7 +10,15 @@ _PATTERNS = [
     (re.compile(r"(Bearer\s+)[A-Za-z0-9_\-\.]{6,}", re.IGNORECASE), r"\1[REDACTED]"),
     # Basic auth
     (re.compile(r"(Basic\s+)[A-Za-z0-9+/=]{6,}", re.IGNORECASE), r"\1[REDACTED]"),
-    # Key-value pairs: "key": "...", key=..., token=..., apiKey=...
+    # Key-value pairs with a QUOTED value — "password": "my secret pass".
+    # Audit F-13: these run BEFORE the bare-token pattern below, which only
+    # matches up to the first whitespace and used to leave the tail of a
+    # quoted secret ("[REDACTED] secret pass") in the log. Order matters: the
+    # quoted patterns consume the whole value, so the bare pattern only ever
+    # sees what they left (an already-redacted marker, idempotently).
+    (re.compile(r'(["\']?(?:api[_-]?key|key|token|auth|password|secret|hkey)["\']?\s*[:=]\s*")([^"]*)(")', re.IGNORECASE), r'\1[REDACTED]\3'),
+    (re.compile(r'(["\']?(?:api[_-]?key|key|token|auth|password|secret|hkey)["\']?\s*[:=]\s*\')([^\']*)(\')', re.IGNORECASE), r'\1[REDACTED]\3'),
+    # Key-value pairs, bare unquoted value: key=..., token=..., apiKey=...
     (re.compile(r'(["\']?(?:api[_-]?key|key|token|auth|password|secret|hkey)["\']?\s*[:=]\s*["\']?)([^"\'\s,;&]+)(["\']?)', re.IGNORECASE), r'\1[REDACTED]\3'),
 ]
 
@@ -27,10 +35,14 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")
 
 # Secret-bearing dict keys. Generic names cover every real secret this service
 # handles (session_secret, admin_password, per-user MCP tokens, AnkiWeb
-# credentials); the deleted legacy env-var names are NOT listed.
+# credentials); the deleted legacy env-var names are NOT listed. Audit F-13
+# adds the compound names the exact-match lookup used to miss: the OAuth
+# grant material and the stored credential fields.
 _SENSITIVE_KEYS = {
     "key", "apikey", "api_key", "token", "auth", "password", "secret",
     "hkey", "authorization", "x-api-key",
+    "refresh_token", "access_token", "code_verifier", "ankiweb_password",
+    "token_plaintext", "client_secret",
 }
 
 

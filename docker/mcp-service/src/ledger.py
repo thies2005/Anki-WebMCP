@@ -183,3 +183,19 @@ class IdempotencyLedger:
             # ledger asyncio lock is held across the call).
             await asyncio.to_thread(self._save_atomic)
             logger.info("Recorded idempotency key %r with failed status", key[:_LOG_KEY_LEN])
+
+    async def clear(self) -> None:
+        """Drop every recorded key and persist the empty ledger atomically.
+
+        Used after a backup restore (audit F-11): keys committed after the
+        restored snapshot was created were never applied to the restored
+        collection, so their records must not replay. Persists even when the
+        in-memory map was already empty — the on-disk file may still hold
+        records written by a previous process. Same worker-thread rewrite
+        discipline as record_success/record_failure (the ledger asyncio lock
+        is held across the save).
+        """
+        async with self._lock:
+            self._entries.clear()
+            await asyncio.to_thread(self._save_atomic)
+            logger.info("Cleared idempotency ledger %s", self.file_path)

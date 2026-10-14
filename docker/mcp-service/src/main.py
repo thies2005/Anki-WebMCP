@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.context import Context
 from starlette.concurrency import run_in_threadpool
-from starlette.datastructures import FormData
+from starlette.datastructures import FormData, MutableHeaders
 from starlette.formparsers import MultiPartException
 from starlette.requests import Request
 from starlette.responses import (
@@ -872,7 +872,10 @@ def _portal_page(
     token_mask: str,
 ) -> str:
     if token_mask:
-        token_state = f"<p>Current token: <code>{html.escape(token_mask)}</code></p>"
+        token_state = (
+            "<p>Current token (masked preview only &mdash; the portal never shows "
+            f"the full value): <code>{html.escape(token_mask)}</code></p>"
+        )
     else:
         # Legacy record without token_plaintext: the raw value was never stored.
         token_state = '<p class="muted">Token not viewable &mdash; regenerate to view.</p>'
@@ -885,7 +888,10 @@ def _portal_page(
 {_flash_html(flash)}
 <section>
   <h2>MCP token</h2>
-  <p>Authenticate MCP clients with this account's token.</p>
+  <p>Authenticate MCP clients with this account's Bearer token. The full token is
+  shown exactly once &mdash; when the account is created or when you press
+  <strong>Regenerate token</strong> &mdash; so copy it immediately; it is never
+  displayed again afterwards.</p>
   {token_state}
   <form method="post" action="/portal/regenerate-token">
     <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
@@ -1408,6 +1414,42 @@ class BoundedSessionManager:
         return len(owned)
 
 
+class SecurityHeadersMiddleware:
+    """Baseline security headers on every HTTP response (audit F-13).
+
+    Pure-ASGI send wrapper (no BaseHTTPMiddleware task overhead): each default
+    header is set only when the response does not already carry it, so a
+    handler or an outer middleware can always override. ``nosniff`` stops
+    MIME-confusion sniffing, ``DENY`` keeps the portal/admin pages out of
+    framing and clickjacking shells, and ``no-referrer`` keeps session-bearing
+    URLs out of Referer headers on outbound navigation.
+    """
+
+    _DEFAULT_HEADERS = (
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        ("referrer-policy", "no-referrer"),
+    )
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_security_headers(message):
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(raw=message["headers"])
+                for name, value in self._DEFAULT_HEADERS:
+                    if name not in headers:
+                        headers[name] = value
+            await send(message)
+
+        await self.app(scope, receive, send_with_security_headers)
+
+
 def create_app(custom_settings: Optional[Settings] = None):
     """Create and configure the MCP Starlette ASGI application."""
     global settings, logger, user_store, sync_manager, login_rate_limiter, collection_registry
@@ -1423,7 +1465,13 @@ def create_app(custom_settings: Optional[Settings] = None):
             backup_retention=settings.backup_retention,
         )
         sync_manager = SyncManager(collection_registry, user_store, settings)
-    login_rate_limiter = LoginRateLimiter()  # fresh per app: lockout state must not leak across tests/restarts
+    # Audit F-14: the login rate limiter is THIS app's instance. login_submit
+    # closes over ``app_rate_limiter``, so a later create_app() rebinding the
+    # ``login_rate_limiter`` module alias (kept only for backward-compatible
+    # imports) can never move or reset this app's lockout state; the instance
+    # is also published on app.state for introspection.
+    app_rate_limiter = LoginRateLimiter()
+    login_rate_limiter = app_rate_limiter
 
     # Captured AFTER the possible custom_settings rebind above, so the tool
     # wrappers always use the registry/manager THIS app owns — never a later
@@ -2866,8 +2914,9 @@ def create_app(custom_settings: Optional[Settings] = None):
         password = str(form.get("password", ""))
         ip = request.client.host if request.client else ""
         # Brute-force gate second: a locked key is rejected before any password
-        # work happens, and the page reveals nothing about the account.
-        if not login_rate_limiter.check(username, ip):
+        # work happens, and the page reveals nothing about the account. Goes
+        # through THIS app's limiter (audit F-14), never the module alias.
+        if not app_rate_limiter.check(username, ip):
             logger.warning("Login rate-limited for %r from %s", username, ip)
             return HTMLResponse(
                 _message_page("Too many failed attempts. Please try again later."),
@@ -2882,7 +2931,7 @@ def create_app(custom_settings: Optional[Settings] = None):
             async with login_verify_capacity:
                 valid = await run_in_threadpool(store.verify_password, username, password)
         if valid:
-            login_rate_limiter.record_success(username, ip)
+            app_rate_limiter.record_success(username, ip)
             response = RedirectResponse(nxt or "/", status_code=303)
             response.set_cookie(
                 SESSION_COOKIE_NAME,
@@ -2902,7 +2951,7 @@ def create_app(custom_settings: Optional[Settings] = None):
             )
             logger.info("Web session issued for %r from %s", username, ip)
             return response
-        login_rate_limiter.record_failure(username, ip)
+        app_rate_limiter.record_failure(username, ip)
         # Generic message: identical for unknown usernames and wrong passwords.
         # The retry form ships with a fresh prelogin pair (and the pending
         # next-path, so an OAuth flow survives a mistyped password).
@@ -2931,8 +2980,11 @@ def create_app(custom_settings: Optional[Settings] = None):
             backups = await run_in_threadpool(portal_registry.list_backups, user.username)
         except Exception:
             logger.exception("Backup listing failed for %r", user.username)
+        # Audit F-13: the portal renders the flash cookie and CSRF-bound forms;
+        # browsers and proxies must never cache it.
         response = HTMLResponse(
-            _portal_page(user, csrf_token, flash, stats, backups, token_mask)
+            _portal_page(user, csrf_token, flash, stats, backups, token_mask),
+            headers={"Cache-Control": "no-store"},
         )
         if request.cookies.get(FLASH_COOKIE_NAME):
             _clear_flash(response)  # consumed: render at most once
@@ -2954,9 +3006,21 @@ def create_app(custom_settings: Optional[Settings] = None):
                 _message_page("Invalid or missing CSRF token."), status_code=403
             )
         response = RedirectResponse("/login", status_code=303)
+        # Audit F-13: logout must revoke server-side, not just in this browser.
+        # A stateless signed cookie cannot be un-sent: stamping the account's
+        # session-revocation epoch (the same step a password reset takes) makes
+        # every cookie issued before NOW — including one copied from this
+        # browser — fail get_session_user immediately. Disk write goes to the
+        # threadpool like every other UserStore mutation here.
+        await run_in_threadpool(store.bump_sessions_invalid_before, user.username)
         # Mirror the set-cookie Secure flag so the deletion cookie matches in
         # FORCE_SECURE_COOKIES deployments too.
         response.delete_cookie(SESSION_COOKIE_NAME, path="/", secure=secure_cookies_enabled())
+        # Audit F-13: the flash and pre-login cookies are session-scoped too —
+        # a stale flash must not render after logout, and a pre-login CSRF pair
+        # must not outlive the session it was issued alongside.
+        response.delete_cookie(FLASH_COOKIE_NAME, path="/", secure=secure_cookies_enabled())
+        response.delete_cookie(PRELOGIN_COOKIE_NAME, path="/login", secure=secure_cookies_enabled())
         logger.info("Web session ended for %r", user.username)
         return response
 
@@ -3211,7 +3275,12 @@ def create_app(custom_settings: Optional[Settings] = None):
         flash = _peek_flash(request)
         accounts = await run_in_threadpool(store.list_users)
         global_patterns = tool_policy_store.get_patterns()
-        response = HTMLResponse(_admin_page(user, csrf_token, flash, accounts, global_patterns))
+        # Audit F-13: same no-cache posture as the portal — the admin page
+        # carries the flash cookie and CSRF forms and must never be cached.
+        response = HTMLResponse(
+            _admin_page(user, csrf_token, flash, accounts, global_patterns),
+            headers={"Cache-Control": "no-store"},
+        )
         if request.cookies.get(FLASH_COOKIE_NAME):
             _clear_flash(response)  # consumed: render at most once
         return response
@@ -3514,6 +3583,12 @@ def create_app(custom_settings: Optional[Settings] = None):
     # username off request.state — and registered here via closure capture.
     app.add_middleware(AuthMiddleware, store=store, settings=settings, session_guard=session_guard)
 
+    # Baseline security headers on every response (audit F-13). Registered
+    # AFTER AuthMiddleware so it sits OUTSIDE it in the stack (the last
+    # add_middleware is outermost) — AuthMiddleware's own 401/WWW-Authenticate
+    # responses must get the headers too. Set-if-absent: handlers can override.
+    app.add_middleware(SecurityHeadersMiddleware)
+
     # Introspection handles for tests/ops: the registry and store THIS app owns.
     app.state.anki_registry = collection_registry
     app.state.anki_store = store
@@ -3522,6 +3597,7 @@ def create_app(custom_settings: Optional[Settings] = None):
     app.state.anki_session_guard = session_guard
     app.state.anki_tool_policy = tool_policy_store
     app.state.anki_tool_usage = tool_usage_log
+    app.state.anki_rate_limiter = app_rate_limiter  # audit F-14: per-app limiter
 
     # Per-user collection lifecycle (Task 3): a background task closes
     # collections idle beyond idle_timeout_minutes every minute, and shutdown

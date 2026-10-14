@@ -195,8 +195,14 @@ def verify_csrf(session_value: str, token: str) -> bool:
 
 
 def secure_cookies_enabled() -> bool:
-    """Whether session cookies should carry the Secure attribute (FORCE_SECURE_COOKIES=true)."""
-    return os.getenv(FORCE_SECURE_COOKIES_ENV, "").strip().lower() == "true"
+    """Whether session cookies should carry the Secure attribute.
+
+    Audit F-13: accepts the same truthy spellings as config._env_bool —
+    ``true``, ``1`` and ``yes``, case-insensitive, whitespace-trimmed — so
+    ``FORCE_SECURE_COOKIES=1`` and ``=yes`` behave identically to ``=true``
+    instead of silently leaving cookies non-Secure.
+    """
+    return os.environ.get(FORCE_SECURE_COOKIES_ENV, "false").strip().lower() in ("true", "1", "yes")
 
 
 class LoginRateLimiter:

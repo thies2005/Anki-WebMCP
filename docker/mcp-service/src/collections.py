@@ -1129,7 +1129,10 @@ class CollectionRegistry:
         replace ``collection.anki2`` atomically (mkstemp + fsync + chmod 0644
         + ``os.replace``, mirroring UserStore's persistence pattern).
         ``state.col`` stays ``None``, so the next ``run()`` reopens the
-        restored file fresh. Returns the restore record for the caller.
+        restored file fresh. On success the per-user idempotency ledger is
+        cleared (audit F-11): mutations committed after the snapshot was
+        created were never applied to the restored collection, so their
+        records must not replay. Returns the restore record for the caller.
         """
         _check_username(username)
         if not BACKUP_FILENAME_RE.fullmatch(filename) or filename not in {
@@ -1191,4 +1194,12 @@ class CollectionRegistry:
                 filename,
                 snapshot,
             )
+            # (e) Wipe the idempotency ledger (audit F-11): keys recorded
+            # after the restored snapshot are stale — the restored collection
+            # never saw those mutations, so replaying them would return
+            # cached results without applying anything. The registry
+            # accessor loads any on-disk ledger first, so records that
+            # outlived a service restart are wiped too; the atomic save
+            # runs on a worker thread under the ledger's own lock.
+            await self.ledger(username).clear()
             return {"restored_from": filename, "pre_restore_snapshot": snapshot}

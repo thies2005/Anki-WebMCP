@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import anki.lang
 from anki.consts import MODEL_CLOZE
-from anki.errors import NotFoundError
+from anki.errors import InvalidInput, NotFoundError, SearchError
 from anki.notes import Note
 
 from ..errors import CollectionToolError
@@ -57,6 +57,18 @@ def _escape_search_term(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _escape_exact_search_term(value: str) -> str:
+    """Escape a value for a double-quoted search term matched EXACTLY.
+
+    ``_escape_search_term``'s ``\\`` and ``"`` escaping keeps the term
+    well-formed; without additionally escaping the Anki wildcards ``*`` and
+    ``_`` (``\\*`` / ``\\_``, probed on the wheel: both are honored inside
+    quoted terms) the value matches any string differing in those positions,
+    so a candidate search for ``cat_dog*fish`` would also surface ``catXdogYfish``.
+    """
+    return _escape_search_term(value).replace("*", "\\*").replace("_", "\\_")
+
+
 def _project_fields(fields: Dict[str, str], wanted: Optional[List[str]]) -> Dict[str, str]:
     """Reduce a note's fields to the requested projection.
 
@@ -92,7 +104,10 @@ async def search_notes(
     logger.info("Executing search_notes for %r: query=%r, limit=%d, offset=%d", username, query, limit, offset)
 
     def _search(col) -> Dict[str, Any]:
-        note_ids = list(col.find_notes(query))
+        try:
+            note_ids = list(col.find_notes(query))
+        except SearchError as exc:
+            raise CollectionToolError(f"Invalid search query: {exc}") from exc
         total = len(note_ids)
         notes: List[Dict[str, Any]] = []
         # Slice offset/limit AFTER the full find (same semantics as before).
@@ -161,6 +176,12 @@ def _is_first_field_duplicate(col, model, deck_name: str, fields: Dict[str, str]
     ``duplicateScope: "deck"``: duplicates are judged on the note type's FIRST
     field within the target deck. (Approximation of AnkiConnect's normalized
     comparison: values are compared as exact strings, not HTML-stripped.)
+
+    The search only narrows candidates: ``deck:`` matching includes subdecks
+    and the term must stay wildcard-tolerant in principle, so every candidate
+    is verified in Python — same note type, first field exactly equal (after
+    stripping), and (deck scope) at least one card whose effective deck
+    (``odid or did``) is the target deck itself, not a subdeck of it.
     """
     try:
         first_field_name = model["flds"][0]["name"]
@@ -175,9 +196,23 @@ def _is_first_field_duplicate(col, model, deck_name: str, fields: Dict[str, str]
     # field name has a space, and ``"Field":"value"`` is a SearchError).
     query = (
         f'deck:"{_escape_search_term(deck_name)}" '
-        f'"{_escape_search_term(first_field_name)}:{_escape_search_term(value)}"'
+        f'"{_escape_search_term(first_field_name)}:{_escape_exact_search_term(value)}"'
     )
-    return len(col.find_notes(query)) > 0
+    # None when the deck does not exist yet (it is only created in pass 2);
+    # no card can then sit in it, so the deck check below rejects everything.
+    target_did = col.decks.id_for_name(deck_name)
+    for cid in col.find_notes(query):
+        cand_note = _get_note_or_none(col, cid)
+        if cand_note is None:
+            # Vanished between find_notes and the read (phantom candidate).
+            continue
+        if cand_note.mid != model["id"]:
+            continue
+        if cand_note.fields[0].strip() != value:
+            continue
+        if any((c.odid or c.did) == target_did for c in cand_note.cards()):
+            return True
+    return False
 
 
 def _add_notes_impl(col, notes: List[NoteInput], allow_duplicates: bool) -> Dict[str, Any]:
@@ -579,7 +614,10 @@ def _resolve_note_selection(
     """
     if query is not None:
         # Client-controlled search string: %r-escape in errors/logs (CWE-117).
-        nids = list(col.find_notes(query))
+        try:
+            nids = list(col.find_notes(query))
+        except SearchError as exc:
+            raise CollectionToolError(f"Invalid search query: {exc}") from exc
         if not nids:
             raise CollectionToolError(f"No notes matched query {query!r}; nothing to change.")
         # Collect note.mid in bounded IN-chunks (SQLite caps host parameters,
@@ -892,14 +930,22 @@ async def find_and_replace(
         # number of CHANGED notes (verified wheel API), so reporting the
         # selection size next to it keeps a zero-match no-op visible as
         # changed=0 rather than looking like a lost request.
-        result = col.find_and_replace(
-            note_ids=nids,
-            search=search,
-            replacement=replacement,
-            regex=regex,
-            field_name=field_name,
-            match_case=match_case,
-        )
+        # A malformed pattern with regex=True (or an unusable search/replacement)
+        # raises the backend's InvalidInput on the HEALTHY handle — surface it as
+        # a clean tool error instead of a generic mutation failure.
+        try:
+            result = col.find_and_replace(
+                note_ids=nids,
+                search=search,
+                replacement=replacement,
+                regex=regex,
+                field_name=field_name,
+                match_case=match_case,
+            )
+        except InvalidInput as exc:
+            raise CollectionToolError(
+                f"Invalid find_and_replace input or regular expression: {exc}"
+            ) from exc
         return {
             "changed": int(result.count),
             "selected": len(nids),
@@ -942,7 +988,12 @@ async def find_duplicates(
     )
 
     def _dupes(col) -> Dict[str, Any]:
-        groups = col.find_dupes(field_name, search)
+        # find_dupes routes the optional ``search`` prefilter through
+        # find_notes internally, so a malformed query raises SearchError there.
+        try:
+            groups = col.find_dupes(field_name, search)
+        except SearchError as exc:
+            raise CollectionToolError(f"Invalid search query: {exc}") from exc
         return {
             "total_groups": len(groups),
             "duplicates": [
