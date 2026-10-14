@@ -57,6 +57,7 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -156,11 +157,56 @@ ROUTINE_BACKUP_REASONS = frozenset({"pre-sync", "manual"})
 # backups/ directory full of foreign names is pruned to something, not zero).
 _ROUTINE_BACKUP_FLOOR = 2
 
-# backup-<timestamp>[-<reason>].colpkg. The timestamp is second-resolution and
-# zero-padded, so lexicographic order IS chronological order (prune_backups
-# relies on that); reason words are lowercase and hyphen-joined, which is why
-# an uppercase or digit-bearing suffix cannot masquerade as a reason.
-BACKUP_FILENAME_RE = re.compile(r"^backup-(\d{4}-\d{2}-\d{2}-\d{2}\.\d{2}\.\d{2})(?:-([a-z0-9]+(?:-[a-z0-9]+)*))?\.colpkg$")
+# backup-<timestamp>[-<reason>[-<collision attempt>]].colpkg. The timestamp is
+# second-resolution and zero-padded; reason words are lowercase and hyphen-joined,
+# which is why an uppercase or underscore-bearing suffix cannot masquerade as a
+# reason. Ordering never relies on filenames alone: _backup_sort_key breaks
+# same-second ties by mtime_ns and the numeric collision attempt (the reason
+# group is non-greedy so a trailing -2/-3... lands in group 3, not the reason).
+BACKUP_FILENAME_RE = re.compile(r"^backup-(\d{4}-\d{2}-\d{2}-\d{2}\.\d{2}\.\d{2})(?:-([a-z0-9]+(?:-[a-z0-9]+)*?))?(?:-(\d+))?\.colpkg$")
+
+
+def _parse_backup_filename(name: str) -> Optional[Tuple[str, Optional[str], int]]:
+    """Split a backup filename into (timestamp, reason, collision attempt).
+
+    The numeric suffix ``_backup_locked`` appends on a same-second, same-reason
+    collision (``-2``, ``-3``, ...) is separated from the reason slug —
+    ``backup-...-pre-sync-2.colpkg`` parses as reason ``pre-sync``, attempt 2,
+    NOT reason ``pre-sync-2`` — while reasons without trailing digits stay
+    intact. A base name without a suffix parses as attempt 1. Returns None for
+    names that are not genuine backup filenames (foreign files must never be
+    reported by list_backups or accepted by restore_backup).
+    """
+    match = BACKUP_FILENAME_RE.fullmatch(name)
+    if match is None:
+        return None
+    attempt = match.group(3)
+    return match.group(1), match.group(2), int(attempt) if attempt else 1
+
+
+def _backup_sort_key(path: str) -> Tuple[str, int, int]:
+    """Chronological sort key for a backup file: (timestamp, mtime_ns, attempt).
+
+    The zero-padded timestamp is only second-resolution, so files written
+    within the same second — reason-tagged renames and their numeric collision
+    suffixes — tie on it; mtime_ns breaks those ties by actual write time and
+    attempt by write order (1 < 2). Newest-first ordering is
+    ``sorted(paths, key=_backup_sort_key, reverse=True)``; a plain filename
+    tiebreak would be wrong (ASCII ``'.' > '-'`` sorts ``backup-<ts>-<r>.colpkg``
+    AFTER ``backup-<ts>-<r>-2.colpkg``, i.e. oldest-first inverted). Names that
+    do not parse and files whose stat fails (raced with prune) sort OLDEST
+    (``""``/0), so retention evicts them before any genuine snapshot.
+    """
+    parsed = _parse_backup_filename(os.path.basename(path))
+    if parsed is None:
+        ts_str, attempt = "", 0
+    else:
+        ts_str, _reason, attempt = parsed
+    try:
+        mtime_ns = os.stat(path).st_mtime_ns
+    except OSError:
+        mtime_ns = 0
+    return (ts_str, mtime_ns, attempt)
 
 # Restore reads one zip member into memory; the bound rejects a bomb-sized
 # member BEFORE the read allocates for it (chunked read stops at cap+1). Real
@@ -644,10 +690,13 @@ class CollectionRegistry:
         ROUTINE files survive; the rest are deleted. Routine pre-sync churn
         can therefore no longer evict destructive-op snapshots, at the cost
         of the total exceeding ``backup_retention`` by at most
-        ``_ROUTINE_BACKUP_FLOOR``. Real Anki backups are named
+        ``_ROUTINE_BACKUP_FLOOR``. "Newest" is _backup_sort_key order
+        (timestamp, then mtime_ns/collision attempt within one second) —
+        real Anki backups are named
         ``backup-YYYY-MM-DD-HH.MM.SS[-<reason>].colpkg`` (verified against
-        the wheel), so lexicographic order IS chronological order. Exposed
-        as a method for testability and reuse by sync_user.
+        the wheel), but a filename tiebreak alone would mis-order same-second
+        collision suffixes. Exposed as a method for testability and reuse by
+        sync_user.
         """
         _check_username(username)
         backup_dir = self._backups_dir(username)
@@ -660,11 +709,16 @@ class CollectionRegistry:
             match = BACKUP_FILENAME_RE.fullmatch(name)
             return match is not None and match.group(2) is not None and match.group(2) not in ROUTINE_BACKUP_REASONS
 
-        safety = [name for name in names if _is_safety(name)]
-        routine = [name for name in names if not _is_safety(name)]
-        kept_safety = set(safety[-self.backup_retention :]) if self.backup_retention > 0 else set()
+        def _key(name: str) -> Tuple[str, int, int]:
+            return _backup_sort_key(os.path.join(backup_dir, name))
+
+        # Newest first per class; within one second the sort key orders by
+        # write time and collision attempt, not by ASCII filename.
+        safety = sorted((name for name in names if _is_safety(name)), key=_key, reverse=True)
+        routine = sorted((name for name in names if not _is_safety(name)), key=_key, reverse=True)
+        kept_safety = set(safety[: self.backup_retention]) if self.backup_retention > 0 else set()
         routine_budget = max(_ROUTINE_BACKUP_FLOOR, self.backup_retention - len(kept_safety))
-        keep = kept_safety | (set(routine[-routine_budget:]) if routine_budget > 0 else set())
+        keep = kept_safety | (set(routine[:routine_budget]) if routine_budget > 0 else set())
         for name in names:
             if name not in keep:
                 try:
@@ -685,14 +739,17 @@ class CollectionRegistry:
         NO file when nothing changed since the last backup (returning False,
         or True while overwriting a same-second name), so the before/after
         directory diff is authoritative, not the return value. When no new
-        file appears, the newest existing backup already IS the current state
-        and its name is returned. The reason is inserted AFTER the unchanged
-        timestamp prefix, so the lexicographic order prune_backups relies on
-        stays chronological. Prunes on the way out — by retention CLASS:
-        destructive-op (SAFETY) snapshots get ``backup_retention`` slots of
-        their own and routine pre-sync churn cannot evict them, so the
-        directory may hold up to ``backup_retention + _ROUTINE_BACKUP_FLOOR``
-        files in total.
+        file appears, the newest existing backup already IS the current state:
+        routine callers get its name back, while a destructive-op (SAFETY)
+        caller additionally gets a SAFETY-tagged copy — returning the routine
+        name alone would let the next pre-sync burst prune it under the
+        ROUTINE budget. The reason is inserted AFTER the unchanged timestamp
+        prefix; ordering (here and in prune_backups/list_backups) goes through
+        _backup_sort_key, so it stays chronological even within one second.
+        Prunes on the way out — by retention CLASS: destructive-op (SAFETY)
+        snapshots get ``backup_retention`` slots of their own and routine
+        pre-sync churn cannot evict them, so the directory may hold up to
+        ``backup_retention + _ROUTINE_BACKUP_FLOOR`` files in total.
         """
         _check_backup_reason(reason)
         backup_dir = self._backups_dir(username)
@@ -705,17 +762,42 @@ class CollectionRegistry:
             after = set(os.listdir(backup_dir))
         except FileNotFoundError:
             after = set()
-        new_files = sorted(after - before)
+
+        def _key(name: str) -> Tuple[str, int, int]:
+            return _backup_sort_key(os.path.join(backup_dir, name))
+
+        new_files = sorted(after - before, key=_key, reverse=True)
         if not new_files:
             # Nothing changed since the last backup (or a same-second backup
             # overwrote an existing plain name): the newest surviving backup
             # reflects the current state. Only genuine backup names qualify —
             # a foreign file must never be returned as a backup handle.
-            existing = sorted(name for name in after if BACKUP_FILENAME_RE.fullmatch(name))
+            existing = sorted((name for name in after if BACKUP_FILENAME_RE.fullmatch(name)), key=_key, reverse=True)
             if not existing:
                 raise RuntimeError(f"No backup exists for user {username!r} and none was created")
-            return existing[-1]
-        newest = new_files[-1]
+            latest = existing[0]
+            latest_reason = _parse_backup_filename(latest)[1]
+            if reason not in ROUTINE_BACKUP_REASONS and (
+                latest_reason is None or latest_reason in ROUTINE_BACKUP_REASONS
+            ):
+                # Anki skipped the write because the newest (routine) snapshot
+                # already holds the current state — but THIS call snapshots a
+                # destructive op. Materialize a dedicated SAFETY-tagged copy
+                # of it: same bytes, own reason-tagged name, so retention
+                # protects it under the SAFETY cap instead of letting routine
+                # churn (which cannot evict SAFETY files) bury the only
+                # pre-delete state behind fresh pre-sync backups.
+                ts = time.strftime("%Y-%m-%d-%H.%M.%S", time.gmtime())
+                target = f"backup-{ts}-{reason}.colpkg"
+                attempt = 2
+                while os.path.exists(os.path.join(backup_dir, target)):
+                    target = f"backup-{ts}-{reason}-{attempt}.colpkg"
+                    attempt += 1
+                shutil.copy2(os.path.join(backup_dir, latest), os.path.join(backup_dir, target))
+                self.prune_backups(username)
+                return target
+            return latest
+        newest = new_files[0]
         match = BACKUP_FILENAME_RE.fullmatch(newest)
         if match is None:
             # Unreachable for wheel-written names; fail loud rather than
@@ -725,10 +807,11 @@ class CollectionRegistry:
         # Same-second, same-reason snapshots must never overwrite each other:
         # os.rename silently REPLACES on POSIX, which would destroy the
         # pre-delete state a destructive op just snapshotted. Disambiguate
-        # with a numeric suffix instead (parseable: the reason group accepts
-        # digits). Ordering note: within one second the suffixed name sorts
-        # before the base name, so retention prunes the suffixed (newer)
-        # snapshot first — the safe direction, keeping older states longer.
+        # with a numeric suffix instead (_parse_backup_filename separates it
+        # from the reason). Ordering note: within one second _backup_sort_key
+        # breaks ties by mtime_ns and attempt, so the suffixed (later-written)
+        # snapshot sorts NEWER than the base name — retention prunes the
+        # older state first.
         candidate = final_name
         attempt = 2
         while os.path.exists(os.path.join(backup_dir, candidate)):
@@ -770,9 +853,13 @@ class CollectionRegistry:
                     "size_bytes": size,
                 }
             )
-        # Zero-padded timestamps sort chronologically; the filename breaks
-        # ties (same-second plain vs reason-tagged) deterministically.
-        entries.sort(key=lambda entry: (entry["timestamp"], entry["filename"]), reverse=True)
+        # Newest first by the chronological sort key: timestamp, then
+        # mtime_ns/collision attempt within the same second (a plain filename
+        # tiebreak would sort ``-2`` after the base name).
+        entries.sort(
+            key=lambda entry: _backup_sort_key(os.path.join(backup_dir, entry["filename"])),
+            reverse=True,
+        )
         return entries
 
     async def backup_user(self, username: str, reason: str) -> str:

@@ -365,11 +365,11 @@ class UserStore:
             # Audit F-01: a fresh record starts with BOTH revocation epochs AT
             # its creation instant, so cookies, OAuth grants and codes minted
             # for a previous account that reused this username predate the new
-            # account's epochs and are rejected. Second resolution (not
-            # sub-second) on purpose: webauth stamps cookie issued-at at whole
-            # seconds, so a sub-second epoch would floor above the account's
-            # very first login and reject it. set_password and
-            # regenerate_token keep stamping sub-second epochs.
+            # account's epochs and are rejected. Whole-second resolution is
+            # merely conservative: a lower floor can only accept MORE cookies
+            # (never a legitimate pre-creation one, which still predates it),
+            # and the account's very first login always postdates it.
+            # set_password and regenerate_token keep stamping sub-second epochs.
             now = float(int(time.time()))
             user = User(
                 username=username,

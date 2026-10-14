@@ -44,6 +44,7 @@ import base64
 import hashlib
 import hmac
 import logging
+import math
 import os
 import secrets
 import threading
@@ -86,13 +87,16 @@ def _sign(key: bytes, username_b64: str, issued_at: str, expiry: str, nonce: str
 def issue_session(session_secret: str, username: str, ttl_seconds: int = SESSION_TTL_SECONDS) -> str:
     """Issue a signed session cookie value for ``username`` valid for ``ttl_seconds``.
 
-    The signed payload carries the issue time (second resolution) so the
-    per-user revocation epoch can reject pre-reset cookies; see
-    :func:`session_issued_before`.
+    The signed payload carries the issue time at microsecond resolution so the
+    per-user revocation epoch can reject pre-reset cookies — including a login
+    completing in the SAME wall-clock second as a password reset, where a
+    whole-second stamp would floor below the reset's fractional
+    ``User.sessions_invalid_before`` epoch; see :func:`session_issued_before`.
     """
     username_b64 = _b64encode(username.encode("utf-8"))
-    issued_at = str(int(time.time()))
-    expiry = str(int(time.time()) + int(ttl_seconds))
+    now_f = round(time.time(), 6)
+    issued_at = f"{now_f:.6f}"
+    expiry = str(int(now_f) + int(ttl_seconds))
     nonce = _b64encode(secrets.token_bytes(NONCE_BYTES))
     mac = _sign(derive_session_key(session_secret), username_b64, issued_at, expiry, nonce)
     return FIELD_SEP.join((username_b64, issued_at, expiry, nonce, _b64encode(mac)))
@@ -125,10 +129,12 @@ def verify_session(session_secret: str, value: str) -> Optional[str]:
     if not hmac.compare_digest(expected, provided_mac):
         return None
     try:
-        int(issued_at)  # segment must be an integer stamp (MAC already covers it)
-        expiry = int(expiry_str)
+        issued = float(issued_at)  # integer (legacy) or decimal stamp (MAC covers it)
+        expiry = float(expiry_str)
     except ValueError:
         return None
+    if not (math.isfinite(issued) and math.isfinite(expiry)):
+        return None  # NaN/inf would defeat the expiry comparison — fail closed
     if time.time() >= expiry:
         return None
     try:
@@ -154,9 +160,12 @@ def session_issued_before(session_value: str) -> Optional[float]:
     if len(parts) != 5:
         return None
     try:
-        return float(int(parts[1]))
+        issued_at = float(parts[1])  # integer (legacy) or decimal stamp
     except ValueError:
         return None
+    if not math.isfinite(issued_at):
+        return None  # NaN/inf always compare False below — fail closed instead
+    return issued_at
 
 
 def _session_mac(session_value: str) -> bytes:

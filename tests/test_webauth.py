@@ -68,7 +68,7 @@ def test_tampered_issued_at_rejected():
     # a revocation epoch) without re-signing must fail the MAC check.
     cookie = issue_session(SECRET, "alice")
     u, issued, expiry, nonce, mac = cookie.split("|")
-    tampered = "|".join([u, str(int(issued) - 10_000), expiry, nonce, mac])
+    tampered = "|".join([u, str(float(issued) - 10_000), expiry, nonce, mac])
     assert verify_session(SECRET, tampered) is None
 
 
@@ -116,7 +116,7 @@ def test_session_payload_has_five_segments_with_issued_at():
     parts = cookie.split("|")
     assert len(parts) == 5
     assert parts[0] != "alice"  # username is base64url-encoded
-    assert int(parts[1]) <= time.time()  # issued at (or before) now
+    assert float(parts[1]) <= time.time()  # issued at (or before) now
     assert int(parts[2]) > time.time()  # expires in the future
     assert parts[3] and parts[4]  # nonce + MAC present
 
@@ -135,7 +135,7 @@ def test_session_issued_before_rejects_malformed_and_legacy_values():
     assert session_issued_before("garbage") is None
     # Legacy four-segment cookie (pre-epoch format): no issued-at -> None.
     assert session_issued_before("YWxpY2U|1234567890|nonce|AAAA") is None
-    # Five segments but a non-integer issued-at.
+    # Five segments but a non-numeric issued-at.
     assert session_issued_before("YWxpY2U|soon|123|nonce|AAAA") is None
 
 

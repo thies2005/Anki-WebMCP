@@ -203,6 +203,27 @@ class SyncManager:
                 "Pre-tool sync for %r raised (tool proceeds on local data): %s", username, exc
             )
 
+    def record_explicit_sync(self, username: str) -> None:
+        """Stamp the pre-tool TTL as of NOW after a successful explicit sync.
+
+        sync_collection (and a portal sync) just made local and AnkiWeb agree:
+        without this stamp the next tool call would pay a redundant full
+        two-way sync within the TTL window. A plain dict write is atomic here
+        — the method has no await point, so the event loop cannot interleave
+        it with sync_before_tool's guarded check-and-set.
+        """
+        self._last_pretool_sync[username] = time.monotonic()
+
+    def invalidate_pretool_ttl(self, username: str) -> None:
+        """Forget the user's pre-tool TTL stamp.
+
+        Called when the state the stamp described is replaced wholesale —
+        AnkiWeb credentials change (the stamped sync ran against the OLD
+        account) or a backup restore replaces the collection file — so the
+        next tool call must not skip its pre-tool sync on stale agreement.
+        """
+        self._last_pretool_sync.pop(username, None)
+
     async def sync_now(
         self,
         username: str,
@@ -212,8 +233,10 @@ class SyncManager:
         """Synchronize the user's collection with AnkiWeb.
 
         Response shape (schema-compatible with the legacy ``sync_collection``
-        tool output): ``{"success", "sync_status", "message", "warnings"}``.
-        ``idempotency_key`` is accepted for replay/ledger semantics but the
+        tool output): ``{"success", "sync_status", "message", "warnings"}``,
+        with ``data`` present on every success — fresh and replayed responses
+        carry the identical key set. ``idempotency_key`` is accepted for
+        replay/ledger semantics but the
         MCP surface passes none (the tool takes no arguments, unchanged).
         ``full_sync_direction`` ("upload"/"download") is forwarded to
         :meth:`CollectionRegistry.sync_user` and only matters when AnkiWeb
@@ -236,83 +259,96 @@ class SyncManager:
         warnings: List[str] = []
         ledger = self.registry.ledger(username)
 
-        if idempotency_key:
-            existing = await ledger.get(idempotency_key)
-            if existing:
-                status = existing.get("status")
-                if status == "committed":
-                    # %r + truncate: the key is client-controlled and must never
-                    # split or bloat a log record (CWE-117).
-                    logger.info("Idempotency hit for sync key %r: returning cached committed response", idempotency_key[:64])
-                    return {
-                        "success": True,
-                        "sync_status": SyncStatus(pre_sync="skipped", post_sync="skipped").model_dump(),
-                        "message": "Synchronization completed successfully.",
-                        "data": existing.get("data"),
-                        "warnings": [_REPLAY_WARNING.format(existing.get("timestamp"))],
-                    }
-                if status == "failed":
-                    logger.info("Idempotency hit for sync key %r: returning cached failure", idempotency_key[:64])
-                    error = existing.get("error", "Previous attempt with this idempotency key failed.")
-                    return {
-                        "success": False,
-                        "sync_status": SyncStatus(pre_sync="skipped", post_sync="skipped").model_dump(),
-                        "message": f"Synchronization error: {error}",
-                        "warnings": [_REPLAY_WARNING.format(existing.get("timestamp"))],
-                    }
-
-        result = await self.registry.sync_user(
-            username, email, password, on_step=self._on_step(username),
-            full_sync_direction=full_sync_direction,
-        )
-
-        if result.get("success"):
-            data = {"output": result.get("output", "")}
+        # The ledger check → sync → record sequence runs under the same
+        # per-user mutation lock as execute_mutation (audit F-08): two
+        # concurrent sync_now calls sharing one idempotency key would
+        # otherwise both miss the ledger and double-sync. Different users
+        # get different locks and are never serialized against each other.
+        async with await self._user_mutation_lock(username):
             if idempotency_key:
+                existing = await ledger.get(idempotency_key)
+                if existing:
+                    status = existing.get("status")
+                    if status == "committed":
+                        # %r + truncate: the key is client-controlled and must never
+                        # split or bloat a log record (CWE-117).
+                        logger.info("Idempotency hit for sync key %r: returning cached committed response", idempotency_key[:64])
+                        return {
+                            "success": True,
+                            "sync_status": SyncStatus(pre_sync="skipped", post_sync="skipped").model_dump(),
+                            "message": "Synchronization completed successfully.",
+                            "data": existing.get("data"),
+                            "warnings": [_REPLAY_WARNING.format(existing.get("timestamp"))],
+                        }
+                    if status == "failed":
+                        logger.info("Idempotency hit for sync key %r: returning cached failure", idempotency_key[:64])
+                        error = existing.get("error", "Previous attempt with this idempotency key failed.")
+                        return {
+                            "success": False,
+                            "sync_status": SyncStatus(pre_sync="skipped", post_sync="skipped").model_dump(),
+                            "message": f"Synchronization error: {error}",
+                            "warnings": [_REPLAY_WARNING.format(existing.get("timestamp"))],
+                        }
+
+            result = await self.registry.sync_user(
+                username, email, password, on_step=self._on_step(username),
+                full_sync_direction=full_sync_direction,
+            )
+
+            if result.get("success"):
+                data = {"output": result.get("output", "")}
+                if idempotency_key:
+                    try:
+                        await ledger.record_success(idempotency_key, data)
+                    except Exception as e:
+                        logger.error("Failed to commit idempotency record for sync key '%s': %s", idempotency_key, e)
+                        warnings.append(_LEDGER_WRITE_WARNING)
+                logger.info("Manual synchronization with AnkiWeb completed for %r", username)
+                # Local and AnkiWeb just agreed — coordinate the pre-tool
+                # cooldown so the next tool call does not immediately re-sync
+                # within the TTL window (audit F-08).
+                self.record_explicit_sync(username)
+                return {
+                    "success": True,
+                    "sync_status": SyncStatus(pre_sync="ok", post_sync="ok").model_dump(),
+                    "message": "Synchronization completed successfully.",
+                    # Same key set as an idempotent replay: the payload recorded
+                    # above is echoed back verbatim.
+                    "data": data,
+                    "warnings": warnings,
+                }
+
+            err_msg = str(result.get("error", "unknown error"))
+            if result.get("outcome_unknown"):
+                # Network-layer failure mid-transfer: NO ledger record, and the
+                # client must learn the outcome is unknowable.
+                logger.error("Synchronization outcome UNKNOWN for %r: %s", username, err_msg)
+                warnings.append(
+                    "The synchronization transfer may or may not have been applied; the outcome is "
+                    "UNKNOWN. The idempotency key was NOT recorded. Verify the AnkiWeb state before "
+                    "retrying with the same key."
+                )
+            elif idempotency_key:
                 try:
-                    await ledger.record_success(idempotency_key, data)
+                    await ledger.record_failure(idempotency_key, err_msg)
                 except Exception as e:
-                    logger.error("Failed to commit idempotency record for sync key '%s': %s", idempotency_key, e)
+                    logger.error("Failed to record idempotency failure for sync key '%s': %s", idempotency_key, e)
                     warnings.append(_LEDGER_WRITE_WARNING)
-            logger.info("Manual synchronization with AnkiWeb completed for %r", username)
-            return {
-                "success": True,
-                "sync_status": SyncStatus(pre_sync="ok", post_sync="ok").model_dump(),
-                "message": "Synchronization completed successfully.",
+            else:
+                logger.error("Synchronization failed for %r: %s", username, err_msg)
+            response: Dict[str, Any] = {
+                "success": False,
+                "sync_status": SyncStatus(pre_sync="ok", post_sync="failed", post_sync_error=err_msg).model_dump(),
+                "message": f"Synchronization error: {err_msg}",
                 "warnings": warnings,
             }
-
-        err_msg = str(result.get("error", "unknown error"))
-        if result.get("outcome_unknown"):
-            # Network-layer failure mid-transfer: NO ledger record, and the
-            # client must learn the outcome is unknowable.
-            logger.error("Synchronization outcome UNKNOWN for %r: %s", username, err_msg)
-            warnings.append(
-                "The synchronization transfer may or may not have been applied; the outcome is "
-                "UNKNOWN. The idempotency key was NOT recorded. Verify the AnkiWeb state before "
-                "retrying with the same key."
-            )
-        elif idempotency_key:
-            try:
-                await ledger.record_failure(idempotency_key, err_msg)
-            except Exception as e:
-                logger.error("Failed to record idempotency failure for sync key '%s': %s", idempotency_key, e)
-                warnings.append(_LEDGER_WRITE_WARNING)
-        else:
-            logger.error("Synchronization failed for %r: %s", username, err_msg)
-        response: Dict[str, Any] = {
-            "success": False,
-            "sync_status": SyncStatus(pre_sync="ok", post_sync="failed", post_sync_error=err_msg).model_dump(),
-            "message": f"Synchronization error: {err_msg}",
-            "warnings": warnings,
-        }
-        if result.get("outcome_unknown"):
-            response["outcome_unknown"] = True
-        if result.get("full_sync_required"):
-            # Lets MCP clients (and the LLM driving them) retry with an
-            # explicit full_sync_direction instead of a blind re-call.
-            response["full_sync_required"] = True
-        return response
+            if result.get("outcome_unknown"):
+                response["outcome_unknown"] = True
+            if result.get("full_sync_required"):
+                # Lets MCP clients (and the LLM driving them) retry with an
+                # explicit full_sync_direction instead of a blind re-call.
+                response["full_sync_required"] = True
+            return response
 
     # -- mutation write-safety -----------------------------------------------------
 

@@ -617,3 +617,86 @@ async def test_replayed_mutation_also_carries_sync_nudge(env):
     assert first.success and second.success
     assert any("Idempotent operation replay" in w for w in second.warnings)
     assert _has_sync_nudge(second)
+
+
+# -- explicit sync serialization + pre-tool cooldown (audit F-08) ----------------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_key_syncs_run_once(env, monkeypatch):
+    """Two concurrent sync_now calls sharing one idempotency key: exactly one
+    sync runs. The ledger check → sync → record sequence must be atomic per
+    user — the second caller, whose ledger check lands while the first's slow
+    sync is still in flight, must see the committed record and replay it."""
+    reg, store, manager = env
+    counter = {"n": 0}
+
+    async def slow_sync_user(username, email, password, endpoint=None, on_step=None,
+                             full_sync_direction=None, acquire_timeout=None):
+        counter["n"] += 1
+        # Yield mid-sync so the second caller's ledger check runs NOW —
+        # without the per-user lock it would miss (nothing recorded yet)
+        # and both callers would sync.
+        await asyncio.sleep(0.05)
+        return {"success": True, "output": f"out-{counter['n']}"}
+
+    monkeypatch.setattr(reg, "sync_user", slow_sync_user)
+
+    results = await asyncio.gather(
+        manager.sync_now("alice", idempotency_key="race-sync"),
+        manager.sync_now("alice", idempotency_key="race-sync"),
+    )
+
+    assert counter["n"] == 1
+    committed = [r for r in results if not any("Idempotent operation replay" in w for w in r["warnings"])]
+    replayed = [r for r in results if any("Idempotent operation replay" in w for w in r["warnings"])]
+    assert len(committed) == 1
+    assert len(replayed) == 1
+    assert committed[0]["success"] is True
+    assert replayed[0]["success"] is True
+    assert replayed[0]["data"] == committed[0]["data"]
+
+
+@pytest.mark.asyncio
+async def test_fresh_sync_success_matches_replay_key_set(env, monkeypatch):
+    """A fresh success echoes the recorded data payload, so fresh and replayed
+    responses carry the identical response keys."""
+    reg, store, manager = env
+    await _patch_sync_user(monkeypatch, reg, {"success": True, "output": "ok"})
+
+    fresh = await manager.sync_now("alice", idempotency_key="data-key")
+    replay = await manager.sync_now("alice", idempotency_key="data-key")
+
+    assert fresh["data"] == {"output": "ok"}
+    assert set(fresh) == set(replay)
+
+
+@pytest.mark.asyncio
+async def test_successful_sync_now_updates_pretool_ttl(env, monkeypatch):
+    """A successful explicit sync stamps the pre-tool cooldown: the next tool
+    call inside the TTL window must not pay a redundant pre-tool sync."""
+    reg, store, manager = env
+    monkeypatch.setattr(manager, "settings", _settings(ttl=60))
+    calls = await _patch_sync_user(monkeypatch, reg, {"success": True, "output": "ok"})
+
+    await manager.sync_now("alice", idempotency_key="ttl-stamp")
+    await manager.sync_before_tool("alice")
+
+    assert len(calls) == 1  # only sync_now ran; the pre-tool sync was throttled
+
+
+@pytest.mark.asyncio
+async def test_invalidate_pretool_ttl_allows_resync(env, monkeypatch):
+    """record_explicit_sync sets the cooldown stamp; invalidate_pretool_ttl
+    clears it so the next pre-tool sync runs again inside the window."""
+    reg, store, manager = env
+    monkeypatch.setattr(manager, "settings", _settings(ttl=60))
+    calls = await _patch_sync_user(monkeypatch, reg, {"success": True, "output": "ok"})
+
+    manager.record_explicit_sync("alice")
+    await manager.sync_before_tool("alice")
+    assert len(calls) == 0  # throttled by the explicit-sync stamp
+
+    manager.invalidate_pretool_ttl("alice")
+    await manager.sync_before_tool("alice")
+    assert len(calls) == 1  # stamp gone: the pre-tool sync ran again

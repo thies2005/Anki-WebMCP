@@ -3001,6 +3001,10 @@ def create_app(custom_settings: Optional[Settings] = None):
                 "/", "Both AnkiWeb email and password are required.", kind="error"
             )
         await run_in_threadpool(store.set_ankiweb_credentials, user.username, email, password)
+        # Audit F-08: the pre-tool TTL stamp described the last sync under the
+        # OLD credentials — drop it so the next tool call re-syncs instead of
+        # skipping on stale agreement with a different AnkiWeb account.
+        tool_sync_manager.invalidate_pretool_ttl(user.username)
         # The spec's portal_change_password maps to this route — the portal's
         # only credential-mutation handler — so the account's /mcp sessions
         # are dropped here too (F-04): the user re-initializes from scratch
@@ -3058,6 +3062,11 @@ def create_app(custom_settings: Optional[Settings] = None):
         except ValueError as e:
             # Account deleted mid-request; mirror the admin handlers' 400.
             return _bad_request(f"Could not sync: {e}", back_href="/", back_label="Back to portal")
+        if result.get("success"):
+            # Audit F-08: this portal sync just reconciled local and AnkiWeb —
+            # stamp the pre-tool cooldown so the next tool call does not pay a
+            # redundant sync within the TTL window.
+            tool_sync_manager.record_explicit_sync(user.username)
         logger.info(
             "Portal sync for %r: success=%s%s",
             user.username,
@@ -3157,6 +3166,10 @@ def create_app(custom_settings: Optional[Settings] = None):
         except Exception as e:
             logger.error("Portal restore failed for %r from %r: %s", user.username, filename, e)
             return _redirect_with_flash("/", f"Restore failed: {e}", kind="error")
+        # Audit F-08: the restore replaced the collection file wholesale, so
+        # the pre-tool TTL stamp describes a collection that no longer exists
+        # — drop it and let the next tool call re-sync from scratch.
+        tool_sync_manager.invalidate_pretool_ttl(user.username)
         snapshot = str(result.get("pre_restore_snapshot", ""))
         logger.info(
             "Portal restore for %r from %r (pre-restore snapshot: %r)",

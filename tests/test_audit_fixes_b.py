@@ -133,9 +133,10 @@ def client(app):
 def _session_value_issued_at(secret: str, username: str, issued_at: float) -> str:
     """A valid session cookie backdated to ``issued_at`` (epoch seconds).
 
-    issue_session always stamps time.time(), which makes same-second reset
-    races untestable; the epoch comparison is deterministic against a
-    backdated cookie while exercising the exact same signed format.
+    Anchors a cookie to a specific past instant (e.g. a record's created_at)
+    while exercising the exact same signed format as issue_session; the int
+    stamp also covers the legacy integer-segment form that verify_session
+    must keep accepting.
     """
     username_b64 = _b64encode(username.encode("utf-8"))
     issued = str(int(issued_at))
@@ -595,12 +596,10 @@ async def test_password_reset_via_admin_route_kills_pre_reset_session(app, clien
         "set-cookie", ""
     )
 
-    # The new password logs in through the real form and gets a working session.
-    # (Cross the second boundary first: the fresh cookie's issued-at stamp has
-    # second resolution, so a login completing in the SAME second as the reset
-    # floors below the float epoch and fails closed — correct behavior, but not
-    # what this assertion is about.)
-    time.sleep(1.05)
+    # The new password logs in through the real form and gets a working
+    # session — issued in the SAME wall-clock second as the reset (audit
+    # F-06: no crossing-the-second-boundary sleep). The microsecond issued-at
+    # stamp must floor above the reset's fractional epoch.
     res = await login_via_form(client, "alice", "brand-new-pw")
     assert res.status_code == 303
     assert (await client.get("/")).status_code == 200
@@ -624,9 +623,9 @@ async def test_backdated_session_rejected_after_store_epoch_bump(app, client):
     client.cookies.set(SESSION_COOKIE_NAME, old_cookie)
     assert (await client.get("/")).status_code == 303
 
-    # A fresh login AFTER the epoch works (cross the second boundary: the
-    # cookie's second-resolution issued-at stamp must exceed the float epoch).
-    time.sleep(1.05)
+    # A fresh login issued in the SAME wall-clock second as the epoch bump
+    # works (audit F-06: no crossing-the-second-boundary sleep) — the
+    # microsecond issued-at stamp must exceed the float epoch.
     res = await login_via_form(client, "alice", "rotated-pw")
     assert res.status_code == 303
     assert (await client.get("/")).status_code == 200
