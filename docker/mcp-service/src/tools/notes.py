@@ -106,7 +106,9 @@ async def search_notes(
     def _search(col) -> Dict[str, Any]:
         try:
             note_ids = list(col.find_notes(query))
-        except SearchError as exc:
+        except (InvalidInput, SearchError) as exc:
+            # InvalidInput: regex PARSE errors (e.g. ``re:[invalid``) raise the
+            # sibling of SearchError on the wheel, not SearchError itself.
             raise CollectionToolError(f"Invalid search query: {exc}") from exc
         total = len(note_ids)
         notes: List[Dict[str, Any]] = []
@@ -616,7 +618,9 @@ def _resolve_note_selection(
         # Client-controlled search string: %r-escape in errors/logs (CWE-117).
         try:
             nids = list(col.find_notes(query))
-        except SearchError as exc:
+        except (InvalidInput, SearchError) as exc:
+            # InvalidInput: regex PARSE errors (e.g. ``re:[invalid``) raise the
+            # sibling of SearchError on the wheel, not SearchError itself.
             raise CollectionToolError(f"Invalid search query: {exc}") from exc
         if not nids:
             raise CollectionToolError(f"No notes matched query {query!r}; nothing to change.")
@@ -994,10 +998,12 @@ async def find_duplicates(
 
     def _dupes(col) -> Dict[str, Any]:
         # find_dupes routes the optional ``search`` prefilter through
-        # find_notes internally, so a malformed query raises SearchError there.
+        # find_notes internally, so a malformed query raises SearchError there
+        # — and InvalidInput for regex PARSE errors (e.g. ``re:[invalid``),
+        # the sibling of SearchError on the wheel.
         try:
             groups = col.find_dupes(field_name, search)
-        except SearchError as exc:
+        except (InvalidInput, SearchError) as exc:
             raise CollectionToolError(f"Invalid search query: {exc}") from exc
         return {
             "total_groups": len(groups),

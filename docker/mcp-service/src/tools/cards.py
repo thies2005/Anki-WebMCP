@@ -18,7 +18,7 @@ import logging
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
-from anki.errors import NotFoundError, SearchError  # isort: skip
+from anki.errors import InvalidInput, NotFoundError, SearchError  # isort: skip
 from anki.scheduler.v3 import CardAnswer
 
 from ..errors import CollectionToolError
@@ -90,7 +90,9 @@ async def find_cards(
     def _find(col) -> Dict[str, Any]:
         try:
             card_ids = list(col.find_cards(query))
-        except SearchError as exc:
+        except (InvalidInput, SearchError) as exc:
+            # InvalidInput: regex PARSE errors (e.g. ``re:[invalid``) raise the
+            # sibling of SearchError on the wheel, not SearchError itself.
             raise CollectionToolError(f"Invalid search query {query!r}: {exc}") from exc
         total = len(card_ids)
         rows = []
@@ -441,14 +443,15 @@ def _resolve_card_selection(
     mutation — a bad selection must fail the request in Python, never as a
     backend error (the registry would mistake an ``InvalidInput`` for a stale
     handle and re-run the closure once). A malformed search raises the wheel's
-    ``SearchError``; it surfaces as a clean CollectionToolError echoing the
-    query instead of the backend's raw error.
+    ``SearchError`` — or its sibling ``InvalidInput`` for regex PARSE errors
+    (e.g. ``re:[invalid``); it surfaces as a clean CollectionToolError echoing
+    the query instead of the backend's raw error.
     """
     if query is not None:
         # Client-controlled search string: %r-escape in errors/logs (CWE-117).
         try:
             cids = list(col.find_cards(query))
-        except SearchError as exc:
+        except (InvalidInput, SearchError) as exc:
             raise CollectionToolError(f"Invalid search query {query!r}: {exc}") from exc
         if not cids:
             raise CollectionToolError(f"No cards matched query {query!r}; nothing to change.")

@@ -134,16 +134,29 @@ def _session_value_issued_at(secret: str, username: str, issued_at: float) -> st
     """A valid session cookie backdated to ``issued_at`` (epoch seconds).
 
     Anchors a cookie to a specific past instant (e.g. a record's created_at)
-    while exercising the exact same signed format as issue_session; the int
-    stamp also covers the legacy integer-segment form that verify_session
-    must keep accepting.
+    while exercising the exact same signed format as issue_session — including
+    its microsecond decimal issued-at stamp, so an anchor of ``created_at``
+    stays valid against a sub-second-precise F-01 creation epoch (an int stamp
+    would floor below it and bounce the not-yet-backdated cookie).
     """
     username_b64 = _b64encode(username.encode("utf-8"))
-    issued = str(int(issued_at))
+    issued = f"{issued_at:.6f}"
     expiry = str(int(time.time()) + 7200)
     nonce = _b64encode(os.urandom(NONCE_BYTES))
     mac = _sign(derive_session_key(secret), username_b64, issued, expiry, nonce)
     return FIELD_SEP.join((username_b64, issued, expiry, nonce, _b64encode(mac)))
+
+
+def _just_after(t: float) -> float:
+    """The next microsecond strictly after ``t`` — the oldest instant
+    issue_session's microsecond stamp format can express past ``t``.
+
+    Anchoring a "still valid" backdated cookie here (instead of exactly at a
+    record's created_at) keeps it strictly ABOVE the sub-second-precise F-01
+    creation epoch: a stamp AT created_at can round DOWN through the 6-decimal
+    format and fall below the very epoch it anchors to.
+    """
+    return (int(t * 1_000_000.0) + 1) / 1_000_000.0
 
 
 # ---------------------------------------------------------------------------
@@ -553,12 +566,12 @@ async def test_other_form_routes_share_the_body_cap(client):
 @pytest.mark.asyncio
 async def test_password_reset_via_admin_route_kills_pre_reset_session(app, client, tmp_path):
     # A cookie issued after the account was created but well before the reset:
-    # the portal accepts it... (anchored at created_at: the F-01 username-reuse
-    # floor rejects anything stamped before the account existed, so "old" now
-    # means "issued at account creation" — which the int issued-at stamp, equal
-    # to the second-resolution created_at, expresses exactly.)
+    # the portal accepts it... (anchored one microsecond past created_at: the
+    # F-01 username-reuse floor rejects anything stamped before the account
+    # existed, so "old" now means "issued just after account creation" — the
+    # oldest stamp the microsecond format can express above that epoch.)
     old_alice = _session_value_issued_at(
-        SECRET, "alice", app.state.anki_store.get("alice").created_at
+        SECRET, "alice", _just_after(app.state.anki_store.get("alice").created_at)
     )
     client.cookies.set(SESSION_COOKIE_NAME, old_alice)
     assert (await client.get("/")).status_code == 200
@@ -609,11 +622,12 @@ async def test_password_reset_via_admin_route_kills_pre_reset_session(app, clien
 async def test_backdated_session_rejected_after_store_epoch_bump(app, client):
     # Store-level variant of the same wiring: any cookie issued before the
     # epoch set by set_password fails the portal gate, and a cookie issued
-    # AFTER the bump (fresh login) still works. (Anchored at created_at: the
-    # F-01 username-reuse floor rejects cookies stamped before the account
-    # existed, so the pre-reset cookie is issued at account creation.)
+    # AFTER the bump (fresh login) still works. (Anchored one microsecond past
+    # created_at: the F-01 username-reuse floor rejects cookies stamped before
+    # the account existed, so the pre-reset cookie is the oldest still-valid
+    # stamp above that epoch.)
     old_cookie = _session_value_issued_at(
-        SECRET, "alice", app.state.anki_store.get("alice").created_at
+        SECRET, "alice", _just_after(app.state.anki_store.get("alice").created_at)
     )
     client.cookies.set(SESSION_COOKIE_NAME, old_cookie)
     assert (await client.get("/")).status_code == 200

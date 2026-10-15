@@ -24,9 +24,10 @@ Covers exactly the Phase 1 gate scenarios from ``.zcode/remediation-spec.md``:
   400) on ``/login`` and ``/oauth/token``.
 
 Same-second sequencing is made deterministic with a monkeypatched fake clock
-(webauth stamps cookie issued-at at whole seconds and create_user floors the
-revocation epochs to the same second on purpose, so wall-clock-dependent
-tests would be flaky at real second boundaries).
+(webauth stamps cookie issued-at at microsecond resolution, create_user stamps
+the revocation epochs at the precise creation instant, and every clock advance
+is a whole number of seconds — so the sub-second orderings these tests rely on
+are exact, not wall-clock-flaky).
 """
 
 import base64
@@ -239,7 +240,11 @@ def test_create_user_stamps_revocation_epochs_at_creation(tmp_path, clock):
     assert raw_token
     assert user.created_at > 0.0
     assert user.created_at == user.sessions_invalid_before == user.tokens_invalid_before
-    assert user.created_at == float(int(clock.now))  # second-resolution, at creation
+    # F-01 review follow-up: the epochs are the PRECISE creation instant (the
+    # spec's ``now = time.time()``), not floored to whole seconds — so a cookie
+    # minted for the previous holder within the same wall-second as
+    # delete+recreate still strictly predates the new epochs.
+    assert user.created_at == clock.now
 
 
 @pytest.mark.asyncio

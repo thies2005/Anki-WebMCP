@@ -15,14 +15,10 @@ Covers exactly the Phase 3 gate scenarios from ``.zcode/remediation-spec.md``:
   ``CollectionToolError`` instead of the raw backend exception, and an
   invalid regex with ``find_and_replace(..., regex=True)`` fails with the
   dedicated tool-error message instead of a raw ``InvalidInput``.
-  KNOWN DEFICIENCY (strict xfail below): the wheel raises
-  ``anki.errors.InvalidInput`` — not ``SearchError`` — for regex PARSE
-  errors in ``find_notes``/``find_cards``/``find_dupes`` (spec F-10's own
-  example ``re:[invalid``; probed on the pinned 26.9.3 wheel: "regex parse
-  error ... unclosed character class"). The production catch on those three
-  paths only handles ``SearchError``, so that malformed-query class still
-  escapes raw. Marked ``xfail(strict=True)``: the marker must be removed
-  (and the test flip to a hard pass) when the fix lands.
+  Both malformed-query classes the wheel produces are covered: parser
+  failures raise ``SearchError`` and regex PARSE errors (e.g. ``re:[invalid``,
+  the spec F-10's own example) raise its sibling ``InvalidInput`` — the
+  production catches on the find paths handle both.
 - F-11: restoring a backup clears the user's idempotency ledger, so a key
   committed AFTER the restored snapshot executes fresh instead of replaying
   a result the restored collection never produced (verified in memory, on
@@ -52,7 +48,6 @@ import anki.lang
 import httpx
 import pytest
 import pytest_asyncio
-from anki.errors import InvalidInput
 
 # src.collections imports anki.collection first; the wheel's anki.notes
 # cannot be the FIRST anki module imported (circular import through
@@ -231,20 +226,12 @@ async def test_find_duplicates_malformed_prefilter_raises_cleanly(env, query):
 @pytest.mark.parametrize(
     "tool_name", ["search_notes", "find_cards", "find_duplicates"]
 )
-@pytest.mark.xfail(
-    strict=True,
-    raises=InvalidInput,
-    reason="F-10 partial: the wheel raises InvalidInput (not SearchError) for "
-    "regex PARSE errors in find_notes/find_cards/find_dupes (e.g. 're:[invalid', "
-    "the spec F-10 root-cause example), so the SearchError-only catch lets this "
-    "malformed-query class escape raw instead of surfacing as CollectionToolError.",
-)
 async def test_regex_parse_error_query_raises_cleanly(env, tool_name):
     """``re:[invalid`` — the spec F-10's own malformed-syntax example — compiles
     lazily and raises the wheel's InvalidInput once candidates exist (probed:
     empty collections short-circuit, populated ones raise 'regex parse error:
-    unclosed character class'). This documents the remaining escape until the
-    fix also catches InvalidInput on the find paths."""
+    unclosed character class'). The find-path catches handle InvalidInput
+    alongside SearchError, so this surfaces as a clean CollectionToolError."""
     reg, _manager = env
     await reg.run("nils", _add_basic_note, "hello")
     if tool_name == "search_notes":

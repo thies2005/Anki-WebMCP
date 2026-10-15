@@ -364,14 +364,16 @@ class UserStore:
                 raise ValueError(f"Username already exists: {username!r}")
             raw_token = secrets.token_urlsafe(TOKEN_BYTES)
             # Audit F-01: a fresh record starts with BOTH revocation epochs AT
-            # its creation instant, so cookies, OAuth grants and codes minted
+            # its creation instant (sub-second precise, matching the spec's
+            # ``now = time.time()``), so cookies, OAuth grants and codes minted
             # for a previous account that reused this username predate the new
-            # account's epochs and are rejected. Whole-second resolution is
-            # merely conservative: a lower floor can only accept MORE cookies
-            # (never a legitimate pre-creation one, which still predates it),
-            # and the account's very first login always postdates it.
-            # set_password and regenerate_token keep stamping sub-second epochs.
-            now = float(int(time.time()))
+            # account's epochs and are rejected — including ones minted within
+            # the same wall-clock second as the delete+recreate, which a
+            # whole-second floor here would have let through. set_password,
+            # regenerate_token and bump_sessions_invalid_before likewise stamp
+            # sub-second epochs, and every check site compares against
+            # max(created_at, epoch) as raw floats.
+            now = time.time()
             user = User(
                 username=username,
                 password_hash=hash_password(password),
