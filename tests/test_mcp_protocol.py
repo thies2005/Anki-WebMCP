@@ -354,6 +354,17 @@ MUTATING_TOOLS = {
     "bury_cards", "unbury_cards", "reposition_new_cards",
 }
 
+# The readOnlyHint complement of MUTATING_TOOLS: pure reads, annotated
+# readOnlyHint=true so annotation-aware clients can treat them as reads
+# instead of assuming every tool mutates. sync_collection is its own bucket:
+# not in either set, annotated readOnlyHint=false (a two-way sync writes).
+READ_ONLY_TOOLS = {
+    "list_decks", "get_deck_config", "search_notes", "get_note", "get_notes",
+    "find_duplicates", "list_note_types", "get_note_type",
+    "preview_note_type_change", "find_cards", "get_card", "get_review_queue",
+    "get_media_file", "list_media_files", "get_collection_stats",
+}
+
 
 @pytest.mark.asyncio
 async def test_tool_descriptions_teach_local_only_semantics(app_with_users):
@@ -384,6 +395,45 @@ async def test_tool_descriptions_teach_local_only_semantics(app_with_users):
             # Read-only exemplars keep their descriptions free of the suffix
             for readonly in ("list_decks", "search_notes", "get_note"):
                 assert "sync_collection" not in tools[readonly]["description"]
+
+
+@pytest.mark.asyncio
+async def test_tool_annotations_readonly_hints(app_with_users):
+    """tools/list annotations: reads declare readOnlyHint=true, no other tool
+    claims to be a read.
+
+    The union pin forces every registered tool into an explicit bucket — a
+    future tool must join READ_ONLY_TOOLS, MUTATING_TOOLS, or be
+    sync-like, or this test fails until someone decides what its
+    annotation says.
+    """
+    app, settings, alice_token, _ = app_with_users
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+            headers = await _init_session(client, alice_token)
+            list_res = await client.post("/mcp", headers=headers, json={
+                "jsonrpc": "2.0", "id": 45, "method": "tools/list",
+            })
+            assert list_res.status_code == 200
+            payload = _parse_mcp_response(list_res)
+            tools = {t["name"]: t for t in payload["result"]["tools"]}
+
+            unbucketed = sorted(
+                set(tools) - READ_ONLY_TOOLS - MUTATING_TOOLS - {"sync_collection"}
+            )
+            assert unbucketed == [], f"tools without an annotation bucket: {unbucketed}"
+
+            for name, tool in tools.items():
+                hints = tool.get("annotations") or {}
+                if name in READ_ONLY_TOOLS:
+                    assert hints.get("readOnlyHint") is True, (
+                        f"{name} must declare readOnlyHint=true"
+                    )
+                else:
+                    assert hints.get("readOnlyHint") is not True, (
+                        f"{name} must not claim readOnlyHint=true"
+                    )
 
 
 @pytest.mark.asyncio
