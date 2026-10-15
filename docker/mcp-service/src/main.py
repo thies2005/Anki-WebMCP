@@ -15,6 +15,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.context import Context
+from mcp.types import ToolAnnotations
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import (
@@ -150,6 +151,17 @@ LOCAL_UNTIL_SYNCED_SUFFIX = (
     " pre-tool two-way sync (at most one SYNC_BEFORE_TOOLS_TTL_SECONDS"
     " window later) or immediately by sync_collection."
 )
+
+# MCP tool annotations (advisory hints clients may consult for permissioning
+# and confirmation UX). Reads declare readOnlyHint; sync_collection gets an
+# explicit readOnlyHint=False because a two-way sync writes to AnkiWeb; the
+# remaining mutators stay unannotated since the spec defaults
+# (readOnlyHint=false, destructiveHint=true) already describe them. Pinned by
+# tests against tools/list: a newly added tool must join one of the three
+# buckets (annotated read / MUTATING_TOOLS / sync-like) or the annotation
+# test fails.
+_READ_ONLY_HINT = ToolAnnotations(read_only_hint=True)
+_MUTATING_HINT = ToolAnnotations(read_only_hint=False)
 
 # Reference grouping of every registered tool, for the portal/admin rule UIs.
 # Pinned by tests against tools/list so a renamed or newly added tool cannot
@@ -1308,7 +1320,10 @@ def create_app(custom_settings: Optional[Settings] = None):
         return _guarded
 
     # 1. list_decks
-    @mcp.tool(description="List all available decks and their IDs in the Anki collection.")
+    @mcp.tool(
+        description="List all available decks and their IDs in the Anki collection.",
+        annotations=_READ_ONLY_HINT,
+    )
     @_tool_guard
     async def list_decks(ctx: Context) -> Dict[str, Any]:
         username = _username_from_context(ctx)
@@ -1328,7 +1343,8 @@ def create_app(custom_settings: Optional[Settings] = None):
             "content. Optional fields=[...] projects each note down to the named "
             "fields (names missing from a note's type are omitted for that note) to "
             "shrink large result sets."
-        )
+        ),
+        annotations=_READ_ONLY_HINT,
     )
     @_tool_guard
     async def search_notes(
@@ -1352,7 +1368,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         description=(
             "Retrieve details and fields for a specific note by ID (single note; "
             "use get_notes to fetch a batch of IDs in one call)."
-        )
+        ),
+        annotations=_READ_ONLY_HINT,
     )
     @_tool_guard
     async def get_note(note_id: int, ctx: Context = None) -> Dict[str, Any]:
@@ -1372,7 +1389,8 @@ def create_app(custom_settings: Optional[Settings] = None):
             "(batch get_note, max 200 IDs). Returns the found notes in request "
             "order — note_id, model_name, tags, and all fields — plus a missing "
             "list of IDs that are not in the collection."
-        )
+        ),
+        annotations=_READ_ONLY_HINT,
     )
     @_tool_guard
     async def get_notes(note_ids: List[int], ctx: Context = None) -> Dict[str, Any]:
@@ -1386,7 +1404,10 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 4. get_collection_stats
-    @mcp.tool(description="Get reliably supported collection statistics and deck summaries.")
+    @mcp.tool(
+        description="Get reliably supported collection statistics and deck summaries.",
+        annotations=_READ_ONLY_HINT,
+    )
     @_tool_guard
     async def get_collection_stats(ctx: Context) -> Dict[str, Any]:
         username = _username_from_context(ctx)
@@ -1409,7 +1430,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         "with a direction only the account owner may choose — retry once with full_sync_direction="
         "'upload' (replace AnkiWeb's copy with this service's collection) or 'download' (replace "
         "this service's collection with AnkiWeb's; a local backup is taken first). The argument is "
-        "ignored for regular syncs."
+        "ignored for regular syncs.",
+        annotations=_MUTATING_HINT,
     )
     @_tool_guard
     async def sync_collection(
@@ -1578,7 +1600,10 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 14. list_note_types
-    @mcp.tool(description="List note types with their field names and card templates.")
+    @mcp.tool(
+        description="List note types with their field names and card templates.",
+        annotations=_READ_ONLY_HINT,
+    )
     @_tool_guard
     async def list_note_types(ctx: Context) -> Dict[str, Any]:
         username = _username_from_context(ctx)
@@ -1618,7 +1643,10 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 16. find_cards
-    @mcp.tool(description="Search cards by Anki query with bounded pagination.")
+    @mcp.tool(
+        description="Search cards by Anki query with bounded pagination.",
+        annotations=_READ_ONLY_HINT,
+    )
     @_tool_guard
     async def find_cards(query: str, limit: int = 50, offset: int = 0, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
@@ -1631,7 +1659,10 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 17. get_card
-    @mcp.tool(description="Retrieve a card's fields, rendered question/answer, and scheduling state.")
+    @mcp.tool(
+        description="Retrieve a card's fields, rendered question/answer, and scheduling state.",
+        annotations=_READ_ONLY_HINT,
+    )
     @_tool_guard
     async def get_card(card_id: int, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
@@ -1709,7 +1740,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         "The queue covers exactly ONE deck (subdecks included): pass deck (a deck name "
         "from list_decks) to review that deck; without it the collection's currently "
         "selected deck is used, which on a fresh collection is 'Default' and usually "
-        "empty. The response names the deck the queue came from."
+        "empty. The response names the deck the queue came from.",
+        annotations=_READ_ONLY_HINT,
     )
     @_tool_guard
     async def get_review_queue(
@@ -1777,7 +1809,10 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 25. get_media_file
-    @mcp.tool(description="Read a media file back as base64 (files over 4 MiB are refused).")
+    @mcp.tool(
+        description="Read a media file back as base64 (files over 4 MiB are refused).",
+        annotations=_READ_ONLY_HINT,
+    )
     @_tool_guard
     async def get_media_file(filename: str, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
@@ -1790,7 +1825,10 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 26. list_media_files
-    @mcp.tool(description="List media filenames (sorted), capped at the requested limit.")
+    @mcp.tool(
+        description="List media filenames (sorted), capped at the requested limit.",
+        annotations=_READ_ONLY_HINT,
+    )
     @_tool_guard
     async def list_media_files(limit: int = 200, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
@@ -1809,7 +1847,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         "old field whose content would be discarded and every old template whose cards would be "
         "deleted. Unmapped old content is discarded and cards regenerate on the new note type; "
         "always run this before change_note_type. Pass the same field_map/template_map you will "
-        "pass to change_note_type so the preview reflects the mapped change."
+        "pass to change_note_type so the preview reflects the mapped change.",
+        annotations=_READ_ONLY_HINT,
     )
     @_tool_guard
     async def preview_note_type_change(
@@ -1920,7 +1959,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         "field_name (matched case-insensitively across note types, HTML-stripped; empty values "
         "never group), optionally narrowed by an Anki search prefilter. Returns the total group "
         "count and one requested page of {field_value, note_ids} groups — useful to clean up "
-        "before or after a mass edit."
+        "before or after a mass edit.",
+        annotations=_READ_ONLY_HINT,
     )
     @_tool_guard
     async def find_duplicates(
@@ -1945,7 +1985,8 @@ def create_app(custom_settings: Optional[Settings] = None):
     @mcp.tool(
         description="Show full detail for one note type (read-only): id, standard/cloze type, "
         "fields with ordinals, templates with question/answer formats, CSS, sort field, and the "
-        "number of notes using it."
+        "number of notes using it.",
+        annotations=_READ_ONLY_HINT,
     )
     @_tool_guard
     async def get_note_type(name: str, ctx: Context = None) -> Dict[str, Any]:
@@ -2252,7 +2293,8 @@ def create_app(custom_settings: Optional[Settings] = None):
     @mcp.tool(
         description="Show one deck's scheduling configuration (read-only): the full config dict "
         "(name, maxTaken, new/review daily limits, autoplay, timer, ...) as plain JSON. A deck's "
-        "config is a preset that may be shared by several decks."
+        "config is a preset that may be shared by several decks.",
+        annotations=_READ_ONLY_HINT,
     )
     @_tool_guard
     async def get_deck_config(deck_id: int, ctx: Context = None) -> Dict[str, Any]:
