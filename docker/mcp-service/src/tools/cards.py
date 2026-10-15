@@ -323,9 +323,11 @@ async def get_review_queue(
         with _deck_selection(col, deck_id):
             out = col.sched.get_queued_cards(fetch_limit=limit)
         items = []
+        q_trunc = False
         for queued in out.cards:
             card = col.get_card(queued.card.id)
-            question, _ = _truncate_html(card.question(), 2000)
+            question, trunc = _truncate_html(card.question(), 2000)
+            q_trunc = q_trunc or bool(trunc)
             items.append(
                 {
                     "card_id": int(card.id),
@@ -342,6 +344,7 @@ async def get_review_queue(
             "deck_id": deck_id,
             "deck_name": col.decks.name(deck_id),
             "total_queue_count": total,
+            "truncated": q_trunc,
             "cards": items,
         }
 

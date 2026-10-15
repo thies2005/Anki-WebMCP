@@ -42,6 +42,11 @@ services:
       # (pulls remote state AND pushes pending local changes).
       - SYNC_BEFORE_TOOLS=${SYNC_BEFORE_TOOLS:-true}
       - SYNC_BEFORE_TOOLS_TTL_SECONDS=${SYNC_BEFORE_TOOLS_TTL_SECONDS:-1800}
+      # MCP streamable-HTTP session table across ALL users: cap on concurrent
+      # sessions (new ones get 503 past the cap) and how long an idle session
+      # is kept before it is reaped.
+      - MCP_MAX_SESSIONS=${MCP_MAX_SESSIONS:-64}
+      - MCP_SESSION_IDLE_TIMEOUT=${MCP_SESSION_IDLE_TIMEOUT:-1800}
       # Comma-separated proxy IPs whose X-Forwarded-For may override the
       # socket peer for request.client.host (login rate limiting). Behind
       # Coolify's Traefik, set this to the proxy network (or "*" — the

@@ -23,9 +23,11 @@ class NoteInput(BaseModel):
         """Fold the legacy ``model_name`` key into canonical ``note_type``."""
         if not isinstance(data, dict):
             return data
-        legacy = data.pop("model_name", None)
-        if legacy is None:
+        if "model_name" not in data:
             return data
+        # Work on a copy: validation must never mutate the caller's dict.
+        data = dict(data)
+        legacy = data.pop("model_name")
         canonical = data.get("note_type")
         if canonical is not None and canonical != legacy:
             raise ValueError(
@@ -886,6 +888,24 @@ class SetDueDateInput(_IdListInput):
     @classmethod
     def validate_ids(cls, v: List[int]) -> List[int]:
         return cls._validate_id_list(v, "card ID")
+
+    @field_validator("days")
+    @classmethod
+    def _check_days(cls, v: str) -> str:
+        """Reject inverted or absurdly far ranges before any snapshot is taken."""
+        lo_text, _, hi_text = v.partition("-")
+        lo = int(lo_text)
+        hi = int(hi_text) if hi_text else lo
+        if hi < lo:
+            raise ValueError(
+                f"days range is inverted: '{v}' means between {lo} and {hi}; "
+                "give the range as 'lo-hi' with lo <= hi."
+            )
+        if hi > 36500:
+            raise ValueError(
+                f"days must be at most 36500 (about 100 years); got {hi} in '{v}'."
+            )
+        return v
 
 
 class MoveCardsInput(_IdListInput):

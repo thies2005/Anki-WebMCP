@@ -159,15 +159,19 @@ async def update_note_type(
                         "template names must stay unique within the note type."
                     )
                 finals.append(final)
+            templates_changed = False
             for upd in template_updates:
                 template = by_name[upd.template]
                 if upd.new_name:
                     template["name"] = upd.new_name
-                if upd.front is not None:
+                if upd.front is not None and upd.front != template["qfmt"]:
                     template["qfmt"] = upd.front
-                if upd.back is not None:
+                    templates_changed = True
+                if upd.back is not None and upd.back != template["afmt"]:
                     template["afmt"] = upd.back
-            changed.append("templates")
+                    templates_changed = True
+            if templates_changed:
+                changed.append("templates")
 
         if sort_field is not None:
             field_names = mm.field_names(nt)
@@ -176,8 +180,10 @@ async def update_note_type(
                     f"Unknown sort field {sort_field!r} of note type {nt['name']!r}. "
                     f"Valid fields for this note type: {sorted(field_names)}."
                 )
-            mm.set_sort_index(nt, field_names.index(sort_field))
-            changed.append("sort_field")
+            target_idx = field_names.index(sort_field)
+            if target_idx != nt["sortf"]:
+                mm.set_sort_index(nt, target_idx)
+                changed.append("sort_field")
 
         mm.update_dict(nt)
         fresh = mm.by_name(nt["name"])  # update_dict evicted the cache: fresh read

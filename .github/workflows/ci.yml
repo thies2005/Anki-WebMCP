@@ -16,7 +16,9 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: anki-mcp
+  # Must stay in sync with docker-image.yml, README.md (ghcr.io/thies2005/anki-webmcp)
+  # and coolify-stack.yml; must be lowercase (GHCR rejects mixed-case names).
+  IMAGE_NAME: anki-webmcp
 
 jobs:
   tests:

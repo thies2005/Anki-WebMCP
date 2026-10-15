@@ -980,6 +980,11 @@ async def find_duplicates(
     ``search`` is an optional Anki query prefilter narrowing which notes are
     examined.
     """
+    # Clamp pagination bounds (direct calls bypass the pydantic input model,
+    # whose own bounds are ge=1/le=500 for limit and ge=0 for offset).
+    limit = max(1, min(limit, 500))
+    offset = max(0, int(offset))
+
     # Client-controlled values are logged %r (repr escapes newlines/control
     # chars) so one tool call can never author multiple log lines (CWE-117).
     logger.info(

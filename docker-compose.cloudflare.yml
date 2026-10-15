@@ -17,6 +17,13 @@ services:
   anki-mcp:
     ports: !override
       - "127.0.0.1:8000:8000"
+    environment:
+      # Overrides the base file's 127.0.0.1 default: behind cloudflared the
+      # socket peer (request.client.host) is the tunnel container on the
+      # compose bridge network, not the real client, and this service is only
+      # reachable through the tunnel. To scope the trust instead, set
+      # FORWARDED_ALLOW_IPS in .env to the bridge CIDR (see .env.example).
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-*}
 
   cloudflared:
     image: cloudflare/cloudflared:latest

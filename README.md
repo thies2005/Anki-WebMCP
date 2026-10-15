@@ -468,7 +468,7 @@ PYTHONPATH=docker/mcp-service pytest tests/ -v
 
 ### End-to-End Verification Checklist
 - [x] Single headless image builds natively on amd64 and arm64 (manylinux `anki` wheels).
-- [x] Service starts fail-closed: refuses to run without `SESSION_SECRET`, and without bootstrap credentials on an empty store.
+- [x] Service starts fail-closed with zero-touch bootstrap: a missing `SESSION_SECRET` is generated once and persisted at `/data/.session_secret` (`0600`) — only a placeholder value or an unwritable data volume is refused — and an empty store always gets a bootstrapped admin (a generated password is recorded in `/data/initial-admin-password.txt`; startup is refused only if it cannot be persisted).
 - [x] Streamable HTTP MCP server on port 8000 requires a valid per-user bearer token.
 - [x] Per-user isolation verified at protocol level: two users' sessions on one instance see only their own notes and collections.
 - [x] All 48 MCP tools execute against real per-user collections with per-user locking and ledger-backed idempotency (destructive ones snapshot-or-abort).

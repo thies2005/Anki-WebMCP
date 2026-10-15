@@ -12,6 +12,13 @@ services:
   anki-mcp:
     # Disable direct host port exposure so all traffic goes through Coolify's Traefik
     ports: !override []
+    environment:
+      # Overrides the base file's 127.0.0.1 default: behind Coolify's Traefik
+      # the socket peer (request.client.host) is the proxy container on the
+      # platform network, and the service is only reachable through that
+      # proxy. To scope the trust instead, set FORWARDED_ALLOW_IPS in the
+      # Coolify environment editor to the proxy network CIDR (see .env.example).
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-*}
     labels:
       - "coolify.managed=true"
       - "traefik.enable=true"

@@ -531,8 +531,10 @@ async def test_review_queue_contains_new_card_and_answer_card_answers_it(env):
 
     q = await card_tools.get_review_queue(reg, "omar")
     # deck_id/deck_name name the deck the queue was built from so an empty
-    # queue is self-explaining (deck-scoped review fix).
-    assert set(q) == {"total_queue_count", "cards", "deck_id", "deck_name"}
+    # queue is self-explaining (deck-scoped review fix); truncated reports
+    # whether any question was cut at the 2000-char cap (F-16).
+    assert set(q) == {"total_queue_count", "cards", "deck_id", "deck_name", "truncated"}
+    assert q["truncated"] is False
     assert q["deck_name"] == "Default"
     assert q["total_queue_count"] >= 1
     entry = next(c for c in q["cards"] if c["card_id"] == cid)

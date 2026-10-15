@@ -18,7 +18,10 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # Lowercase and owner-prefixed below (ghcr.io/${{ github.repository_owner }}/anki-webmcp)
+  # so it matches ci.yml, README.md and coolify-stack.yml; `${{ github.repository }}`
+  # would carry the repo's uppercase name, which GHCR rejects.
+  IMAGE_NAME: anki-webmcp
 
 jobs:
   build-push:
@@ -42,7 +45,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
             type=raw,value=latest

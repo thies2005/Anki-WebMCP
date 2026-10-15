@@ -298,6 +298,12 @@ class OAuthStore:
     mcp-service replica per data dir.
     """
 
+    # Hard cap on live authorization codes: consent retries or a runaway
+    # client must not grow the in-memory map without limit. ``issue_code``
+    # evicts the entry closest to expiry when the cap is reached; every live
+    # code dies within CODE_TTL_SECONDS anyway.
+    MAX_CODES = 250
+
     def __init__(self, file_path: str):
         self.file_path = file_path
         self._lock = threading.RLock()
@@ -443,6 +449,16 @@ class OAuthStore:
         """Mint a single-use authorization code bound to the consented request."""
         with self._lock:
             self.purge_expired_codes()
+            if len(self._codes) >= self.MAX_CODES:
+                oldest, _record = min(
+                    self._codes.items(), key=lambda kv: kv[1].get("expires_at", 0.0)
+                )
+                del self._codes[oldest]
+                logger.warning(
+                    "OAuth authorization-code store at capacity (%d): evicted the "
+                    "soonest-expiring code",
+                    self.MAX_CODES,
+                )
             code = secrets.token_urlsafe(32)
             self._codes[code] = {
                 "client_id": client_id,
