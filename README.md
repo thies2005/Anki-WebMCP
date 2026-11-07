@@ -1,8 +1,23 @@
-# Anki-WebMCP
+<h1 align="center">Anki-WebMCP</h1>
 
-> A self-hosted, headless **multi-user** Anki MCP service in Docker: one Python process serving per-user collections through the official `anki` library, a web portal for tokens and AnkiWeb sync, an admin UI, and an authenticated Streamable HTTP Model Context Protocol (MCP) endpoint for AI clients.
+<p align="center"><strong>Your collections. Your AI tools.</strong><br>A self-hosted, multi-user Anki MCP service.</p>
 
----
+<p align="center">
+  <a href="#quick-start">Get started</a> ·
+  <a href="#mcp-client-integration">Client integration</a> ·
+  <a href="#operations">Operations</a> ·
+  <a href="#testing--verification">Verification</a>
+</p>
+
+## What you can do
+
+| | Features |
+|---|---|
+| **Connect an AI client** | Use an authenticated Streamable HTTP MCP endpoint. |
+| **Keep users separate** | Give each account its own collection, MCP token, and AnkiWeb credentials. |
+| **Manage collections** | Use the portal, admin tools, snapshots, and explicit or configured pre-tool sync. |
+
+Anki-WebMCP runs as one headless Python service in Docker. It opens each user’s collection through the official `anki` library and provides a token portal, AnkiWeb synchronization, an admin interface, and authenticated MCP tools for AI clients. Review cards on your usual Anki clients after synchronization.
 
 ## Table of Contents
 
@@ -23,8 +38,6 @@
 13. [Testing & Verification](#testing--verification)
 14. [History](#history)
 
----
-
 ## Overview & Philosophy
 
 ### What this is
@@ -39,8 +52,6 @@
 - This is **not** a replacement Anki backend, custom sync server, or web scraper.
 - Mutations made through MCP hit **this service's local copy first**; they are pushed to AnkiWeb by the automatic pre-tool sync (within one TTL window, saved credentials required) or by an explicit sync — see [Write Safety & Synchronization Model](#write-safety--synchronization-model).
 
----
-
 ## Prerequisites
 
 - **Docker Engine 24+ and Docker Compose v2.24+** (the exposure-mode override files use the `!override` compose tag, which requires 2.24+).
@@ -49,8 +60,6 @@
 - A free host port `8000` (configurable mapping).
 - A Cloudflare account with a Zero Trust tunnel (only for Exposure Mode 1).
 - `openssl` if you prefer choosing your own `SESSION_SECRET` and admin password — when omitted, the service generates and persists both on first boot (see [Security Architecture](#security-architecture)).
-
----
 
 ## Architecture
 
@@ -97,8 +106,6 @@ One containerized service and an optional exposure gateway:
    - Sanitizes and redacts secrets from logs; `LOG_LEVEL` controls verbosity.
 2. **Exposure gateway** (optional): cloudflared or Coolify's Traefik terminates TLS in front of port 8000. Direct plain-HTTP exposure beyond localhost is not recommended — see [Security Architecture](#security-architecture).
 
----
-
 ## Write Safety & Synchronization Model
 
 The core change from v1: every write is applied locally to the acting user's collection and reported immediately — the mutation response itself never syncs inline (`sync_status` stays `"skipped"`). But for accounts with saved AnkiWeb credentials the **pre-tool sync is a full two-way sync**, so pending local mutations are pushed to AnkiWeb automatically at most one `SYNC_BEFORE_TOOLS_TTL_SECONDS` window after they are made (Anki's protocol has no pull-only delta sync, so the automatic pre-tool step pushes as well as pulls). `SYNC_BEFORE_TOOLS=false` — or a tool rule disabling `sync_collection` for the account — restores explicit-sync-only behavior: changes then reach other Anki clients only when an **explicit sync** runs (the `sync_collection` MCP tool or the portal's Sync button).
@@ -144,8 +151,6 @@ sequenceDiagram
 - **Ambiguous-outcome semantics**: if a sync drops mid-flight with an unknown outcome, the response carries an outcome-UNKNOWN warning and the idempotency key is deliberately **not** recorded — verify collection state before retrying. Deterministic failures (e.g. duplicate rejection) do persist a `failed` record.
 - **Bounded state**: the ledger keeps at most 1000 recent keys (each key capped at 256 characters); at most `BACKUP_RETENTION` snapshots per user (default **20**, env-tunable) covering pre-sync, pre-destructive-change, manual, and pre-restore snapshots; at most `MAX_OPEN_COLLECTIONS` collections open at once (idle ones close after `IDLE_TIMEOUT_MINUTES`); at most `MCP_MAX_SESSIONS` concurrent MCP sessions across all users, reaped after `MCP_SESSION_IDLE_TIMEOUT` seconds idle.
 - **Two-way sync with AnkiWeb before every tool**: for accounts with saved AnkiWeb credentials, the FIRST tool call in each cooldown window runs a full two-way sync (snapshot first): it pulls the account's AnkiWeb state so tools start from current data **and pushes the local changes made since the last window** — the pre-tool step is automatic AnkiWeb egress, not a pull-only read; the rest of the window's calls run on local data. The sync is **fail-open** — if AnkiWeb is unreachable the tool proceeds on the local copy — and the window is `SYNC_BEFORE_TOOLS_TTL_SECONDS` per user (default **1800s = 30 min**, `0` = sync before every call). Turn it off with `SYNC_BEFORE_TOOLS=false` (mutations then stay local until an explicit sync), or disable `sync_collection` for an account via a tool rule (the rule doubles as that account's opt-out from the automatic pre-tool sync); accounts without credentials are silently skipped, and `sync_collection` itself is excluded (it performs the full sync).
-
----
 
 ## Quick Start
 
@@ -195,8 +200,6 @@ Expected health output:
 
 `/health` returns **200** when healthy and **503** with `"status":"degraded"` when the users store is unavailable or the data directory is not writable — there is no slow GUI startup anymore (the Docker healthcheck grace period is 10 s).
 
----
-
 ## First-Run Setup: Portal, Users & AnkiWeb
 
 1. Open **http://localhost:8000** and log in with `ADMIN_USERNAME` / `ADMIN_PASSWORD` from `.env` — or, if you set no admin password, with the generated one from `/data/initial-admin-password.txt` (`docker compose exec anki-mcp cat /data/initial-admin-password.txt`).
@@ -213,8 +216,6 @@ Expected health output:
 - **Global rules** (admin console → **Global tool rules**): the admin can disable tools for **every** account (admins included). Deny-only union — a tool matched by either layer is refused; nothing can re-enable a tool matched by the global layer.
 - Refused calls return a structured `ToolDisabledError` naming the matching rule and which layer it came from, so connected clients (claude.ai, Perplexity, ...) see why a tool is unavailable instead of a silent failure.
 - The usage log lives per user at `/data/users/<name>/tool_usage.json` (capped at the 1000 most recent entries, atomic writes; archived with the account on deletion).
-
----
 
 ## Exposure Modes
 
@@ -255,8 +256,6 @@ Recommended for self-hosters running Coolify — a paste-and-go deploy with zero
 Git-based deploys work too: add the resource from this repository with the compose file at `/coolify-stack.yml`, swapping the `image:` line for the commented `build:` block to build from source. The advanced override (`docker-compose.coolify.yml`, explicit Traefik labels driven by `ANKI_MCP_DOMAIN`) remains for users who manage their own Traefik.
 
 > **If the domain does not resolve after deploy:** attach the `anki-mcp` service to Coolify's proxy network in the Coolify UI, and confirm the service's port is set to 8000.
-
----
 
 ## MCP Client Integration
 
@@ -307,8 +306,6 @@ claude mcp add --transport http anki https://anki-mcp.yourdomain.com/mcp \
   Authorization: Bearer <user-token-from-portal>
   Accept: application/json, text/event-stream
   ```
-
----
 
 ## Available MCP Tools
 
@@ -367,8 +364,6 @@ All tools operate on the **authenticated user's** collection — the token decid
 
 *Destructive tools* (`rename_deck`, `delete_deck`, `delete_notes`, `change_note_type`, `remove_note_type_field`, `remove_note_type_template`, `delete_note_type`, `restore_note_type_to_stock`) require `confirm=true` **and always create a snapshot in `backups/` first** — if the snapshot fails, the operation is aborted (fail-closed), so every destructive change stays reversible from the portal's Version history. Raw SQL execution and arbitrary add-on passthrough remain deliberately omitted to preserve collection integrity.
 
----
-
 ## Security Architecture
 
 1. **Fail-Closed Startup (with zero-touch self-provisioning)**:
@@ -403,8 +398,6 @@ All tools operate on the **authenticated user's** collection — the token decid
    - In Cloudflare Tunnel mode, ingress rules live in the Cloudflare dashboard — route only port 8000.
 8. **Log Redaction**: automatic filters mask Authorization headers, bearer tokens, passwords, API keys, and AnkiWeb credentials before writing to container logs.
 
----
-
 ## Troubleshooting
 
 - **`/health` returns 503 / `degraded`**: the users store is unavailable (e.g. `users.json` unreadable/corrupt) or the data directory is missing/not writable (volume not mounted, permissions). Check `docker compose logs -f anki-mcp` for the `Health probe:` warnings.
@@ -426,8 +419,6 @@ All tools operate on the **authenticated user's** collection — the token decid
 - **`Bind for 127.0.0.1:8000 failed: port already allocated`**: another service holds the port — change the published port in `docker-compose.yml`.
 - **After upgrading the image, older Anki clients complain**: the pinned `anki` wheel version defines the collection schema; see the upgrade notes in [Operations](#operations).
 
----
-
 ## Operations
 
 - **Backup**: stop the service first (`docker compose stop anki-mcp`) for a consistent snapshot —
@@ -448,8 +439,6 @@ All tools operate on the **authenticated user's** collection — the token decid
   ```
   Pass = `python-multipart` >= 0.0.18 and `starlette` >= 0.40.0 (the security-fix floors for the pre-auth multipart parser DoS CVEs CVE-2024-53981 and CVE-2024-47874). If the image reports lower versions, rebuild (`docker compose build --pull`) and re-check.
 - **Logs**: `docker compose logs -f anki-mcp`
-
----
 
 ## Testing & Verification
 
@@ -473,8 +462,6 @@ PYTHONPATH=docker/mcp-service pytest tests/ -v
 - [x] Per-user isolation verified at protocol level: two users' sessions on one instance see only their own notes and collections.
 - [x] All 48 MCP tools execute against real per-user collections with per-user locking and ledger-backed idempotency (destructive ones snapshot-or-abort).
 - [x] `/health` reports 200 healthy and 503 degraded (users store unavailable / data dir not writable).
-
----
 
 ## History
 
