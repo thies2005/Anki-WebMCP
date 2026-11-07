@@ -119,7 +119,7 @@ sequenceDiagram
     participant C as Per-user Collection (/data)
     participant Cloud as Official AnkiWeb
 
-    Note over Client,Cloud: Mutation response reports sync_status "skipped" — the change sits locally until the next pre-tool two-way sync pushes it to AnkiWeb (≤1 TTL window; saved credentials required) or an explicit sync_collection runs
+    Note over Client,Cloud: Mutation response reports sync_status "skipped" — the change sits locally until the next pre-tool two-way sync pushes it to AnkiWeb (≤1 TTL window#59; saved credentials required) or an explicit sync_collection runs
     Client->>S: add_notes / update_note_fields / add_tags (+ idempotency_key?)
     activate S
     Note over S: 1. Maintenance-mode gate
