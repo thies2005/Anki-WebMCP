@@ -29,10 +29,22 @@ from src.users import UserStore
 DEFAULT_USERS_FILE = "/data/users.json"
 
 
+def _resolve_encryption_secret(users_path: str) -> str:
+    secret = os.getenv("DATA_ENCRYPTION_KEY", "").strip() or os.getenv("SESSION_SECRET", "").strip()
+    if secret:
+        return secret
+    secret_file = os.path.join(os.path.dirname(users_path) or ".", ".session_secret")
+    try:
+        with open(secret_file, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def _open_store(args: argparse.Namespace) -> UserStore:
     path = args.users_file or os.getenv("USERS_FILE") or DEFAULT_USERS_FILE
     try:
-        return UserStore(path)
+        return UserStore(path, encryption_secret=_resolve_encryption_secret(path))
     except (OSError, ValueError) as e:
         # A missing file yields an empty store instead of raising; a corrupt or
         # unreadable one raises — for an auth store that must be loud, and here

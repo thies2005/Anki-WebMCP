@@ -13,6 +13,7 @@ STRINGS at the storage layer while ``note.tags`` is a List[str] property;
 """
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import anki.lang
@@ -908,35 +909,73 @@ async def find_and_replace(
     regex: bool = False,
     field_name: Optional[str] = None,
     match_case: bool = False,
+    dry_run: bool = False,
+    idempotency_key: Optional[str] = None,
 ) -> MutationResponse:
-    """Bulk find-and-replace over the selected notes' fields.
-
-    Same class as update_note_fields: a plain content edit of notes the user
-    already owns, reversible through the portal's ordinary snapshot/restore
-    machinery, so — unlike the structural, content-discarding change_note_type
-    — no confirm gate and no dedicated snapshot precede it. The selection may
-    span note types, and ``field_name`` is therefore passed to the backend
-    unvalidated (a selection-wide name check is impossible; an unknown name
-    simply matches nothing).
-    """
+    """Bulk find-and-replace over the selected notes' fields (supports ``dry_run`` preview)."""
     logger.info(
         "Executing find_and_replace for %r: search=%r, replacement=%r, regex=%r, "
-        "field_name=%r, match_case=%r (%d note id(s), query=%r)",
-        username, search, replacement, regex, field_name, match_case,
+        "field_name=%r, match_case=%r, dry_run=%r (%d note id(s), query=%r)",
+        username, search, replacement, regex, field_name, match_case, dry_run,
         len(note_ids) if note_ids else 0, query,
     )
+
+    if dry_run:
+        compiled = None
+        if regex:
+            flags = 0 if match_case else re.IGNORECASE
+            try:
+                compiled = re.compile(search, flags)
+            except re.error as exc:
+                raise CollectionToolError(
+                    f"Invalid find_and_replace regular expression: {exc}"
+                ) from exc
+
+        def _preview(col) -> Dict[str, Any]:
+            nids, _mids = _resolve_note_selection(col, note_ids, query, "Cannot find and replace")
+            needle = search if match_case else search.lower()
+            matched_notes = 0
+            total_matches = 0
+            sample_nids: List[int] = []
+            for nid in nids:
+                note = col.get_note(nid)
+                note_hits = 0
+                for fname, val in note.items():
+                    if field_name is not None and fname != field_name:
+                        continue
+                    if compiled is not None:
+                        note_hits += len(compiled.findall(val))
+                    else:
+                        hay = val if match_case else val.lower()
+                        note_hits += hay.count(needle)
+                if note_hits > 0:
+                    matched_notes += 1
+                    total_matches += note_hits
+                    if len(sample_nids) < 20:
+                        sample_nids.append(int(nid))
+            return {
+                "dry_run": True,
+                "selected": len(nids),
+                "matched_notes": matched_notes,
+                "matched_occurrences": total_matches,
+                "sample_note_ids": sample_nids,
+                "field_name": field_name,
+                "regex": regex,
+                "match_case": match_case,
+            }
+
+        preview_data = await registry.run(username, _preview)
+        return MutationResponse(
+            success=True,
+            local_status="dry_run",
+            sync_status=SyncStatus(),
+            data=preview_data,
+        )
 
     def _replace(col) -> Dict[str, Any]:
         # Existence + dedupe only (shared resolver): mixed note types are the
         # point of a mass edit, so no single-notetype check here.
         nids, _mids = _resolve_note_selection(col, note_ids, query, "Cannot find and replace")
-        # One backend operation over the whole selection; ``count`` is the
-        # number of CHANGED notes (verified wheel API), so reporting the
-        # selection size next to it keeps a zero-match no-op visible as
-        # changed=0 rather than looking like a lost request.
-        # A malformed pattern with regex=True (or an unusable search/replacement)
-        # raises the backend's InvalidInput on the HEALTHY handle — surface it as
-        # a clean tool error instead of a generic mutation failure.
         try:
             result = col.find_and_replace(
                 note_ids=nids,
@@ -965,6 +1004,7 @@ async def find_and_replace(
         username,
         operation_name="find_and_replace",
         mutation_fn=_mutation,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -1014,3 +1054,14 @@ async def find_duplicates(
         }
 
     return await registry.run(username, _dupes)
+
+
+async def list_tags(registry, username: str) -> Dict[str, Any]:
+    """List all note tags in the user's collection (sorted case-insensitively)."""
+    logger.info("Executing list_tags for %r", username)
+
+    def _list(col) -> Dict[str, Any]:
+        tags = sorted((str(t) for t in col.tags.all()), key=str.lower)
+        return {"count": len(tags), "tags": tags}
+
+    return await registry.run(username, _list)

@@ -142,6 +142,7 @@ BACKUP_REASONS = (
     "pre-remove-note-type-template",
     "pre-delete-note-type",
     "pre-restore-note-type-stock",
+    "pre-delete-media",
     "manual",
 )
 

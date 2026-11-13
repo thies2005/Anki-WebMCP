@@ -589,7 +589,9 @@ async def test_password_reset_via_admin_route_kills_pre_reset_session(app, clien
         },
     )
     assert res.status_code == 303
-    assert UserStore(str(tmp_path / "users.json")).verify_password("alice", "brand-new-pw")
+    assert UserStore(str(tmp_path / "users.json"), encryption_secret=SECRET).verify_password(
+        "alice", "brand-new-pw"
+    )
 
     # The pre-reset cookie is dead: the portal bounces to login...
     client.cookies.set(SESSION_COOKIE_NAME, old_alice)
@@ -897,7 +899,7 @@ async def test_delete_user_without_ledger_dir_skips_ledger_archive(tmp_path):
     assert res.status_code == 303
     # Read from disk via a fresh store: create_app rebinds the module-global
     # store instance, so the pre-app `store` object above is stale.
-    assert UserStore(users_file).get("alice") is None
+    assert UserStore(users_file, encryption_secret=SECRET).get("alice") is None
     # Neither users/alice nor ledgers/alice existed: deleted/ is not created.
     assert not (tmp_path / "deleted").exists()
     await web_client.aclose()

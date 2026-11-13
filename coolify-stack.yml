@@ -51,7 +51,7 @@ services:
       # socket peer for request.client.host (login rate limiting). Behind
       # Coolify's Traefik, set this to the proxy network (or "*" — the
       # service is only reachable through the platform proxy).
-      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1}
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
     volumes:
       - anki_mcp_data:/data
     healthcheck:

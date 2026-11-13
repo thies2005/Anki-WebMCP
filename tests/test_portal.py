@@ -113,7 +113,7 @@ def _csrf_from(html_text: str) -> str:
 
 async def _fresh_store(tmp_path) -> UserStore:
     """A new store instance reading what the app persisted to disk."""
-    return UserStore(str(tmp_path / "users.json"))
+    return UserStore(str(tmp_path / "users.json"), encryption_secret=SECRET)
 
 
 # ---------------------------------------------------------------------------

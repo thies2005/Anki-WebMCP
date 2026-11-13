@@ -390,9 +390,9 @@ async def test_tools_list_unchanged_names_and_review_deck_params(app_with_users)
             payload = _parse_mcp_response(res)
     tools = {t["name"]: t for t in payload["result"]["tools"]}
     reference = [name for _, names in TOOL_REFERENCE_GROUPS for name in names]
-    assert len(reference) == len(set(reference)) == 48
+    assert len(reference) == len(set(reference)) == 51
     assert set(tools) == set(reference)
     assert set(tools["get_review_queue"]["inputSchema"]["properties"]) == {"limit", "deck"}
     assert set(tools["answer_card"]["inputSchema"]["properties"]) == {
-        "card_id", "rating", "deck", "idempotency_key",
+        "card_id", "rating", "deck", "idempotency_key", "elapsed_ms",
     }

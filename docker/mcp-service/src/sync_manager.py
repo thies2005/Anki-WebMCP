@@ -82,6 +82,7 @@ class SyncManager:
         # on failure): a failed attempt must also throttle, or every tool call
         # would pay a full network timeout while AnkiWeb is down.
         self._pretool_guard = asyncio.Lock()
+        self._pretool_locks: Dict[str, asyncio.Lock] = {}
         self._last_pretool_sync: Dict[str, float] = {}
 
     @property
@@ -177,31 +178,43 @@ class SyncManager:
         if user is None or not (user.ankiweb_email and user.ankiweb_password):
             return
         async with self._pretool_guard:
+            user_lock = self._pretool_locks.get(username)
+            if user_lock is None:
+                user_lock = asyncio.Lock()
+                self._pretool_locks[username] = user_lock
+
+        async with user_lock:
+            ttl = self.settings.sync_before_tools_ttl_seconds
             now = time.monotonic()
             last = self._last_pretool_sync.get(username)
-            if last is not None and (now - last) < self.settings.sync_before_tools_ttl_seconds:
+            if last is not None and (now - last) < ttl:
                 return
-            self._last_pretool_sync[username] = now
-        try:
-            result = await self.registry.sync_user(
-                username,
-                user.ankiweb_email,
-                user.ankiweb_password,
-                on_step=self._on_step(username),
-                acquire_timeout=PRETOOL_SYNC_ACQUIRE_TIMEOUT_SECONDS,
-            )
-            if result.get("success"):
-                logger.debug("Pre-tool sync for %r ok", username)
-            else:
-                logger.warning(
-                    "Pre-tool sync for %r failed (tool proceeds on local data): %s",
+            try:
+                result = await self.registry.sync_user(
                     username,
-                    result.get("error"),
+                    user.ankiweb_email,
+                    user.ankiweb_password,
+                    on_step=self._on_step(username),
+                    acquire_timeout=PRETOOL_SYNC_ACQUIRE_TIMEOUT_SECONDS,
                 )
-        except Exception as exc:
-            logger.error(
-                "Pre-tool sync for %r raised (tool proceeds on local data): %s", username, exc
-            )
+                if result.get("success"):
+                    logger.debug("Pre-tool sync for %r ok", username)
+                else:
+                    logger.warning(
+                        "Pre-tool sync for %r failed (tool proceeds on local data): %s",
+                        username,
+                        result.get("error"),
+                    )
+            except Exception as exc:
+                logger.error(
+                    "Pre-tool sync for %r raised (tool proceeds on local data): %s",
+                    username,
+                    exc,
+                )
+            finally:
+                # Stamp completion AFTER sync_user returns so concurrent
+                # calls await completion instead of reading an unstamped/early TTL.
+                self._last_pretool_sync[username] = time.monotonic()
 
     def record_explicit_sync(self, username: str) -> None:
         """Stamp the pre-tool TTL as of NOW after a successful explicit sync.
@@ -301,7 +314,11 @@ class SyncManager:
                     try:
                         await ledger.record_success(idempotency_key, data)
                     except Exception as e:
-                        logger.error("Failed to commit idempotency record for sync key '%s': %s", idempotency_key, e)
+                        logger.error(
+                            "Failed to commit idempotency record for sync key %r: %s",
+                            idempotency_key[:64],
+                            e,
+                        )
                         warnings.append(_LEDGER_WRITE_WARNING)
                 logger.info("Manual synchronization with AnkiWeb completed for %r", username)
                 # Local and AnkiWeb just agreed — coordinate the pre-tool
@@ -332,7 +349,11 @@ class SyncManager:
                 try:
                     await ledger.record_failure(idempotency_key, err_msg)
                 except Exception as e:
-                    logger.error("Failed to record idempotency failure for sync key '%s': %s", idempotency_key, e)
+                    logger.error(
+                        "Failed to record idempotency failure for sync key %r: %s",
+                        idempotency_key[:64],
+                        e,
+                    )
                     warnings.append(_LEDGER_WRITE_WARNING)
             else:
                 logger.error("Synchronization failed for %r: %s", username, err_msg)
@@ -464,7 +485,11 @@ class SyncManager:
                     try:
                         await ledger.record_failure(idempotency_key, err_msg)
                     except Exception as ledger_exc:
-                        logger.error("Failed to record idempotency failure for key '%s': %s", idempotency_key, ledger_exc)
+                        logger.error(
+                            "Failed to record idempotency failure for key %r: %s",
+                            idempotency_key[:64],
+                            ledger_exc,
+                        )
                         warnings.append(_LEDGER_WRITE_WARNING)
                 return MutationResponse(
                     success=False,
@@ -478,7 +503,11 @@ class SyncManager:
                 try:
                     await ledger.record_success(idempotency_key, local_data)
                 except Exception as e:
-                    logger.error("Failed to commit idempotency record for key '%s': %s", idempotency_key, e)
+                    logger.error(
+                        "Failed to commit idempotency record for key %r: %s",
+                        idempotency_key[:64],
+                        e,
+                    )
                     warnings.append(_LEDGER_WRITE_WARNING)
 
             nudge = self._sync_nudge(username)

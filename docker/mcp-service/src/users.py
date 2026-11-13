@@ -33,6 +33,82 @@ from typing import Dict, List, Optional, Tuple
 
 from .toolpolicy import is_valid_pattern, validate_patterns
 
+_ENC_PREFIX = "enc:v1:"
+_ENC_KEY_DOMAIN = b"anki-mcp/users-enc/v1"
+_MAC_KEY_DOMAIN = b"anki-mcp/users-mac/v1"
+_ENC_NONCE_BYTES = 16
+
+
+def _b64u_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64u_decode(data: str) -> bytes:
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
+def _derive_at_rest_keys(secret: str) -> Tuple[bytes, bytes]:
+    secret_bytes = secret.encode("utf-8")
+    enc_key = hmac.new(secret_bytes, _ENC_KEY_DOMAIN, hashlib.sha256).digest()
+    mac_key = hmac.new(secret_bytes, _MAC_KEY_DOMAIN, hashlib.sha256).digest()
+    return enc_key, mac_key
+
+
+def _ctr_keystream(enc_key: bytes, nonce: bytes, length: int) -> bytes:
+    blocks: List[bytes] = []
+    counter = 0
+    remaining = length
+    while remaining > 0:
+        blocks.append(hashlib.sha256(enc_key + nonce + counter.to_bytes(4, "big")).digest())
+        counter += 1
+        remaining -= 32
+    return b"".join(blocks)[:length]
+
+
+def encrypt_secret_field(secret: str, plaintext: str) -> str:
+    """Encrypt ``plaintext`` with Encrypt-then-MAC (``enc:v1:...``) if ``secret`` is non-empty."""
+    if not plaintext or not secret:
+        return plaintext
+    enc_key, mac_key = _derive_at_rest_keys(secret)
+    nonce = secrets.token_bytes(_ENC_NONCE_BYTES)
+    pt_bytes = plaintext.encode("utf-8")
+    stream = _ctr_keystream(enc_key, nonce, len(pt_bytes))
+    ct = bytes(a ^ b for a, b in zip(pt_bytes, stream))
+    mac = hmac.new(mac_key, nonce + ct, hashlib.sha256).digest()
+    return f"{_ENC_PREFIX}{_b64u_encode(nonce)}:{_b64u_encode(ct)}:{_b64u_encode(mac)}"
+
+
+def decrypt_secret_field(secret: str, stored: str) -> str:
+    """Decrypt an ``enc:v1:...`` field, or pass through legacy unencrypted strings."""
+    if not stored:
+        return ""
+    if not stored.startswith(_ENC_PREFIX):
+        return stored
+    if not secret:
+        raise ValueError("Encrypted user-store field encountered without an encryption secret")
+    body = stored[len(_ENC_PREFIX):]
+    parts = body.split(":")
+    if len(parts) != 3:
+        raise ValueError("Malformed encrypted user-store field")
+    try:
+        nonce = _b64u_decode(parts[0])
+        ct = _b64u_decode(parts[1])
+        provided_mac = _b64u_decode(parts[2])
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"Malformed encrypted user-store field encoding: {e}") from e
+    if len(nonce) != _ENC_NONCE_BYTES or len(provided_mac) != 32:
+        raise ValueError("Invalid encrypted user-store field parameters")
+    enc_key, mac_key = _derive_at_rest_keys(secret)
+    expected_mac = hmac.new(mac_key, nonce + ct, hashlib.sha256).digest()
+    if not hmac.compare_digest(expected_mac, provided_mac):
+        raise ValueError("Encrypted user-store field failed integrity verification")
+    stream = _ctr_keystream(enc_key, nonce, len(ct))
+    pt_bytes = bytes(a ^ b for a, b in zip(ct, stream))
+    try:
+        return pt_bytes.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"Decrypted user-store field is not valid UTF-8: {e}") from e
+
 logger = logging.getLogger("anki_mcp.users")
 
 # Path-safety guard: usernames become directory names under DATA_DIR in later
@@ -187,8 +263,29 @@ class UserStore:
     would let a subsequent bootstrap overwrite every existing account.
     """
 
-    def __init__(self, file_path: str):
+    @staticmethod
+    def _discover_encryption_secret(file_path: str) -> str:
+        env_key = os.environ.get("DATA_ENCRYPTION_KEY", "").strip()
+        if env_key:
+            return env_key
+        env_session = os.environ.get("SESSION_SECRET", "").strip()
+        if env_session:
+            return env_session
+        secret_file = os.path.join(os.path.dirname(os.path.abspath(file_path)), ".session_secret")
+        if os.path.isfile(secret_file):
+            try:
+                with open(secret_file, "r", encoding="utf-8") as f:
+                    return f.read().strip()
+            except OSError:
+                return ""
+        return ""
+
+    def __init__(self, file_path: str, encryption_secret: Optional[str] = None):
         self.file_path = file_path
+        if encryption_secret is None:
+            self._encryption_secret = self._discover_encryption_secret(file_path)
+        else:
+            self._encryption_secret = encryption_secret.strip()
         self._lock = threading.RLock()
         self._users: Dict[str, User] = {}
         self._load()
@@ -216,9 +313,13 @@ class UserStore:
                     password_hash=record["password_hash"],
                     token_hash=record["token_hash"],
                     role=record["role"],
-                    token_plaintext=record.get("token_plaintext", ""),
+                    token_plaintext=decrypt_secret_field(
+                        self._encryption_secret, record.get("token_plaintext", "")
+                    ),
                     ankiweb_email=record.get("ankiweb_email", ""),
-                    ankiweb_password=record.get("ankiweb_password", ""),
+                    ankiweb_password=decrypt_secret_field(
+                        self._encryption_secret, record.get("ankiweb_password", "")
+                    ),
                     created_at=float(record.get("created_at", 0.0)),
                     # Tolerant load: records written before the session epoch
                     # existed simply start with "no revocation" (0.0).
@@ -257,10 +358,21 @@ class UserStore:
             dir=dir_name if dir_name else ".", prefix="users_", suffix=".tmp"
         )
         try:
+            serialized: Dict[str, Dict] = {}
+            for user in self._users.values():
+                rec = asdict(user)
+                if self._encryption_secret:
+                    if rec.get("token_plaintext"):
+                        rec["token_plaintext"] = encrypt_secret_field(
+                            self._encryption_secret, rec["token_plaintext"]
+                        )
+                    if rec.get("ankiweb_password"):
+                        rec["ankiweb_password"] = encrypt_secret_field(
+                            self._encryption_secret, rec["ankiweb_password"]
+                        )
+                serialized[user.username] = rec
             with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
-                json.dump(
-                    {user.username: asdict(user) for user in self._users.values()}, f, indent=2
-                )
+                json.dump(serialized, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
             # mkstemp already creates the file 0o600; re-assert in case of umask oddities.
@@ -465,6 +577,15 @@ class UserStore:
             user.ankiweb_password = password
             self._save_atomic()
         logger.info("Updated stored AnkiWeb credentials for %r", username)
+
+    def clear_ankiweb_credentials(self, username: str) -> None:
+        """Remove stored AnkiWeb email and password for ``username``."""
+        with self._lock:
+            user = self._get_locked(username)
+            user.ankiweb_email = ""
+            user.ankiweb_password = ""
+            self._save_atomic()
+        logger.info("Disconnected AnkiWeb credentials for %r", username)
 
     def set_disabled_tool_patterns(self, username: str, patterns: List[str]) -> List[str]:
         """Set the account's tool-disable rules (per-user gate layer).

@@ -7,11 +7,13 @@ import functools
 import hashlib
 import html
 import hmac
+import json
 import logging
 import os
 import secrets
 import tempfile
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.context import Context
@@ -34,11 +36,12 @@ from .collections import CollectionRegistry
 from .config import (
     Settings,
     _env_int,
+    get_encryption_secret,
     get_settings,
     load_or_create_session_secret,
     validate_deployment_config,
 )
-from .logging_util import setup_logging
+from .logging_util import redact_string, setup_logging
 from .models import (
     AddNotesInput,
     AddNoteTypeFieldInput,
@@ -50,6 +53,7 @@ from .models import (
     CreateDeckInput,
     CreateNoteTypeInput,
     DeleteDeckInput,
+    DeleteMediaInput,
     DeleteNoteTypeInput,
     DeleteNotesInput,
     FindAndReplaceInput,
@@ -79,6 +83,7 @@ from .models import (
     SetDueDateInput,
     StoreMediaInput,
     SuspendCardsInput,
+    SyncCollectionInput,
     TemplateInput,
     TemplateUpdateInput,
     UnburyCardsInput,
@@ -170,6 +175,11 @@ LOCAL_UNTIL_SYNCED_SUFFIX = (
 # test fails.
 _READ_ONLY_HINT = ToolAnnotations(read_only_hint=True)
 _MUTATING_HINT = ToolAnnotations(read_only_hint=False)
+_DESTRUCTIVE_HINT = ToolAnnotations(read_only_hint=False, destructive_hint=True)
+_IDEMPOTENT_WRITE_HINT = ToolAnnotations(
+    read_only_hint=False, destructive_hint=False, idempotent_hint=True
+)
+_NON_DESTRUCTIVE_WRITE_HINT = ToolAnnotations(read_only_hint=False, destructive_hint=False)
 
 # Reference grouping of every registered tool, for the portal/admin rule UIs.
 # Pinned by tests against tools/list so a renamed or newly added tool cannot
@@ -181,7 +191,7 @@ TOOL_REFERENCE_GROUPS: List[Tuple[str, List[str]]] = [
     ]),
     ("Notes", [
         "search_notes", "get_note", "get_notes", "add_notes", "update_note_fields",
-        "add_tags", "remove_tags", "delete_notes", "find_and_replace",
+        "add_tags", "remove_tags", "list_tags", "delete_notes", "find_and_replace",
         "find_duplicates",
     ]),
     ("Note types", [
@@ -198,8 +208,8 @@ TOOL_REFERENCE_GROUPS: List[Tuple[str, List[str]]] = [
         "unbury_cards", "reposition_new_cards",
     ]),
     ("Review", ["get_review_queue", "answer_card"]),
-    ("Media", ["store_media_file", "get_media_file", "list_media_files"]),
-    ("Sync & stats", ["get_collection_stats", "sync_collection"]),
+    ("Media", ["store_media_file", "get_media_file", "list_media_files", "delete_media_file"]),
+    ("Sync & stats", ["get_collection_stats", "get_sync_status", "sync_collection"]),
 ]
 
 
@@ -223,7 +233,9 @@ def _tool_status_chip(tool_name: str, global_patterns: List[str], user_patterns:
 settings: Settings = get_settings()
 logger: logging.Logger = setup_logging(settings.log_level)
 # Per-user account store: MCP tokens and AnkiWeb credentials.
-user_store: UserStore = UserStore(settings.users_file)
+user_store: UserStore = UserStore(
+    settings.users_file, encryption_secret=get_encryption_secret(settings)
+)
 # Per-user collection registry (Task 3): opened lazily per user; construction does no I/O.
 collection_registry: CollectionRegistry = CollectionRegistry(
     data_dir=settings.data_dir,
@@ -245,7 +257,7 @@ def _tool_error_response(exc: Exception) -> Dict[str, Any]:
     """
     return {
         "success": False,
-        "error": str(exc),
+        "error": redact_string(str(exc)),
         "error_type": type(exc).__name__,
     }
 
@@ -445,86 +457,43 @@ def _uvicorn_run_kwargs(settings: Settings) -> Dict[str, Any]:
     }
 
 
-_PAGE_CSS = """
-  body { font-family: system-ui, sans-serif; background: #f5f5f5; margin: 0;
-         display: flex; justify-content: center; padding-top: 10vh; }
-  main { background: #fff; border: 1px solid #ddd; border-radius: 6px;
-         padding: 2rem; width: 20rem; }
-  h1 { font-size: 1.25rem; margin: 0 0 0.5rem; }
-  label { display: block; margin: 0.75rem 0 0.25rem; }
-  input { width: 100%; padding: 0.4rem; box-sizing: border-box; }
-  button { margin-top: 1rem; padding: 0.45rem 1rem; cursor: pointer; }
-  .error { color: #b00020; margin-top: 1rem; }
-"""
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+_APP_CSS_BYTES = (_STATIC_DIR / "app.css").read_bytes()
+_APP_JS_BYTES = (_STATIC_DIR / "app.js").read_bytes()
 
-# Shared stylesheet for the portal/admin pages: one consistent header, stacked
-# section cards, plain HTML tables (wrapped for small screens).
-_APP_CSS = """
-  * { box-sizing: border-box; }
-  body { font-family: system-ui, sans-serif; background: #f5f5f5; margin: 0; color: #1a1a1a; }
-  main.app { max-width: 52rem; margin: 0 auto; padding: 1rem; }
-  header.top { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: center;
-               justify-content: space-between; background: #fff; border: 1px solid #ddd;
-               border-radius: 6px; padding: 0.75rem 1rem; margin-bottom: 1rem; }
-  header.top .brand { font-weight: 700; }
-  header.top nav { display: flex; gap: 0.9rem; align-items: center; flex-wrap: wrap; }
-  header.top form { display: inline; margin: 0; }
-  section { background: #fff; border: 1px solid #ddd; border-radius: 6px;
-            padding: 1rem 1.25rem; margin-bottom: 1rem; }
-  h1 { font-size: 1.25rem; margin: 0 0 0.5rem; }
-  h2 { font-size: 1.05rem; margin: 0 0 0.5rem; }
-  label { display: block; margin: 0.5rem 0 0.2rem; }
-  input, select { padding: 0.35rem; margin: 0 0.25rem 0.25rem 0; }
-  button { padding: 0.4rem 0.8rem; cursor: pointer; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { border: 1px solid #e3e3e3; padding: 0.4rem 0.55rem; text-align: left; vertical-align: top; }
-  th { background: #fafafa; }
-  .tablewrap { overflow-x: auto; }
-  td form { display: flex; flex-wrap: wrap; gap: 0.3rem; align-items: center;
-            margin: 0 0 0.45rem; }
-  .flash { border: 1px solid #b7d7b7; background: #eef7ee; color: #14532d;
-           border-radius: 6px; padding: 0.75rem 1rem; margin-bottom: 1rem;
-           white-space: pre-wrap; overflow-wrap: anywhere; }
-  .flash.success { border-color: #b7d7b7; background: #eef7ee; color: #14532d; }
-  .flash.error { border-color: #e5b4b4; background: #fdeeee; color: #b00020; }
-  .flash.token { border-color: #b4c7e5; background: #eef2fd; color: #1e3a5f; }
-  .flash.token pre { background: #fff; border: 1px solid #ccd; padding: 0.5rem;
-                     margin: 0.5rem 0; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .muted { color: #666; }
-  .ok { color: #14532d; }
-  .error { color: #b00020; }
-  textarea { font-family: ui-monospace, monospace; padding: 0.35rem; width: 100%; }
-  .chip { display: inline-block; border-radius: 999px; padding: 0.05rem 0.55rem;
-          font-size: 0.8rem; border: 1px solid #e3e3e3; white-space: nowrap; }
-  .chip.on { background: #eef7ee; color: #14532d; border-color: #b7d7b7; }
-  .chip.off-user { background: #fdf3e7; color: #7c4a03; border-color: #e5cfa4; }
-  .chip.off-global { background: #fdeeee; color: #b00020; border-color: #e5b4b4; }
-  code { background: #f4f4f4; padding: 0.1rem 0.35rem; border-radius: 4px; overflow-wrap: anywhere; }
-  pre.syncout { background: #fafafa; border: 1px solid #e3e3e3; border-radius: 4px;
-                padding: 0.6rem; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .decknode { border: 1px solid #e3e3e3; border-radius: 6px; margin: 0.25rem 0;
-              padding: 0.15rem 0.4rem; background: #fafafa; }
-  .decknode summary { cursor: pointer; display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: baseline; }
-  .decknode .deckname { font-weight: 600; flex: 1; }
-  .decknode .counts { color: #666; font-size: 0.9rem; }
-  .decknode .decknode { margin-left: 1.1rem; }
-"""
+# Retained as empty constants only in case external callers inspect attributes.
+_PAGE_CSS = ""
+_APP_CSS = ""
+
+_CONFIRM_DIALOG_HTML = """<dialog id="confirm-dialog" closedby="any" aria-labelledby="confirm-dialog-title">
+  <h2 id="confirm-dialog-title">Confirm action</h2>
+  <p id="confirm-dialog-message"></p>
+  <div class="btn-row">
+    <button type="button" id="confirm-dialog-cancel">Cancel</button>
+    <button type="button" id="confirm-dialog-ok" class="danger">Confirm</button>
+  </div>
+</dialog>"""
 
 
 def _page(title: str, body: str, css: str = _PAGE_CSS, main_class: str = "") -> str:
-    class_attr = f' class="{main_class}"' if main_class else ""
+    body_class = ' class="centered-page"' if not main_class else ""
+    main_cls = main_class or "auth-card"
+    dialog_html = _CONFIRM_DIALOG_HTML if main_class == "app" else ""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>{html.escape(title)}</title>
-<style>{css}</style>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
 </head>
-<body>
-<main{class_attr}>
+<body{body_class}>
+<main class="{html.escape(main_cls)}">
 {body}
 </main>
+{dialog_html}
 </body>
 </html>"""
 
@@ -629,16 +598,24 @@ def _flash_html(flash: Optional[Tuple[str, str]]) -> str:
         return ""
     kind, message = flash
     if kind == "token":
+        target_user = ""
+        token_value = message
+        if "\n" in message:
+            target_user, token_value = message.split("\n", 1)
+        user_note = f" for <strong>{html.escape(target_user)}</strong>" if target_user else ""
         return (
-            '<div class="flash token"><strong>'
-            "Copy this now &mdash; it will not be shown again.</strong>"
-            f'<pre id="flash-token">{html.escape(message)}</pre>'
-            '<button type="button" onclick="navigator.clipboard.writeText('
-            "document.getElementById('flash-token').textContent)\">Copy to clipboard</button>"
-            "</div>"
+            f'<div class="flash token" role="status"><strong>'
+            f"Copy this now{user_note} &mdash; it will not be shown again.</strong>"
+            f'<pre id="flash-token">{html.escape(token_value)}</pre>'
+            '<div class="btn-row">'
+            '<button type="button" class="small" data-copy-target="flash-token" '
+            'data-copy-status="flash-copy-status">Copy to clipboard</button>'
+            '<span id="flash-copy-status" class="copy-feedback" role="status" aria-live="polite"></span>'
+            "</div></div>"
         )
     css_class = "flash" if kind == "info" else f"flash {kind}"
-    return f'<div class="{css_class}">{html.escape(message)}</div>'
+    role = "alert" if kind == "error" else "status"
+    return f'<div class="{css_class}" role="{role}">{html.escape(message)}</div>'
 
 
 def _collect_deck_stats(col) -> Dict[str, Any]:
@@ -766,11 +743,21 @@ def _deck_section(stats: Optional[Dict[str, Any]]) -> str:
     for root in roots:
         _aggregate_deck(root)
     tree = "".join(_deck_node_html(root) for root in roots)
-    if not tree:
+    toolbar = ""
+    if tree:
+        toolbar = (
+            '<div class="deck-toolbar">'
+            '<input id="deck-filter" type="search" placeholder="Filter decks..." aria-label="Filter decks">'
+            '<button type="button" id="deck-expand-all" class="small">Expand all</button>'
+            '<button type="button" id="deck-collapse-all" class="small">Collapse all</button>'
+            "</div>"
+        )
+    else:
         tree = '<p class="muted">No decks yet.</p>'
     due = stats["due"]
     return f"""<section>
   <h2>Decks</h2>
+  {toolbar}
   {tree}
   <p class="muted">Due now: {due['new']} new, {due['learn']} learning, {due['review']} review.</p>
 </section>"""
@@ -786,14 +773,16 @@ def _human_size(num_bytes: int) -> str:
     return f"{size:.1f} TB"
 
 
-def _backup_section(csrf_token: str, backups: Optional[List[Dict[str, Any]]]) -> str:
-    """Version history: newest snapshots (When / Reason / Size) + row actions.
+def _backup_section(
+    csrf_token: str, backups: Optional[List[Dict[str, Any]]], show_all: bool = False
+) -> str:
+    """Version history: newest snapshots (When (UTC) / Reason / Size) + row actions.
 
     ``backups`` is a ``registry.list_backups`` record list (newest first) or
     None when the listing failed — a listing failure must not take the portal
-    down, mirroring the deck-stats posture. At most BACKUP_LIST_LIMIT rows
-    render; the rest collapse into one muted "+N older" line. Filenames ride
-    in query strings, so they are URL-escaped via html.escape(quote=True).
+    down, mirroring the deck-stats posture. By default at most BACKUP_LIST_LIMIT
+    rows render with a "+N older · Show all" control; ``show_all=True`` lists
+    every snapshot.
     """
     if backups is None:
         listing = '<p class="muted">Snapshot list is unavailable right now.</p>'
@@ -803,22 +792,33 @@ def _backup_section(csrf_token: str, backups: Optional[List[Dict[str, Any]]]) ->
             "every sync and destructive change.</p>"
         )
     else:
-        visible = backups[:BACKUP_LIST_LIMIT]
+        visible = backups if show_all else backups[:BACKUP_LIST_LIMIT]
         rows = "".join(
             f"<tr><td>{html.escape(str(entry['timestamp']))}</td>"
             f"<td><code>{html.escape(str(entry['reason']))}</code></td>"
             f"<td>{_human_size(int(entry['size_bytes']))}</td>"
             '<td><a href="/portal/backup/confirm?file='
-            f'{html.escape(str(entry["filename"]))}">Restore</a> '
+            f'{html.escape(str(entry["filename"]))}">Restore</a> &middot; '
             '<a href="/portal/backup/download?file='
             f'{html.escape(str(entry["filename"]))}">Download</a></td></tr>'
             for entry in visible
         )
         older = len(backups) - len(visible)
-        older_note = f'<p class="muted">+{older} older</p>' if older > 0 else ""
+        if show_all and len(backups) > BACKUP_LIST_LIMIT:
+            older_note = (
+                f'<p class="muted">Showing all {len(backups)} snapshots &middot; '
+                f'<a href="/">Show recent {BACKUP_LIST_LIMIT}</a></p>'
+            )
+        elif older > 0:
+            older_note = (
+                f'<p class="muted">+{older} older &middot; '
+                '<a href="/?backups=all">Show all</a></p>'
+            )
+        else:
+            older_note = ""
         listing = (
             f"""<div class="tablewrap"><table>
-      <thead><tr><th>When</th><th>Reason</th><th>Size</th><th>Actions</th></tr></thead>
+      <thead><tr><th>When (UTC)</th><th>Reason</th><th>Size</th><th>Actions</th></tr></thead>
       <tbody>{rows}</tbody>
     </table></div>
     {older_note}"""
@@ -882,6 +882,10 @@ def _portal_page(
     stats: Optional[Dict[str, Any]],
     backups: Optional[List[Dict[str, Any]]],
     token_mask: str,
+    *,
+    grants: Optional[List[Dict[str, Any]]] = None,
+    show_all_backups: bool = False,
+    mcp_path: str = "/mcp",
 ) -> str:
     if token_mask:
         token_state = (
@@ -896,6 +900,60 @@ def _portal_page(
         if user.ankiweb_email
         else '<p class="muted">Not set.</p>'
     )
+    disconnect_controls = ""
+    if user.ankiweb_email:
+        disconnect_controls = f"""
+  <div class="btn-row">
+    <form method="post" action="/portal/credentials/test">
+      <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
+      <button type="submit">Test connection</button>
+    </form>
+    <form method="post" action="/portal/credentials/disconnect"
+          data-confirm-title="Disconnect AnkiWeb"
+          data-confirm-message="Remove saved AnkiWeb credentials for this account? Automatic syncs will stop until you sign in again."
+          data-confirm-cta="Disconnect">
+      <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
+      <button type="submit" class="danger">Disconnect</button>
+    </form>
+  </div>"""
+
+    grants_list = grants or []
+    if grants_list:
+        grant_rows = "".join(
+            f"<tr><td>{html.escape(str(g['client_name']))}</td>"
+            f"<td>{html.escape(time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(float(g['created_at'] or 0.0))) if g.get('created_at') else '—')}</td>"
+            f"""<td><form method="post" action="/portal/oauth/revoke"
+                  data-confirm-title="Revoke OAuth app"
+                  data-confirm-message="Disconnect this OAuth app? Its active and refresh tokens will stop working immediately."
+                  data-confirm-cta="Revoke">
+              <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
+              <input type="hidden" name="grant_id" value="{html.escape(str(g['grant_id']))}">
+              <button type="submit" class="danger small">Revoke</button>
+            </form></td></tr>"""
+            for g in grants_list
+        )
+        oauth_body = (
+            '<div class="tablewrap"><table>'
+            "<thead><tr><th>App</th><th>Authorized (UTC)</th><th>Action</th></tr></thead>"
+            f"<tbody>{grant_rows}</tbody></table></div>"
+        )
+    else:
+        oauth_body = '<p class="muted">No connected OAuth apps yet. Connectors like Claude Desktop or claude.ai appear here after consent.</p>'
+
+    escaped_path = html.escape(mcp_path)
+    config_template = (
+        '{\n'
+        '  "mcpServers": {\n'
+        '    "anki": {\n'
+        f'      "url": "__ORIGIN__{escaped_path}",\n'
+        '      "headers": {\n'
+        '        "Authorization": "Bearer YOUR_MCP_TOKEN"\n'
+        '      }\n'
+        '    }\n'
+        '  }\n'
+        '}'
+    )
+
     body = f"""{_app_header(user, csrf_token)}
 {_flash_html(flash)}
 <section>
@@ -905,25 +963,65 @@ def _portal_page(
   <strong>Regenerate token</strong> &mdash; so copy it immediately; it is never
   displayed again afterwards.</p>
   {token_state}
-  <form method="post" action="/portal/regenerate-token">
+  <form method="post" action="/portal/regenerate-token"
+        data-confirm-title="Regenerate MCP token"
+        data-confirm-message="Your previous static Bearer token and active sessions using it will stop working immediately. OAuth apps stay connected."
+        data-confirm-cta="Regenerate token">
     <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
     <button type="submit">Regenerate token</button>
   </form>
 </section>
+<section>
+  <h2>MCP client setup</h2>
+  <p>Point OAuth-compatible connectors (Claude Desktop, claude.ai) at your MCP URL, or pass your Bearer token in <code>Authorization</code> for Cursor/CLI clients.</p>
+  <p>Endpoint: <code id="mcp-endpoint" data-origin-template="__ORIGIN__{escaped_path}">{escaped_path}</code>
+    <button type="button" class="small" data-copy-target="mcp-endpoint" data-copy-status="mcp-url-status">Copy URL</button>
+    <span id="mcp-url-status" class="copy-feedback" role="status" aria-live="polite"></span>
+  </p>
+  <pre id="mcp-config-snippet" class="snippet" data-origin-template="{html.escape(config_template, quote=True)}">{html.escape(config_template.replace('__ORIGIN__', ''))}</pre>
+  <div class="btn-row">
+    <button type="button" class="small" data-copy-target="mcp-config-snippet" data-copy-status="mcp-cfg-status">Copy JSON config</button>
+    <span id="mcp-cfg-status" class="copy-feedback" role="status" aria-live="polite"></span>
+  </div>
+</section>
 {_deck_section(stats)}
-{_backup_section(csrf_token, backups)}
+{_backup_section(csrf_token, backups, show_all=show_all_backups)}
 <section>
   <h2>AnkiWeb credentials</h2>
-  <p>Needed to synchronize with AnkiWeb. The password is stored for the sync
-  service and never displayed.</p>
+  <p>Needed to synchronize with AnkiWeb. Credentials are encrypted at rest when
+  a deployment secret is configured and never displayed.</p>
   {credentials_state}
   <form method="post" action="/portal/credentials">
     <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
     <label for="ankiweb-email">AnkiWeb email</label>
-    <input id="ankiweb-email" name="email" type="email" autocomplete="off">
+    <input id="ankiweb-email" name="email" type="email" autocomplete="off" required>
     <label for="ankiweb-password">AnkiWeb password</label>
-    <input id="ankiweb-password" name="password" type="password" autocomplete="new-password">
-    <button type="submit">Save credentials</button>
+    <input id="ankiweb-password" name="password" type="password" autocomplete="new-password" required>
+    <div class="btn-row">
+      <button type="submit" class="primary">Save credentials</button>
+    </div>
+  </form>
+  {disconnect_controls}
+</section>
+<section>
+  <h2>Connected OAuth apps</h2>
+  <p>Revoking an app invalidates its OAuth access and refresh tokens immediately without rotating your personal MCP token.</p>
+  {oauth_body}
+</section>
+<section>
+  <h2>Account password</h2>
+  <p>Change your web portal sign-in password (minimum 8 characters). Active sessions in other browsers will be signed out.</p>
+  <form method="post" action="/portal/password">
+    <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
+    <label for="pw-current">Current password</label>
+    <input id="pw-current" name="current_password" type="password" autocomplete="current-password" required>
+    <label for="pw-new">New password</label>
+    <input id="pw-new" name="new_password" type="password" autocomplete="new-password" minlength="8" required>
+    <label for="pw-confirm">Confirm new password</label>
+    <input id="pw-confirm" name="confirm_password" type="password" autocomplete="new-password" minlength="8" required>
+    <div class="btn-row">
+      <button type="submit">Update password</button>
+    </div>
   </form>
 </section>
 <section>
@@ -931,20 +1029,17 @@ def _portal_page(
   <p>Backs up this account's collection locally, then syncs it with AnkiWeb.</p>
   <form method="post" action="/portal/sync">
     <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
-    <button type="submit">Sync now</button>
+    <button type="submit" class="primary">Sync now</button>
   </form>
 </section>"""
     return _page("Anki MCP - Portal", body, css=_APP_CSS, main_class="app")
 
 
-def _sync_result_page(result: Dict[str, Any], csrf_token: str) -> str:
-    """Render the sync_user result dict on a dedicated page.
-
-    A dedicated page (not a flash cookie) because sync output/error text is
-    unbounded and would not fit the cookie budget. When the failure is the
-    FULL_SYNC direction demand, the page offers the two explicit choices as
-    separate CSRF-protected buttons — the direction is never pre-selected.
-    """
+def _sync_result_page(
+    result: Dict[str, Any], csrf_token: str, user: Optional[User] = None
+) -> str:
+    """Render the sync_user result dict on a dedicated page."""
+    header = f"{_app_header(user, csrf_token)}\n" if user is not None else ""
     if result.get("success"):
         detail = (
             '<p class="ok">Sync succeeded.</p>'
@@ -981,7 +1076,7 @@ def _sync_result_page(result: Dict[str, Any], csrf_token: str) -> str:
 </section>"""
     return _page(
         "Anki MCP - Sync result",
-        f"<h1>Sync result</h1>\n{detail}\n<p><a href=\"/\">Back to portal</a></p>",
+        f"{header}<section><h1>Sync result</h1>\n{detail}\n<p><a href=\"/\">Back to portal</a></p></section>",
         css=_APP_CSS,
         main_class="app",
     )
@@ -993,13 +1088,11 @@ def _admin_page(
     flash: Optional[Tuple[str, str]],
     accounts: List[User],
     global_patterns: Optional[List[str]] = None,
+    *,
+    maintenance_mode: bool = False,
+    active_sessions: int = 0,
 ) -> str:
-    """Admin console: create-user form plus one action cell per account.
-
-    The table shows no secrets: credentials are shown as a masked email and the
-    token column only says whether a token exists. The global tool-rules
-    section edits the deny layer applied to EVERY account (admins included).
-    """
+    """Admin console: service status, create-user form, users table, and global tool rules."""
     global_patterns = global_patterns if global_patterns is not None else []
     hidden = (
         f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">'
@@ -1025,18 +1118,24 @@ def _admin_page(
         forms = {
             "set-role": f"""<form method="post" action="/admin/set-role">{hidden.format(name=name)}
       <select name="role" aria-label="New role for {name}">{role_options}</select>
-      <button type="submit">Set role</button>
+      <button type="submit" class="small">Set role</button>
     </form>""",
             "reset-password": f"""<form method="post" action="/admin/reset-password">{hidden.format(name=name)}
       <input name="new_password" type="password" placeholder="new password" required aria-label="New password for {name}">
-      <button type="submit">Reset password</button>
+      <button type="submit" class="small">Reset password</button>
     </form>""",
-            "regenerate-token": f"""<form method="post" action="/admin/regenerate-token">{hidden.format(name=name)}
-      <button type="submit">Regenerate token</button>
+            "regenerate-token": f"""<form method="post" action="/admin/regenerate-token"
+                  data-confirm-title="Regenerate token"
+                  data-confirm-message="Invalidate {name}'s existing MCP token and close its active MCP sessions?"
+                  data-confirm-cta="Regenerate token">{hidden.format(name=name)}
+      <button type="submit" class="small">Regenerate token</button>
     </form>""",
-            "delete-user": f"""<form method="post" action="/admin/delete-user">{hidden.format(name=name)}
+            "delete-user": f"""<form method="post" action="/admin/delete-user"
+                  data-confirm-title="Delete user account"
+                  data-confirm-message="Archive {name}'s data directory under deleted/ and remove the account?"
+                  data-confirm-cta="Delete user">{hidden.format(name=name)}
       <input name="confirm_username" placeholder="type username to confirm" aria-label="Confirm delete of {name}">
-      <button type="submit">Delete</button>
+      <button type="submit" class="danger small">Delete</button>
     </form>""",
         }
         rows.append(
@@ -1049,8 +1148,28 @@ def _admin_page(
   <td>{forms['set-role']}{forms['reset-password']}{forms['regenerate-token']}{forms['delete-user']}</td>
 </tr>"""
         )
+    maint_chip = (
+        '<span class="chip off-global">paused (maintenance on)</span>'
+        if maintenance_mode
+        else '<span class="chip on">active (normal)</span>'
+    )
+    next_maint = "false" if maintenance_mode else "true"
+    maint_cta = "Disable maintenance mode" if maintenance_mode else "Enable maintenance mode"
     body = f"""{_app_header(user, csrf_token)}
 {_flash_html(flash)}
+<section>
+  <h2>Service status &amp; maintenance</h2>
+  <div class="stat-grid">
+    <div class="stat-card"><div class="stat-label">Accounts</div><div class="stat-value">{len(accounts)}</div></div>
+    <div class="stat-card"><div class="stat-label">Active /mcp sessions</div><div class="stat-value">{int(active_sessions)}</div></div>
+    <div class="stat-card"><div class="stat-label">Writes &amp; syncs</div><div class="stat-value">{maint_chip}</div></div>
+  </div>
+  <form method="post" action="/admin/maintenance" class="btn-row">
+    <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
+    <input type="hidden" name="enabled" value="{next_maint}">
+    <button type="submit">{maint_cta}</button>
+  </form>
+</section>
 <section>
   <h2>Create user</h2>
   <form method="post" action="/admin/create-user">
@@ -1061,7 +1180,7 @@ def _admin_page(
     <input id="new-password" name="password" type="password" required>
     <label for="new-role">Role</label>
     <select id="new-role" name="role"><option value="user">user</option><option value="admin">admin</option></select>
-    <button type="submit">Create user</button>
+    <div class="btn-row"><button type="submit" class="primary">Create user</button></div>
   </form>
   <p class="muted">The new account's MCP token is shown once after creation &mdash; copy it for the user.</p>
 </section>
@@ -1079,36 +1198,60 @@ def _admin_page(
   <p class="muted">These disable rules apply to EVERY account (admins included) and cannot be
   overridden: users may add their own rules on their Tools page, but nothing can re-enable a
   tool matched here. Same grammar as user rules &mdash; exact tool name or trailing-* prefix.</p>
-  {_tool_rules_form('/admin/tool-rules', csrf_token, global_patterns, 'Save global rules')}
-  {_tool_reference_html(global_patterns, [])}
+  {_tool_rules_form('/admin/tool-rules', csrf_token, global_patterns, 'Save global rules', include_presets=True)}
+  {_tool_reference_html(global_patterns, [], interactive=True)}
 </section>"""
     return _page("Anki MCP - Admin", body, css=_APP_CSS, main_class="app")
 
 
 def _tool_rules_form(
-    action: str, csrf_token: str, patterns: List[str], button_label: str
+    action: str,
+    csrf_token: str,
+    patterns: List[str],
+    button_label: str,
+    *,
+    include_presets: bool = False,
 ) -> str:
     """Shared rules editor for the portal (own rules) and admin (global)."""
+    presets = ""
+    if include_presets:
+        presets = (
+            '<div class="preset-bar">'
+            '<button type="button" class="small" data-rule-preset="destructive">Stage disable destructive</button>'
+            '<button type="button" class="small" data-rule-preset="no-sync">Stage disable sync</button>'
+            '<button type="button" class="small" data-rule-preset="clear">Clear staged rules</button>'
+            "</div>"
+        )
     return f"""<form method="post" action="{html.escape(action)}">
   <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
   <label for="patterns">One rule per line &mdash; an exact tool name (sync_collection) or a trailing-* prefix (delete_*)</label>
+  {presets}
   <textarea id="patterns" name="patterns" rows="4" spellcheck="false">{html.escape(chr(10).join(patterns))}</textarea>
-  <button type="submit">{html.escape(button_label)}</button>
+  <div class="btn-row"><button type="submit" class="primary">{html.escape(button_label)}</button></div>
 </form>"""
 
 
-def _tool_reference_html(global_patterns: List[str], user_patterns: List[str]) -> str:
+def _tool_reference_html(
+    global_patterns: List[str], user_patterns: List[str], *, interactive: bool = False
+) -> str:
     """Grouped per-tool status table (used by both the Tools page and admin)."""
     sections = []
+    action_header = "<th>Toggle</th>" if interactive else ""
     for group, names in TOOL_REFERENCE_GROUPS:
         rows = "".join(
             f'<tr><td><code>{html.escape(n)}</code></td>'
-            f"<td>{_tool_status_chip(n, global_patterns, user_patterns)}</td></tr>"
+            f"<td>{_tool_status_chip(n, global_patterns, user_patterns)}</td>"
+            + (
+                f'<td><button type="button" class="small" data-tool-toggle="{html.escape(n)}" aria-pressed="false">Stage disable</button></td>'
+                if interactive
+                else ""
+            )
+            + "</tr>"
             for n in names
         )
         sections.append(
             f'<h3>{html.escape(group)}</h3>'
-            '<div class="tablewrap"><table><thead><tr><th>Tool</th><th>Status</th></tr></thead>'
+            f'<div class="tablewrap"><table><thead><tr><th>Tool</th><th>Status</th>{action_header}</tr></thead>'
             f"<tbody>{rows}</tbody></table></div>"
         )
     return "\n".join(sections)
@@ -1156,12 +1299,12 @@ def _tools_page(
 <section>
   <h2>Your disabled-tool rules</h2>
   <p class="muted">These rules apply only to your account's MCP token and OAuth connections. A matching tool call is refused with an explanatory error. Deny-only: a tool disabled here or by a global rule cannot be re-enabled by another rule.</p>
-  {_tool_rules_form('/portal/tools/disabled', csrf_token, user.disabled_tool_patterns, 'Save rules')}
+  {_tool_rules_form('/portal/tools/disabled', csrf_token, user.disabled_tool_patterns, 'Save rules', include_presets=True)}
 </section>
 <section>
   <h2>All tools</h2>
   <p class="muted">{global_note}</p>
-  {_tool_reference_html(global_patterns, user.disabled_tool_patterns)}
+  {_tool_reference_html(global_patterns, user.disabled_tool_patterns, interactive=True)}
 </section>"""
     return _page("Anki MCP - Tools", body, css=_APP_CSS, main_class="app")
 
@@ -1273,25 +1416,79 @@ class BoundedSessionManager:
         user_store: UserStore,
         mcp_path: str,
         max_sessions: int,
+        oauth_store: Optional[OAuthStore] = None,
     ):
         self._sdk = session_manager  # SDK StreamableHTTPSessionManager
         self._users = user_store
+        self._oauth = oauth_store
         self.mcp_path = mcp_path
         self.max_sessions = max_sessions
         cap = _env_int("MCP_MAX_SESSIONS_PER_USER", MCP_DEFAULT_MAX_SESSIONS_PER_USER)
         self.max_per_user = max(1, min(cap, max_sessions))
-        # session_id -> (username, token_hash) of the credential that created it.
+        # session_id -> (username, auth_binding) of the credential that created it.
         self._session_owners: Dict[str, Tuple[str, str]] = {}
         # Monotonic time of each session's last request through this guard:
         # the eviction victim is the caller's own least-recently-used session.
         self._last_seen: Dict[str, float] = {}
-        # Serializes per-user admission (count + evict) so two concurrent
+        # Serializes per-user admission (count + evict + bind) so two concurrent
         # opens by one account cannot both pass the cap check.
         self._admission_lock = asyncio.Lock()
+
+    async def handle_asgi(self, scope, receive, send, next_app) -> None:
+        """Pure-ASGI ownership gate + per-user fairness without buffering SSE streams."""
+        state = scope.get("state") or {}
+        username: Optional[str] = state.get("username")
+        auth_binding: str = state.get("auth_binding") or ""
+        req_headers = MutableHeaders(scope=scope)
+        session_id = req_headers.get(MCP_SESSION_ID_HEADER)
+        method = (scope.get("method") or "GET").upper()
+
+        if session_id is not None:
+            self._reap_expired()
+            if session_id in self._sdk._server_instances:
+                refusal = await self._enforce_owner(session_id, username)
+                if refusal is not None:
+                    await refusal(scope, receive, send)
+                    return
+                self._last_seen[session_id] = time.monotonic()
+            await next_app(scope, receive, send)
+            return
+
+        if method != "POST":
+            await next_app(scope, receive, send)
+            return
+
+        # POST without mcp-session-id: hold _admission_lock through eviction AND
+        # until http.response.start delivers the newly minted mcp-session-id so
+        # concurrent opens cannot race past max_per_user, without holding the
+        # lock across long-lived streaming bodies.
+        locked = False
+        await self._admission_lock.acquire()
+        locked = True
+        try:
+            await self._make_room_for_locked(username)
+
+            async def send_and_bind(message):
+                nonlocal locked
+                if message["type"] == "http.response.start":
+                    resp_headers = MutableHeaders(raw=message.get("headers", []))
+                    new_sid = resp_headers.get(MCP_SESSION_ID_HEADER)
+                    if new_sid:
+                        self._bind_session_id(new_sid, username, auth_binding)
+                    if locked:
+                        locked = False
+                        self._admission_lock.release()
+                await send(message)
+
+            await next_app(scope, receive, send_and_bind)
+        finally:
+            if locked:
+                self._admission_lock.release()
 
     async def handle_request(self, request: Request, call_next) -> Response:
         """Ownership gate + per-user fairness for one authenticated /mcp request."""
         username: Optional[str] = getattr(request.state, "username", None)
+        auth_binding: str = getattr(request.state, "auth_binding", "") or ""
         session_id = request.headers.get(MCP_SESSION_ID_HEADER)
 
         if session_id is not None:
@@ -1301,22 +1498,14 @@ class BoundedSessionManager:
                 if refusal is not None:
                     return refusal
                 self._last_seen[session_id] = time.monotonic()
-            # Unknown/expired id: fall through — the SDK answers 404.
-        elif session_id is None and request.method == "POST":
-            # A POST without a session id is the only request that opens a
-            # session: make room under this account's cap BEFORE dispatching,
-            # so the SDK's own admission (which answers 503 at the global cap)
-            # actually has a slot to hand out.
-            await self._make_room_for(username)
-
-        response = await call_next(request)
-
-        if session_id is None and request.method == "POST":
-            # Bind whichever session this request created: the SDK puts the
-            # new id in the response headers (absent when it answered 503 or
-            # the request never established a session).
-            self._bind_created_session(response, username)
-        return response
+            return await call_next(request)
+        if request.method == "POST":
+            async with self._admission_lock:
+                await self._make_room_for_locked(username)
+                response = await call_next(request)
+                self._bind_created_session(response, username, auth_binding)
+                return response
+        return await call_next(request)
 
     async def _enforce_owner(self, session_id: str, username: Optional[str]) -> Optional[Response]:
         """Refuse (and for same-user token changes, close) a foreign/stale session."""
@@ -1326,14 +1515,20 @@ class BoundedSessionManager:
         owner_name, owner_token_hash = owner
         if username == owner_name:
             current = self._users.get_user(username)
-            if current is not None and current.token_hash == owner_token_hash:
-                return None
+            if current is not None:
+                if owner_token_hash.startswith("oauth:"):
+                    gid = owner_token_hash[len("oauth:") :]
+                    if self._oauth is None or any(
+                        g["grant_id"] == gid for g in self._oauth.list_user_grants(username)
+                    ):
+                        return None
+                elif current.token_hash == owner_token_hash:
+                    return None
             # Same account, but the credential that created this session no
-            # longer exists (token rotated/reset, account deleted): the stale
-            # transport must not outlive its token. Close it, then 401.
+            # longer exists (token rotated/reset, grant revoked, account deleted).
             await self._close_session(session_id)
             logger.warning(
-                "Closed /mcp session %.16s of %r: token hash changed since it was created",
+                "Closed /mcp session %.16s of %r: credential changed or revoked since creation",
                 session_id,
                 username,
             )
@@ -1350,51 +1545,56 @@ class BoundedSessionManager:
         )
         return JSONResponse({"error": "Session belongs to another user"}, status_code=403)
 
-    async def _make_room_for(self, username: Optional[str]) -> None:
-        """At the user's cap, evict their own least-recently-used session."""
+    async def _make_room_for_locked(self, username: Optional[str]) -> None:
+        """Caller holds ``_admission_lock``. At the user's cap, evict LRU session."""
         if not username:
             return
         self._reap_expired()
-        if len(self._owned_sessions(username)) < self.max_per_user:
+        owned = self._owned_sessions(username)
+        if len(owned) < self.max_per_user:
             return
-        async with self._admission_lock:
-            # Recount under the lock: a concurrent open by the same account
-            # may have evicted or been admitted in the meantime.
-            owned = self._owned_sessions(username)
-            if len(owned) < self.max_per_user:
-                return
-            victim = min(owned, key=lambda sid: self._last_seen.get(sid, 0.0))
-            await self._close_session(victim)
-            logger.info(
-                "Evicted /mcp session %.16s of %r at the per-user cap (%d)",
-                victim,
-                username,
-                self.max_per_user,
-            )
+        victim = min(owned, key=lambda sid: self._last_seen.get(sid, 0.0))
+        await self._close_session(victim)
+        logger.info(
+            "Evicted /mcp session %.16s of %r at the per-user cap (%d)",
+            victim,
+            username,
+            self.max_per_user,
+        )
 
-    def _bind_created_session(self, response: Response, username: Optional[str]) -> None:
-        """Bind a newly created session id to the (username, current token hash)."""
-        if not username:
-            return
-        new_session_id = response.headers.get(MCP_SESSION_ID_HEADER)
-        if not new_session_id:
+    async def _make_room_for(self, username: Optional[str]) -> None:
+        """At the user's cap, evict their own least-recently-used session."""
+        async with self._admission_lock:
+            await self._make_room_for_locked(username)
+
+    def _bind_session_id(
+        self, new_session_id: str, username: Optional[str], auth_binding: str = ""
+    ) -> None:
+        if not username or not new_session_id:
             return
         user = self._users.get_user(username)
         if user is None:
             return
-        self._session_owners[new_session_id] = (username, user.token_hash)
+        self._session_owners[new_session_id] = (username, auth_binding or user.token_hash)
         self._last_seen[new_session_id] = time.monotonic()
+
+    def _bind_created_session(
+        self, response: Response, username: Optional[str], auth_binding: str = ""
+    ) -> None:
+        """Bind a newly created session id to the (username, current credential binding)."""
+        new_session_id = response.headers.get(MCP_SESSION_ID_HEADER)
+        if new_session_id:
+            self._bind_session_id(new_session_id, username, auth_binding)
+
+    def active_session_count(self) -> int:
+        self._reap_expired()
+        return len(self._sdk._server_instances)
 
     def _owned_sessions(self, username: str) -> List[str]:
         return [sid for sid, (owner, _h) in self._session_owners.items() if owner == username]
 
     def _reap_expired(self) -> None:
-        """Drop owner/last-seen entries whose session the SDK already discarded.
-
-        The SDK forgets a session itself (client DELETE, idle timeout, failed
-        initialize); our side of the table is cleaned here, on every request
-        that touches an existing session.
-        """
+        """Drop owner/last-seen entries whose session the SDK already discarded."""
         for sid in [s for s in self._session_owners if s not in self._sdk._server_instances]:
             self._session_owners.pop(sid, None)
             self._last_seen.pop(sid, None)
@@ -1405,42 +1605,35 @@ class BoundedSessionManager:
         self._last_seen.pop(session_id, None)
         transport = self._sdk._server_instances.pop(session_id, None)
         if transport is not None and not transport.is_terminated:
-            # Shielded like the SDK's own _discard_session: the transport
-            # must be torn down even if the caller is being cancelled.
             with anyio.CancelScope(shield=True):
                 await transport.terminate()
 
     async def drop_user_sessions(self, username: str) -> int:
-        """Close and remove every /mcp session owned by ``username``.
-
-        Called when an account's token is regenerated, its password is reset,
-        or the account is deleted: transports created under the old credential
-        must not survive it.
-        """
-        self._reap_expired()
-        owned = self._owned_sessions(username)
-        for sid in owned:
-            await self._close_session(sid)
+        """Close and remove every /mcp session owned by ``username``."""
+        async with self._admission_lock:
+            self._reap_expired()
+            owned = self._owned_sessions(username)
+            for sid in owned:
+                await self._close_session(sid)
         if owned:
             logger.info("Dropped %d /mcp session(s) of %r", len(owned), username)
         return len(owned)
 
 
 class SecurityHeadersMiddleware:
-    """Baseline security headers on every HTTP response (audit F-13).
-
-    Pure-ASGI send wrapper (no BaseHTTPMiddleware task overhead): each default
-    header is set only when the response does not already carry it, so a
-    handler or an outer middleware can always override. ``nosniff`` stops
-    MIME-confusion sniffing, ``DENY`` keeps the portal/admin pages out of
-    framing and clickjacking shells, and ``no-referrer`` keeps session-bearing
-    URLs out of Referer headers on outbound navigation.
-    """
+    """Baseline security headers + strict CSP + optional HSTS on every HTTP response."""
 
     _DEFAULT_HEADERS = (
         ("x-content-type-options", "nosniff"),
         ("x-frame-options", "DENY"),
         ("referrer-policy", "no-referrer"),
+        ("permissions-policy", "geolocation=(), microphone=(), camera=()"),
+        (
+            "content-security-policy",
+            "default-src 'self'; script-src 'self'; style-src 'self'; "
+            "img-src 'self' data:; object-src 'none'; base-uri 'self'; "
+            "frame-ancestors 'none'; form-action 'self' https: http://localhost:* http://127.0.0.1:* http://[::1]:*",
+        ),
     )
 
     def __init__(self, app):
@@ -1451,12 +1644,16 @@ class SecurityHeadersMiddleware:
             await self.app(scope, receive, send)
             return
 
+        use_hsts = secure_cookies_enabled()
+
         async def send_with_security_headers(message):
             if message["type"] == "http.response.start":
                 headers = MutableHeaders(raw=message["headers"])
                 for name, value in self._DEFAULT_HEADERS:
                     if name not in headers:
                         headers[name] = value
+                if use_hsts and "strict-transport-security" not in headers:
+                    headers["strict-transport-security"] = "max-age=31536000; includeSubDomains"
             await send(message)
 
         await self.app(scope, receive, send_with_security_headers)
@@ -1468,7 +1665,9 @@ def create_app(custom_settings: Optional[Settings] = None):
     if custom_settings:
         settings = custom_settings
         logger = setup_logging(settings.log_level)
-        user_store = UserStore(settings.users_file)
+        user_store = UserStore(
+            settings.users_file, encryption_secret=get_encryption_secret(settings)
+        )
         collection_registry = CollectionRegistry(
             data_dir=settings.data_dir,
             idle_timeout_minutes=settings.idle_timeout_minutes,
@@ -1725,26 +1924,34 @@ def create_app(custom_settings: Optional[Settings] = None):
         "with a direction only the account owner may choose — retry once with full_sync_direction="
         "'upload' (replace AnkiWeb's copy with this service's collection) or 'download' (replace "
         "this service's collection with AnkiWeb's; a local backup is taken first). The argument is "
-        "ignored for regular syncs.",
-        annotations=_MUTATING_HINT,
+        "ignored for regular syncs. Optional idempotency_key prevents duplicate retries.",
+        annotations=_NON_DESTRUCTIVE_WRITE_HINT,
     )
     @_tool_guard
     async def sync_collection(
         full_sync_direction: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
         ctx: Context = None,
     ) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
             return _unauthorized_tool_response()
         try:
-            return await sync_tools.sync_collection(tool_sync_manager, username, full_sync_direction)
+            parsed = SyncCollectionInput(
+                full_sync_direction=full_sync_direction,
+                idempotency_key=idempotency_key,
+            )
+            return await sync_tools.sync_collection(
+                tool_sync_manager, username, parsed.full_sync_direction, parsed.idempotency_key
+            )
         except Exception as e:
             return _tool_error_response(e)
 
     # 6. add_notes
     @mcp.tool(
         description="Add notes to the collection with duplicate prevention and per-user idempotency."
-                     + LOCAL_UNTIL_SYNCED_SUFFIX
+                     + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_NON_DESTRUCTIVE_WRITE_HINT,
     )
     @_tool_guard
     async def add_notes(
@@ -1768,7 +1975,10 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 7. update_note_fields
-    @mcp.tool(description="Update fields on an existing note." + LOCAL_UNTIL_SYNCED_SUFFIX)
+    @mcp.tool(
+        description="Update fields on an existing note." + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_IDEMPOTENT_WRITE_HINT,
+    )
     @_tool_guard
     async def update_note_fields(note_id: int, fields: Dict[str, str], ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
@@ -1782,7 +1992,10 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 8. add_tags
-    @mcp.tool(description="Add tags to notes." + LOCAL_UNTIL_SYNCED_SUFFIX)
+    @mcp.tool(
+        description="Add tags to notes." + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_IDEMPOTENT_WRITE_HINT,
+    )
     @_tool_guard
     async def add_tags(note_ids: List[int], tags: List[str], ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
@@ -1798,7 +2011,8 @@ def create_app(custom_settings: Optional[Settings] = None):
     # 9. create_deck
     @mcp.tool(
         description="Create a deck ('Parent::Child' creates subdecks); an existing name resolves to its ID."
-                     + LOCAL_UNTIL_SYNCED_SUFFIX
+                     + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_IDEMPOTENT_WRITE_HINT,
     )
     @_tool_guard
     async def create_deck(deck_name: str, ctx: Context = None) -> Dict[str, Any]:
@@ -1816,7 +2030,8 @@ def create_app(custom_settings: Optional[Settings] = None):
     @mcp.tool(
         description="Rename a deck (subdecks follow). DESTRUCTIVE: requires confirm=true; a "
         "pre-rename-deck snapshot backup is taken first and the rename is aborted if it fails."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_NON_DESTRUCTIVE_WRITE_HINT,
     )
     @_tool_guard
     async def rename_deck(deck_id: int, new_name: str, confirm: bool = False, ctx: Context = None) -> Dict[str, Any]:
@@ -1837,7 +2052,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         description="Delete a deck, its subdecks and all their cards (the Default deck can never be "
         "deleted). DESTRUCTIVE: requires confirm=true; a pre-delete-deck snapshot backup is taken "
         "first and the deletion is aborted if it fails."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_DESTRUCTIVE_HINT,
     )
     @_tool_guard
     async def delete_deck(deck_id: int, confirm: bool = False, ctx: Context = None) -> Dict[str, Any]:
@@ -1858,7 +2074,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         description="Delete notes and their cards by ID; missing IDs are reported, not fatal. "
         "DESTRUCTIVE: requires confirm=true; a pre-delete-notes snapshot backup is taken first "
         "and the deletion is aborted if it fails."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_DESTRUCTIVE_HINT,
     )
     @_tool_guard
     async def delete_notes(
@@ -1881,7 +2098,10 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 13. remove_tags
-    @mcp.tool(description="Remove tags from notes." + LOCAL_UNTIL_SYNCED_SUFFIX)
+    @mcp.tool(
+        description="Remove tags from notes." + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_IDEMPOTENT_WRITE_HINT,
+    )
     @_tool_guard
     async def remove_tags(note_ids: List[int], tags: List[str], ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
@@ -1913,7 +2133,8 @@ def create_app(custom_settings: Optional[Settings] = None):
     @mcp.tool(
         description="Create a note type from field names and card templates (omit templates for a "
         "default single template over the first two fields). Refuses an existing name."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_NON_DESTRUCTIVE_WRITE_HINT,
     )
     @_tool_guard
     async def create_note_type(
@@ -1970,8 +2191,11 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 18. suspend_cards
-    @mcp.tool(description="Suspend cards so they leave the review queue until unsuspended."
-                          + LOCAL_UNTIL_SYNCED_SUFFIX)
+    @mcp.tool(
+        description="Suspend cards so they leave the review queue until unsuspended."
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_IDEMPOTENT_WRITE_HINT,
+    )
     @_tool_guard
     async def suspend_cards(card_ids: List[int], ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
@@ -1985,7 +2209,10 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 19. unsuspend_cards
-    @mcp.tool(description="Unsuspend previously suspended cards." + LOCAL_UNTIL_SYNCED_SUFFIX)
+    @mcp.tool(
+        description="Unsuspend previously suspended cards." + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_IDEMPOTENT_WRITE_HINT,
+    )
     @_tool_guard
     async def unsuspend_cards(card_ids: List[int], ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
@@ -2001,7 +2228,8 @@ def create_app(custom_settings: Optional[Settings] = None):
     # 20. set_due_date
     @mcp.tool(
         description="Set cards' due date to N days from today ('3') or a random range ('0-2')."
-                     + LOCAL_UNTIL_SYNCED_SUFFIX
+                     + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_IDEMPOTENT_WRITE_HINT,
     )
     @_tool_guard
     async def set_due_date(card_ids: List[int], days: str, ctx: Context = None) -> Dict[str, Any]:
@@ -2016,7 +2244,10 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _tool_error_response(e)
 
     # 21. move_cards
-    @mcp.tool(description="Move cards to another deck (target deck must exist)." + LOCAL_UNTIL_SYNCED_SUFFIX)
+    @mcp.tool(
+        description="Move cards to another deck (target deck must exist)." + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_IDEMPOTENT_WRITE_HINT,
+    )
     @_tool_guard
     async def move_cards(card_ids: List[int], deck_id: int, ctx: Context = None) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
@@ -2059,8 +2290,10 @@ def create_app(custom_settings: Optional[Settings] = None):
         "Only the first 50 queued cards of the deck are considered, so a card deeper in a "
         "long queue is refused until it reaches the front. remaining_in_queue reports the "
         "deck's true remaining queue (new + learning + review counts) — a just-answered "
-        "card that re-enters today's learning queue is still counted."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        "card that re-enters today's learning queue is still counted. Pass elapsed_ms (optional, "
+        "100-600000 ms) to record accurate review duration."
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_NON_DESTRUCTIVE_WRITE_HINT,
     )
     @_tool_guard
     async def answer_card(
@@ -2068,16 +2301,23 @@ def create_app(custom_settings: Optional[Settings] = None):
         rating: int,
         deck: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        elapsed_ms: Optional[int] = None,
         ctx: Context = None,
     ) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
         if username is None:
             return _unauthorized_tool_response()
         try:
-            parsed = AnswerCardInput(card_id=card_id, rating=rating, deck=deck, idempotency_key=idempotency_key)
+            parsed = AnswerCardInput(
+                card_id=card_id,
+                rating=rating,
+                deck=deck,
+                idempotency_key=idempotency_key,
+                elapsed_ms=elapsed_ms,
+            )
             res = await cards_tools.answer_card(
                 tool_sync_manager, tool_registry, username,
-                parsed.card_id, parsed.rating, parsed.deck, parsed.idempotency_key,
+                parsed.card_id, parsed.rating, parsed.deck, parsed.idempotency_key, parsed.elapsed_ms,
             )
             return res.model_dump()
         except Exception as e:
@@ -2087,7 +2327,8 @@ def create_app(custom_settings: Optional[Settings] = None):
     @mcp.tool(
         description="Store a media file (standard base64, max 4 MiB decoded, single-segment "
         "filename); returns the actual stored name."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_NON_DESTRUCTIVE_WRITE_HINT,
     )
     @_tool_guard
     async def store_media_file(filename: str, data_base64: str, ctx: Context = None) -> Dict[str, Any]:
@@ -2177,7 +2418,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         "type, and cards of unmapped old templates are deleted — run preview_note_type_change first. "
         "Requires confirm=true; a pre-change-note-type snapshot backup is taken first and the change "
         "is aborted if it fails."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_DESTRUCTIVE_HINT,
     )
     @_tool_guard
     async def change_note_type(
@@ -2216,9 +2458,11 @@ def create_app(custom_settings: Optional[Settings] = None):
         "$1, $2, ... (Rust regex syntax); match_case makes matching case-sensitive. field_name "
         "restricts the replace to that one field (omit it for all fields) — the name is NOT "
         "checked for existence because a selection-wide check is impossible and an unknown name "
-        "simply matches nothing. Like update_note_fields this is a plain content edit: no confirm "
-        "gate and no snapshot."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        "simply matches nothing. Pass dry_run=true to preview affected notes/fields without modifying "
+        "the collection, and optional idempotency_key to deduplicate retries. Like update_note_fields "
+        "this is a plain content edit: no confirm gate and no snapshot."
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_NON_DESTRUCTIVE_WRITE_HINT,
     )
     @_tool_guard
     async def find_and_replace(
@@ -2229,6 +2473,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         regex: bool = False,
         field_name: Optional[str] = None,
         match_case: bool = False,
+        dry_run: bool = False,
+        idempotency_key: Optional[str] = None,
         ctx: Context = None,
     ) -> Dict[str, Any]:
         username = _username_from_context(ctx) if ctx is not None else None
@@ -2238,11 +2484,13 @@ def create_app(custom_settings: Optional[Settings] = None):
             parsed = FindAndReplaceInput(
                 search=search, replacement=replacement, note_ids=note_ids, query=query,
                 regex=regex, field_name=field_name, match_case=match_case,
+                dry_run=dry_run, idempotency_key=idempotency_key,
             )
             res = await note_tools.find_and_replace(
                 tool_sync_manager, tool_registry, username,
                 parsed.search, parsed.replacement, parsed.note_ids, parsed.query,
                 parsed.regex, parsed.field_name, parsed.match_case,
+                parsed.dry_run, parsed.idempotency_key,
             )
             return res.model_dump()
         except Exception as e:
@@ -2300,7 +2548,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         "type), replace its CSS, edit existing card templates (rename / question / answer), and "
         "set the sort field. Rendering-level edits only — fields and templates are neither added "
         "nor removed, and no note content changes."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_NON_DESTRUCTIVE_WRITE_HINT,
     )
     @_tool_guard
     async def update_note_type(
@@ -2336,7 +2585,8 @@ def create_app(custom_settings: Optional[Settings] = None):
     @mcp.tool(
         description="Add a new empty field to a note type, appended at the end or inserted at a "
         "0-based position. Existing notes get an empty value for it."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_NON_DESTRUCTIVE_WRITE_HINT,
     )
     @_tool_guard
     async def add_note_type_field(
@@ -2364,7 +2614,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         "on EVERY note of the type, and the last remaining field cannot be removed. Requires "
         "confirm=true; a pre-remove-note-type-field snapshot backup is taken first and the removal "
         "is aborted if it fails."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_DESTRUCTIVE_HINT,
     )
     @_tool_guard
     async def remove_note_type_field(
@@ -2391,7 +2642,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         description="Rename a field of a note type (template references to the old name are NOT "
         "rewritten — update templates afterwards if needed). The new name must not collide with "
         "another field of the same type."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_NON_DESTRUCTIVE_WRITE_HINT,
     )
     @_tool_guard
     async def rename_note_type_field(
@@ -2419,7 +2671,8 @@ def create_app(custom_settings: Optional[Settings] = None):
     @mcp.tool(
         description="Move a field of a note type to a new 0-based position (0..field count - 1); "
         "every note keeps its values, only the field order changes."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_IDEMPOTENT_WRITE_HINT,
     )
     @_tool_guard
     async def reposition_note_type_field(
@@ -2446,7 +2699,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         description="Add a card template (name, question format, answer format) to a note type, "
         "appended at the end or inserted at a 0-based position. Cards for existing notes are "
         "generated by Anki's usual template logic."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_NON_DESTRUCTIVE_WRITE_HINT,
     )
     @_tool_guard
     async def add_note_type_template(
@@ -2480,7 +2734,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         "that template are deleted, and the last remaining template cannot be removed. Requires "
         "confirm=true; a pre-remove-note-type-template snapshot backup is taken first and the "
         "removal is aborted if it fails."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_DESTRUCTIVE_HINT,
     )
     @_tool_guard
     async def remove_note_type_template(
@@ -2508,7 +2763,8 @@ def create_app(custom_settings: Optional[Settings] = None):
     @mcp.tool(
         description="Move a card template of a note type to a new 0-based position "
         "(0..template count - 1); existing cards follow their template."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_IDEMPOTENT_WRITE_HINT,
     )
     @_tool_guard
     async def reposition_note_type_template(
@@ -2537,7 +2793,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         description="Delete an UNUSED note type (zero notes). DESTRUCTIVE: requires confirm=true; "
         "a pre-delete-note-type snapshot backup is taken first and the deletion is aborted if it "
         "fails. Note types with notes on them are refused — change or delete those notes first."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_DESTRUCTIVE_HINT,
     )
     @_tool_guard
     async def delete_note_type(name: str, confirm: bool = False, ctx: Context = None) -> Dict[str, Any]:
@@ -2562,7 +2819,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         "or 'image_occlusion'; omit it to use the type's original stock kind. DESTRUCTIVE: "
         "requires confirm=true; a pre-restore-note-type-stock snapshot backup is taken first and "
         "the restore is aborted if it fails."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_DESTRUCTIVE_HINT,
     )
     @_tool_guard
     async def restore_note_type_to_stock(
@@ -2609,7 +2867,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         "(int 10-120), autoplay_audio (bool); anything else is rejected with the valid keys "
         "listed. NOTE: the config is a preset SHARED by every deck using it — decks pointing at "
         "the same preset change scheduling behavior together."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_IDEMPOTENT_WRITE_HINT,
     )
     @_tool_guard
     async def update_deck_config(
@@ -2634,7 +2893,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         description="Set the user flag of the selected cards (card_ids or query): flag 0 clears "
         "the flag, 1-4 are the classic red/orange/green/blue flags, 5-7 the extra user-renameable "
         "ones."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_IDEMPOTENT_WRITE_HINT,
     )
     @_tool_guard
     async def set_card_flags(
@@ -2660,7 +2920,8 @@ def create_app(custom_settings: Optional[Settings] = None):
     @mcp.tool(
         description="Bury the selected cards (card_ids or query): they leave the review queue and "
         "return automatically at the next day rollover, or earlier via unbury_cards."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_IDEMPOTENT_WRITE_HINT,
     )
     @_tool_guard
     async def bury_cards(
@@ -2682,11 +2943,11 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # 46. unbury_cards
     @mcp.tool(
-        description="Unbury the selected cards (card_ids or query). NOTE: the scheduler's unbury "
-        "restores BURIED AND SUSPENDED cards alike — any suspended card in the selection is "
-        "unsuspended too. The reported `unburied` count is the number of cards actually restored "
-        "(they were buried or suspended) out of the selection, not the selection size."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        description="Unbury ONLY buried cards in the selection (card_ids or query); "
+        "suspended cards remain untouched. The reported `unburied` count is the number "
+        "of buried cards actually restored out of the selection, not the selection size."
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_IDEMPOTENT_WRITE_HINT,
     )
     @_tool_guard
     async def unbury_cards(
@@ -2713,7 +2974,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         "learning cards in the selection are ignored by the scheduler. randomize assigns the "
         "positions in random order; shift_existing also shifts other new cards that occupy the "
         "target positions."
-        + LOCAL_UNTIL_SYNCED_SUFFIX
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_NON_DESTRUCTIVE_WRITE_HINT,
     )
     @_tool_guard
     async def reposition_new_cards(
@@ -2742,6 +3004,122 @@ def create_app(custom_settings: Optional[Settings] = None):
         except Exception as e:
             return _tool_error_response(e)
 
+    # 48. list_tags
+    @mcp.tool(
+        description="List all distinct tags present in the Anki collection (sorted).",
+        annotations=_READ_ONLY_HINT,
+    )
+    @_tool_guard
+    async def list_tags(ctx: Context) -> Dict[str, Any]:
+        username = _username_from_context(ctx)
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            return await note_tools.list_tags(tool_registry, username)
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 49. get_sync_status
+    @mcp.tool(
+        description="Report read-only sync status for the account (AnkiWeb credentials "
+        "configured, pre-tool sync cooldown window, and maintenance mode).",
+        annotations=_READ_ONLY_HINT,
+    )
+    @_tool_guard
+    async def get_sync_status(ctx: Context) -> Dict[str, Any]:
+        username = _username_from_context(ctx)
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            return await sync_tools.get_sync_status(tool_sync_manager, username)
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # 50. delete_media_file
+    @mcp.tool(
+        description="Delete a media file from the collection (single-segment filename). "
+        "DESTRUCTIVE: moves the file to trash/removes it permanently from the collection; "
+        "requires confirm=true and creates a pre-delete-media snapshot first."
+        + LOCAL_UNTIL_SYNCED_SUFFIX,
+        annotations=_DESTRUCTIVE_HINT,
+    )
+    @_tool_guard
+    async def delete_media_file(
+        filename: str,
+        confirm: bool = False,
+        idempotency_key: Optional[str] = None,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            return _unauthorized_tool_response()
+        try:
+            parsed = DeleteMediaInput(
+                filename=filename, confirm=confirm, idempotency_key=idempotency_key
+            )
+            res = await media_tools.delete_media_file(
+                tool_sync_manager,
+                tool_registry,
+                username,
+                parsed.filename,
+                parsed.confirm,
+                parsed.idempotency_key,
+            )
+            return res.model_dump()
+        except Exception as e:
+            return _tool_error_response(e)
+
+    # -- MCP Resources & Prompts ---------------------------------------------
+
+    @mcp.resource(
+        "anki://collection/{section}",
+        name="collection_section",
+        description="Read-only JSON view of an Anki collection section ('decks', 'note-types', or 'tags').",
+        mime_type="application/json",
+    )
+    async def read_collection_section(section: str, ctx: Context = None) -> str:
+        username = _username_from_context(ctx) if ctx is not None else None
+        if username is None:
+            raise ValueError("Unauthorized")
+        section_norm = section.strip().lower()
+        if section_norm == "decks":
+            payload = await deck_tools.list_decks(tool_registry, username)
+        elif section_norm == "note-types":
+            payload = await note_tools.list_note_types(tool_registry, username)
+        elif section_norm == "tags":
+            payload = await note_tools.list_tags(tool_registry, username)
+        else:
+            raise ValueError(
+                f"Unknown collection section {section!r}; expected 'decks', 'note-types', or 'tags'."
+            )
+        return json.dumps(payload, indent=2)
+
+    @mcp.prompt(
+        name="create_flashcards",
+        description="Guide the assistant to inspect decks/note types and create high-quality flashcards.",
+    )
+    def prompt_create_flashcards(topic: str, deck: str = "Default", note_type: str = "Basic") -> str:
+        return (
+            f"Create well-structured Anki flashcards about {topic!r} in deck {deck!r} "
+            f"using note type {note_type!r}.\n"
+            "1. Call list_decks and list_note_types to verify target deck and exact field names.\n"
+            "2. Search existing notes first with search_notes to avoid duplicates.\n"
+            "3. Keep each card atomic (one concept per card) and pass an idempotency_key to add_notes."
+        )
+
+    @mcp.prompt(
+        name="review_session",
+        description="Start a guided review session using get_review_queue and answer_card.",
+    )
+    def prompt_review_session(deck: str = "Default", limit: int = 10) -> str:
+        return (
+            f"Run an interactive Anki review session for deck {deck!r} (up to {limit} cards).\n"
+            "1. Call get_review_queue(deck=..., limit=...) to fetch due cards.\n"
+            "2. Present each question cleanly without revealing the answer first.\n"
+            "3. Wait for the user's recall attempt, reveal the answer, confirm rating "
+            "(1=Again, 2=Hard, 3=Good, 4=Easy), and submit answer_card with elapsed_ms when known."
+        )
+
     # Create Starlette app for streamable HTTP with reverse-proxy support
     from mcp.server.transport_security import TransportSecuritySettings
 
@@ -2759,6 +3137,10 @@ def create_app(custom_settings: Optional[Settings] = None):
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
+    # OAuth 2.1 store (claude.ai custom connectors): constructed once per app
+    # before session_guard so both session ownership and AuthMiddleware share it.
+    oauth_store = OAuthStore(os.path.join(settings.data_dir, "oauth_state.json"))
+
     # Session ownership + per-user fairness on top of the SDK's table
     # (audit F-04): binds every mcp-session-id to the (username, token_hash)
     # that created it, refuses cross-user reuse, and caps sessions per user.
@@ -2770,6 +3152,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         user_store=user_store,
         mcp_path=settings.mcp_path,
         max_sessions=settings.mcp_max_sessions,
+        oauth_store=oauth_store,
     )
 
     # Healthcheck endpoint (exempt from authentication)
@@ -3009,6 +3392,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         csrf_token = issue_csrf(session_value)
         flash = _peek_flash(request)
         token_mask = _mask_token(await run_in_threadpool(store.peek_token, user.username))
+        show_all_backups = request.query_params.get("backups") == "all"
         # A stats failure must not take the whole portal down.
         stats: Optional[Dict[str, Any]] = None
         try:
@@ -3022,15 +3406,44 @@ def create_app(custom_settings: Optional[Settings] = None):
             backups = await run_in_threadpool(portal_registry.list_backups, user.username)
         except Exception:
             logger.exception("Backup listing failed for %r", user.username)
+        grants: Optional[List[Dict[str, Any]]] = None
+        try:
+            grants = await run_in_threadpool(oauth_store.list_user_grants, user.username)
+        except Exception:
+            logger.exception("OAuth grant listing failed for %r", user.username)
         # Audit F-13: the portal renders the flash cookie and CSRF-bound forms;
         # browsers and proxies must never cache it.
         response = HTMLResponse(
-            _portal_page(user, csrf_token, flash, stats, backups, token_mask),
+            _portal_page(
+                user,
+                csrf_token,
+                flash,
+                stats,
+                backups,
+                token_mask,
+                grants=grants,
+                show_all_backups=show_all_backups,
+                mcp_path=app_settings.mcp_path,
+            ),
             headers={"Cache-Control": "no-store"},
         )
         if request.cookies.get(FLASH_COOKIE_NAME):
             _clear_flash(response)  # consumed: render at most once
         return response
+
+    async def static_css(request: Request) -> Response:
+        return Response(
+            _APP_CSS_BYTES,
+            media_type="text/css; charset=utf-8",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    async def static_js(request: Request) -> Response:
+        return Response(
+            _APP_JS_BYTES,
+            media_type="application/javascript; charset=utf-8",
+            headers={"Cache-Control": "no-cache"},
+        )
 
     async def logout_submit(request: Request) -> Response:
         session_value = request.cookies.get(SESSION_COOKIE_NAME)
@@ -3119,6 +3532,124 @@ def create_app(custom_settings: Optional[Settings] = None):
         logger.info("Portal AnkiWeb credentials update for %r", user.username)
         return _redirect_with_flash("/", "AnkiWeb credentials saved.", kind="success")
 
+    async def portal_disconnect_credentials(request: Request) -> Response:
+        user, err = _require_session(request)
+        if err:
+            return err
+        session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
+        if not _csrf_ok(session_value, form):
+            return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
+        try:
+            await run_in_threadpool(store.clear_ankiweb_credentials, user.username)
+        except ValueError as e:
+            return _bad_request(f"Could not remove credentials: {e}", back_href="/", back_label="Back to portal")
+        tool_sync_manager.invalidate_pretool_ttl(user.username)
+        logger.info("Portal AnkiWeb credentials removed for %r", user.username)
+        return _redirect_with_flash("/", "AnkiWeb credentials removed.", kind="success")
+
+    async def portal_test_credentials(request: Request) -> Response:
+        user, err = _require_session(request)
+        if err:
+            return err
+        session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
+        if not _csrf_ok(session_value, form):
+            return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
+        if tool_sync_manager.maintenance_mode:
+            return _redirect_with_flash(
+                "/", "Worker is currently in maintenance mode; checks are paused.", kind="error"
+            )
+        if not user.ankiweb_email or not user.ankiweb_password:
+            return _redirect_with_flash(
+                "/",
+                "AnkiWeb credentials are not set — save them before testing.",
+                kind="error",
+            )
+        try:
+            await portal_registry.run(
+                user.username,
+                lambda col: col.sync_login(user.ankiweb_email, user.ankiweb_password, None),
+            )
+        except Exception as e:
+            logger.warning("Portal AnkiWeb credential check failed for %r: %s", user.username, e)
+            return _redirect_with_flash(
+                "/",
+                f"AnkiWeb login check failed: {redact_string(str(e))}",
+                kind="error",
+            )
+        logger.info("Portal AnkiWeb credential check succeeded for %r", user.username)
+        return _redirect_with_flash("/", "AnkiWeb login check succeeded.", kind="success")
+
+    async def portal_change_password(request: Request) -> Response:
+        user, err = _require_session(request)
+        if err:
+            return err
+        session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
+        if not _csrf_ok(session_value, form):
+            return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
+        current_password = str(form.get("current_password", ""))
+        new_password = str(form.get("new_password", ""))
+        confirm_password = str(form.get("confirm_password", ""))
+        if not current_password or not new_password:
+            return _redirect_with_flash("/", "Current and new password are required.", kind="error")
+        if len(new_password) < 8:
+            return _redirect_with_flash(
+                "/", "New password must be at least 8 characters.", kind="error"
+            )
+        if new_password != confirm_password:
+            return _redirect_with_flash("/", "New passwords do not match.", kind="error")
+        async with login_verify_capacity:
+            valid = await run_in_threadpool(store.verify_password, user.username, current_password)
+        if not valid:
+            return _redirect_with_flash("/", "Current password is incorrect.", kind="error")
+        try:
+            await run_in_threadpool(store.set_password, user.username, new_password)
+        except ValueError as e:
+            return _redirect_with_flash("/", f"Could not update password: {e}", kind="error")
+        await session_guard.drop_user_sessions(user.username)
+        logger.info("Portal password changed for %r", user.username)
+        response = _redirect_with_flash(
+            "/", "Password updated. Earlier sessions were signed out.", kind="success"
+        )
+        response.set_cookie(
+            SESSION_COOKIE_NAME,
+            issue_session(app_settings.session_secret, user.username),
+            max_age=SESSION_TTL_SECONDS,
+            path="/",
+            httponly=True,
+            samesite="lax",
+            secure=secure_cookies_enabled(),
+        )
+        return response
+
+    async def portal_revoke_oauth(request: Request) -> Response:
+        user, err = _require_session(request)
+        if err:
+            return err
+        session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
+        if not _csrf_ok(session_value, form):
+            return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
+        grant_id = str(form.get("grant_id", "")).strip()
+        if not grant_id:
+            return _redirect_with_flash("/", "Missing OAuth grant ID.", kind="error")
+        revoked = await run_in_threadpool(oauth_store.revoke_grant, user.username, grant_id)
+        await session_guard.drop_user_sessions(user.username)
+        if not revoked:
+            return _redirect_with_flash("/", "OAuth client grant not found.", kind="error")
+        logger.info("Portal revoked OAuth grant %r for %r", grant_id, user.username)
+        return _redirect_with_flash("/", "OAuth client access revoked.", kind="success")
+
     async def portal_sync_now(request: Request) -> Response:
         user, err = _require_session(request)
         if err:
@@ -3179,7 +3710,10 @@ def create_app(custom_settings: Optional[Settings] = None):
             result.get("success"),
             f", direction={full_sync_direction!r}" if full_sync_direction else "",
         )
-        return HTMLResponse(_sync_result_page(result, issue_csrf(session_value)))
+        return HTMLResponse(
+            _sync_result_page(result, issue_csrf(session_value), user=user),
+            headers={"Cache-Control": "no-store"},
+        )
 
     # -- Portal version history (snapshots): create / confirm / restore / ------
     #    download. Session-authenticated like every portal route; every POST is
@@ -3188,7 +3722,7 @@ def create_app(custom_settings: Optional[Settings] = None):
     #    it may address a file — unknown names, other users' snapshots and
     #    traversal strings all fail the same way (400).
 
-    def _backup_entry(username: str, filename: str) -> Optional[Dict[str, Any]]:
+    async def _backup_entry(username: str, filename: str) -> Optional[Dict[str, Any]]:
         """The user's list_backups record whose filename equals ``filename``.
 
         The membership check IS the access control: ``filename`` never
@@ -3198,7 +3732,8 @@ def create_app(custom_settings: Optional[Settings] = None):
         """
         if not isinstance(filename, str) or not filename:
             return None
-        for entry in portal_registry.list_backups(username):
+        entries = await run_in_threadpool(portal_registry.list_backups, username)
+        for entry in entries:
             if entry["filename"] == filename:
                 return entry
         return None
@@ -3225,7 +3760,9 @@ def create_app(custom_settings: Optional[Settings] = None):
             filename = await portal_registry.backup_user(user.username, "manual")
         except Exception as e:
             logger.error("Portal manual backup failed for %r: %s", user.username, e)
-            return _redirect_with_flash("/", f"Backup failed: {e}", kind="error")
+            return _redirect_with_flash(
+                "/", f"Backup failed: {redact_string(str(e))}", kind="error"
+            )
         logger.info("Portal manual backup for %r: %r", user.username, filename)
         return _redirect_with_flash("/", f"Snapshot created: {filename}.", kind="success")
 
@@ -3234,14 +3771,17 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         filename = request.query_params.get("file", "")
-        entry = _backup_entry(user.username, filename)
+        entry = await _backup_entry(user.username, filename)
         if entry is None:
             return _bad_request(
                 f"Unknown snapshot {filename!r}.", back_href="/", back_label="Back to portal"
             )
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
         csrf_token = issue_csrf(session_value)
-        return HTMLResponse(_backup_confirm_page(user, csrf_token, entry))
+        return HTMLResponse(
+            _backup_confirm_page(user, csrf_token, entry),
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def portal_backup_restore(request: Request) -> Response:
         user, err = _require_session(request)
@@ -3263,7 +3803,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         if not _csrf_ok(session_value, form):
             return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
         filename = str(form.get("file", ""))
-        if _backup_entry(user.username, filename) is None:
+        if await _backup_entry(user.username, filename) is None:
             return _bad_request(
                 f"Unknown snapshot {filename!r}.", back_href="/", back_label="Back to portal"
             )
@@ -3271,7 +3811,9 @@ def create_app(custom_settings: Optional[Settings] = None):
             result = await portal_registry.restore_backup(user.username, filename)
         except Exception as e:
             logger.error("Portal restore failed for %r from %r: %s", user.username, filename, e)
-            return _redirect_with_flash("/", f"Restore failed: {e}", kind="error")
+            return _redirect_with_flash(
+                "/", f"Restore failed: {redact_string(str(e))}", kind="error"
+            )
         # Audit F-08: the restore replaced the collection file wholesale, so
         # the pre-tool TTL stamp describes a collection that no longer exists
         # — drop it and let the next tool call re-sync from scratch.
@@ -3296,15 +3838,20 @@ def create_app(custom_settings: Optional[Settings] = None):
         if err:
             return err
         filename = request.query_params.get("file", "")
-        if _backup_entry(user.username, filename) is None:
+        if await _backup_entry(user.username, filename) is None:
             return _bad_request(
                 f"Unknown snapshot {filename!r}.", back_href="/", back_label="Back to portal"
             )
         # The path is built from the validated name ONLY AFTER the exact-
         # membership check above, so the filename can never carry a path.
         # colpkg IS a zip, hence the media type.
-        path = portal_registry.backup_path(user.username, filename)
-        return FileResponse(path, filename=filename, media_type="application/zip")
+        path = await run_in_threadpool(portal_registry.backup_path, user.username, filename)
+        return FileResponse(
+            path,
+            filename=filename,
+            media_type="application/zip",
+            headers={"Cache-Control": "no-store"},
+        )
 
     # -- Admin console (session + admin role, CSRF-protected) ------------------
 
@@ -3320,12 +3867,40 @@ def create_app(custom_settings: Optional[Settings] = None):
         # Audit F-13: same no-cache posture as the portal — the admin page
         # carries the flash cookie and CSRF forms and must never be cached.
         response = HTMLResponse(
-            _admin_page(user, csrf_token, flash, accounts, global_patterns),
+            _admin_page(
+                user,
+                csrf_token,
+                flash,
+                accounts,
+                global_patterns,
+                maintenance_mode=tool_sync_manager.maintenance_mode,
+                active_sessions=session_guard.active_session_count(),
+            ),
             headers={"Cache-Control": "no-store"},
         )
         if request.cookies.get(FLASH_COOKIE_NAME):
             _clear_flash(response)  # consumed: render at most once
         return response
+
+    async def admin_maintenance(request: Request) -> Response:
+        admin, err = _require_admin(request)
+        if err:
+            return err
+        session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+        form, too_large = await _read_bounded_form(request)
+        if too_large is not None:
+            return too_large
+        if not _csrf_ok(session_value, form):
+            return HTMLResponse(_message_page("Invalid or missing CSRF token."), status_code=403)
+        enabled = str(form.get("enabled", "")).strip().lower() in ("1", "true", "on", "yes")
+        tool_sync_manager.set_maintenance_mode(enabled)
+        logger.info("Admin %r set maintenance_mode=%s", admin.username, enabled)
+        notice = (
+            "Maintenance mode enabled — writes and syncs are paused."
+            if enabled
+            else "Maintenance mode disabled — normal writes resumed."
+        )
+        return _redirect_with_flash("/admin", notice, kind="success")
 
     async def admin_create_user(request: Request) -> Response:
         admin, err = _require_admin(request)
@@ -3348,7 +3923,7 @@ def create_app(custom_settings: Optional[Settings] = None):
             return _bad_request(f"Could not create user: {e}")
         logger.info("Admin %r created account %r", admin.username, username)
         # One-time token reveal so the admin can hand it to the new user.
-        return _redirect_with_flash("/admin", raw_token, kind="token")
+        return _redirect_with_flash("/admin", f"{username}\n{raw_token}", kind="token")
 
     async def admin_reset_password(request: Request) -> Response:
         admin, err = _require_admin(request)
@@ -3393,7 +3968,7 @@ def create_app(custom_settings: Optional[Settings] = None):
         # outlive it — close them so the client re-initializes on the new one.
         await session_guard.drop_user_sessions(username)
         logger.info("Admin %r regenerated token of %r", admin.username, username)
-        return _redirect_with_flash("/admin", raw_token, kind="token")
+        return _redirect_with_flash("/admin", f"{username}\n{raw_token}", kind="token")
 
     async def admin_set_role(request: Request) -> Response:
         admin, err = _require_admin(request)
@@ -3460,7 +4035,9 @@ def create_app(custom_settings: Optional[Settings] = None):
         try:
             # Archive FIRST: if the rename fails, the account record stays put
             # rather than losing a user whose data could not be moved aside.
-            archive_path = _archive_user_data(app_settings.data_dir, username)
+            archive_path = await run_in_threadpool(
+                _archive_user_data, app_settings.data_dir, username
+            )
         except (OSError, ValueError) as e:
             logger.error("Failed to archive data directory for %r: %s", username, e)
             return _bad_request(f"Deletion failed while archiving data: {e}")
@@ -3508,7 +4085,9 @@ def create_app(custom_settings: Optional[Settings] = None):
             # no in-flight sync can resurrect the path mid-rename; a failure
             # here cannot be rolled back (the record is already deleted), so
             # it is logged for the operator instead of aborting.
-            ledger_archive = _archive_ledger_dir(app_settings.data_dir, username, archive_path)
+            ledger_archive = await run_in_threadpool(
+                _archive_ledger_dir, app_settings.data_dir, username, archive_path
+            )
         except (OSError, ValueError) as e:
             logger.error("Failed to archive ledger directory for %r: %s", username, e)
             ledger_archive = None
@@ -3533,7 +4112,10 @@ def create_app(custom_settings: Optional[Settings] = None):
         flash = _peek_flash(request)
         usage = await tool_usage_log.recent(user.username, 50)
         global_patterns = tool_policy_store.get_patterns()
-        response = HTMLResponse(_tools_page(user, csrf_token, flash, usage, global_patterns))
+        response = HTMLResponse(
+            _tools_page(user, csrf_token, flash, usage, global_patterns),
+            headers={"Cache-Control": "no-store"},
+        )
         if request.cookies.get(FLASH_COOKIE_NAME):
             _clear_flash(response)  # consumed: render at most once
         return response
@@ -3587,18 +4169,25 @@ def create_app(custom_settings: Optional[Settings] = None):
             "/admin", f"Saved {len(patterns)} global tool rule(s).", kind="success"
         )
 
+    app.add_route("/static/app.css", static_css, methods=["GET"])
+    app.add_route("/static/app.js", static_js, methods=["GET"])
     app.add_route("/login", login_page, methods=["GET"])
     app.add_route("/login", login_submit, methods=["POST"])
     app.add_route("/", index_page, methods=["GET"])
     app.add_route("/logout", logout_submit, methods=["POST"])
+    app.add_route("/portal/password", portal_change_password, methods=["POST"])
     app.add_route("/portal/regenerate-token", portal_regenerate_token, methods=["POST"])
     app.add_route("/portal/credentials", portal_set_credentials, methods=["POST"])
+    app.add_route("/portal/credentials/disconnect", portal_disconnect_credentials, methods=["POST"])
+    app.add_route("/portal/credentials/test", portal_test_credentials, methods=["POST"])
+    app.add_route("/portal/oauth/revoke", portal_revoke_oauth, methods=["POST"])
     app.add_route("/portal/sync", portal_sync_now, methods=["POST"])
     app.add_route("/portal/backup/create", portal_backup_create, methods=["POST"])
     app.add_route("/portal/backup/confirm", portal_backup_confirm, methods=["GET"])
     app.add_route("/portal/backup/restore", portal_backup_restore, methods=["POST"])
     app.add_route("/portal/backup/download", portal_backup_download, methods=["GET"])
     app.add_route("/admin", admin_page, methods=["GET"])
+    app.add_route("/admin/maintenance", admin_maintenance, methods=["POST"])
     app.add_route("/admin/create-user", admin_create_user, methods=["POST"])
     app.add_route("/admin/reset-password", admin_reset_password, methods=["POST"])
     app.add_route("/admin/regenerate-token", admin_regenerate_token, methods=["POST"])
@@ -3610,11 +4199,8 @@ def create_app(custom_settings: Optional[Settings] = None):
 
     # -- OAuth 2.1 authorization server (claude.ai custom connectors) ---------
     # Discovery, dynamic client registration, the consent-gated authorize
-    # flow, and the token endpoint live in src/oauth.py. The store is
-    # constructed HERE (never at module scope), exactly once per app and
-    # bound to this app's settings/data dir — same capture discipline as
-    # portal_registry/app_settings above.
-    oauth_store = OAuthStore(os.path.join(app_settings.data_dir, "oauth_state.json"))
+    # flow, and the token endpoint live in src/oauth.py (store constructed
+    # above alongside session_guard).
     add_oauth_routes(app, oauth_store, user_store, app_settings)
 
     # Per-user token auth for the MCP surface; the web routes above are in the
@@ -3623,7 +4209,13 @@ def create_app(custom_settings: Optional[Settings] = None):
     # hands authenticated /mcp requests to the session guard (F-04), so it is
     # constructed AFTER authentication — the guard reads the authenticated
     # username off request.state — and registered here via closure capture.
-    app.add_middleware(AuthMiddleware, store=store, settings=settings, session_guard=session_guard)
+    app.add_middleware(
+        AuthMiddleware,
+        store=store,
+        settings=settings,
+        session_guard=session_guard,
+        oauth_store=oauth_store,
+    )
 
     # Baseline security headers on every response (audit F-13). Registered
     # AFTER AuthMiddleware so it sits OUTSIDE it in the stack (the last
@@ -3695,7 +4287,9 @@ def _bootstrap_first_admin(app_settings: Settings) -> None:
     tested by test_first_boot_bootstrap_visible_to_serving_app.
     """
     global user_store, sync_manager
-    user_store = UserStore(app_settings.users_file)
+    user_store = UserStore(
+        app_settings.users_file, encryption_secret=get_encryption_secret(app_settings)
+    )
     sync_manager = SyncManager(collection_registry, user_store, app_settings)
     if not user_store.list_users():
         username = app_settings.admin_username or "admin"

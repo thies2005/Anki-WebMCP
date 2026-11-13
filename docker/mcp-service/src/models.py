@@ -541,6 +541,15 @@ class FindAndReplaceInput(BaseModel):
         description="Restrict the replace to this field name (matched across note types); omit to replace in every field. Passed through WITHOUT existence validation: selections may span note types, and an unknown name simply matches nothing",
     )
     match_case: bool = Field(False, description="Case-sensitive matching (default: case-insensitive)")
+    dry_run: bool = Field(
+        False,
+        description="Preview match counts and sample note IDs without modifying any notes",
+    )
+    idempotency_key: Optional[str] = Field(
+        None,
+        max_length=256,
+        description="Optional unique key to prevent duplicate execution on network retries",
+    )
 
     @field_validator("search", "replacement")
     @classmethod
@@ -950,6 +959,12 @@ class AnswerCardInput(BaseModel):
         max_length=256,
         description="Optional unique key to prevent duplicate answering on network retries",
     )
+    elapsed_ms: Optional[int] = Field(
+        None,
+        ge=0,
+        le=3_600_000,
+        description="Optional study duration in milliseconds for the review log (clamped 0..3600000)",
+    )
 
 
 class _CardSelectionInput(BaseModel):
@@ -1054,3 +1069,44 @@ class GetMediaInput(BaseModel):
 class ListMediaInput(BaseModel):
     """Input parameters for list_media_files tool."""
     limit: int = Field(200, ge=1, le=500, description="Max filenames to return (1-500, default 200)")
+
+
+class DeleteMediaInput(BaseModel):
+    """Input parameters for delete_media_file tool (destructive)."""
+    filename: str = Field(..., min_length=1, max_length=255, description="Media filename (single path segment, no '/' or '\\', not '..')")
+    confirm: bool = Field(False, description="Safety confirmation required to move the media file to trash")
+    idempotency_key: Optional[str] = Field(
+        None,
+        max_length=256,
+        description="Optional unique key to prevent duplicate deletion on network retries",
+    )
+
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, v: str) -> str:
+        return validate_media_filename(v)
+
+
+class SyncCollectionInput(BaseModel):
+    """Input parameters for sync_collection tool."""
+    full_sync_direction: Optional[str] = Field(
+        None,
+        description=(
+            "Required ONLY when AnkiWeb reports a full sync conflict (one side had a structural change). "
+            "'upload' pushes local collection (overwriting AnkiWeb); 'download' pulls AnkiWeb (overwriting local)."
+        ),
+    )
+    idempotency_key: Optional[str] = Field(
+        None,
+        max_length=256,
+        description="Optional unique key to make sync requests idempotent on network retries",
+    )
+
+    @field_validator("full_sync_direction")
+    @classmethod
+    def validate_direction(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        if v not in ("upload", "download"):
+            raise ValueError("full_sync_direction must be 'upload' or 'download'")
+        return v

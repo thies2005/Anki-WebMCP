@@ -15,6 +15,8 @@ through ``sync_manager.execute_mutation``. Wheel facts this module relies on
 """
 
 import logging
+import re
+import time
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -58,8 +60,13 @@ def _card_row(col, card) -> Dict[str, Any]:
     }
 
 
-def _truncate_html(text: str, cap: int) -> Tuple[str, bool]:
-    """Truncate rendered HTML to ``cap`` chars; report whether it was cut."""
+_STYLE_BLOCK_RE = re.compile(r"<style\b[^>]*>.*?</style>", re.IGNORECASE | re.DOTALL)
+
+
+def _truncate_html(text: str, cap: int, *, strip_style: bool = False) -> Tuple[str, bool]:
+    """Optionally strip ``<style>`` blocks, then truncate rendered HTML to ``cap`` chars."""
+    if strip_style:
+        text = _STYLE_BLOCK_RE.sub("", text).strip()
     if len(text) <= cap:
         return text, False
     return text[:cap], True
@@ -328,7 +335,7 @@ async def get_review_queue(
         q_trunc = False
         for queued in out.cards:
             card = col.get_card(queued.card.id)
-            question, trunc = _truncate_html(card.question(), 2000)
+            question, trunc = _truncate_html(card.question(), 2000, strip_style=True)
             q_trunc = q_trunc or bool(trunc)
             items.append(
                 {
@@ -361,14 +368,15 @@ async def answer_card(
     rating: int,
     deck: Optional[str] = None,
     idempotency_key: Optional[str] = None,
+    elapsed_ms: Optional[int] = None,
 ) -> MutationResponse:
     """Answer a queued card with a 1..4 rating (Again/Hard/Good/Easy).
 
     The card must currently be in the scheduler's queue; the answer is built
     from the queue's scheduling states (the v3 path) and applied via
-    ``sched.answer_card``. The card's answer timer is started at answer time —
-    an unattended tool has no "question shown" moment, and build_answer
-    raises on a never-started timer (probed against the wheel).
+    ``sched.answer_card``. The card's answer timer is started at answer time
+    (or offset back by ``elapsed_ms`` when provided) so review logs record
+    accurate study duration.
 
     Deck scoping mirrors get_review_queue: by default the card's OWN deck's
     queue is consulted (any due card is answerable); an explicit ``deck``
@@ -392,6 +400,9 @@ async def answer_card(
                 )
             card = col.get_card(card_id)
             card.start_timer()
+            if elapsed_ms is not None:
+                clamped_ms = max(0, min(int(elapsed_ms), 3_600_000))
+                card.timer_started = max(0.0, time.time() - (clamped_ms / 1000.0))
             answer = col.sched.build_answer(card=card, states=queued.states, rating=_RATING_BY_LEVEL[rating])
             col.sched.answer_card(answer)
             reloaded = col.get_card(card_id)
@@ -530,14 +541,12 @@ async def unbury_cards(
     card_ids: Optional[List[int]] = None,
     query: Optional[str] = None,
 ) -> MutationResponse:
-    """Unbury the selected cards, reporting how many were actually restored.
+    """Unbury buried cards in the selection, leaving suspended cards untouched.
 
-    Wheel semantics (probed: the backend operation is
-    ``restore_buried_and_suspended_cards``): this restores BURIED AND
-    SUSPENDED cards alike, so suspended cards in the selection are
-    unsuspended too — disclosed in the tool description. ``unburied`` counts
-    the selection cards that were actually buried or suspended (queue < 0)
-    just before the call; ``selected`` is the selection size.
+    Filter specifically to buried queues (queue IN (-2, -3)) before calling
+    ``col.sched.unbury_cards`` because Anki's backend restore method would
+    otherwise also unsuspend suspended cards (queue -1). ``unburied`` counts
+    the buried cards actually restored; ``selected`` is the selection size.
     """
     logger.info(
         "Executing unbury_cards for %r (%d id(s), query=%r)",
@@ -546,19 +555,18 @@ async def unbury_cards(
 
     def _apply(col) -> Dict[str, Any]:
         cids = _resolve_card_selection(col, card_ids, query, "Cannot unbury cards")
-        # OpChanges carries no count (probed wheel API), so count the cards
-        # the restore actually affects: buried (-3) or suspended (-1) cards
-        # have queue < 0; active queues are >= 0 (probed wheel behavior).
-        restored_count = 0
+        buried_cids: List[int] = []
         for start in range(0, len(cids), _QUERY_CHUNK):
             chunk = cids[start : start + _QUERY_CHUNK]
             placeholders = ",".join("?" * len(chunk))
-            restored_count += col.db.scalar(
-                f"SELECT COUNT() FROM cards WHERE id IN ({placeholders}) AND queue < 0",
+            rows = col.db.all(
+                f"SELECT id FROM cards WHERE id IN ({placeholders}) AND queue IN (-2, -3)",
                 *chunk,
             )
-        col.sched.unbury_cards(cids)
-        return {"unburied": int(restored_count), "selected": len(cids)}
+            buried_cids.extend(int(r[0]) for r in rows)
+        if buried_cids:
+            col.sched.unbury_cards(buried_cids)
+        return {"unburied": len(buried_cids), "selected": len(cids)}
 
     async def _mutation() -> Dict[str, Any]:
         return await registry.run(username, _apply)

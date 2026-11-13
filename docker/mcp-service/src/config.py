@@ -51,6 +51,9 @@ class Settings:
     log_level: str = field(default_factory=lambda: _env_str("LOG_LEVEL", "INFO").upper())
     # Multi-user settings (Task 1 auth model):
     session_secret: str = field(default_factory=lambda: _env_str("SESSION_SECRET", "").strip())
+    data_encryption_key: str = field(
+        default_factory=lambda: _env_str("DATA_ENCRYPTION_KEY", "").strip()
+    )
     data_dir: str = field(default_factory=lambda: _env_str("DATA_DIR", "/data") or "/data")
     users_file: str = field(default_factory=lambda: _env_str("USERS_FILE", ""))
     admin_username: str = field(default_factory=lambda: _env_str("ADMIN_USERNAME", "").strip())
@@ -121,6 +124,11 @@ def validate_deployment_config(settings: Settings) -> List[str]:
 def get_settings() -> Settings:
     """Return an immutable snapshot of configuration, read from the environment at call time."""
     return Settings()
+
+
+def get_encryption_secret(settings: Settings) -> str:
+    """Return the at-rest encryption secret (DATA_ENCRYPTION_KEY or SESSION_SECRET)."""
+    return settings.data_encryption_key or settings.session_secret
 
 
 def load_or_create_session_secret(data_dir: str) -> Tuple[str, str]:

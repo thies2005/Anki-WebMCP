@@ -18,7 +18,7 @@ services:
       # platform network, and the service is only reachable through that
       # proxy. To scope the trust instead, set FORWARDED_ALLOW_IPS in the
       # Coolify environment editor to the proxy network CIDR (see .env.example).
-      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-*}
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
     labels:
       - "coolify.managed=true"
       - "traefik.enable=true"

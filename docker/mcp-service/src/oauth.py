@@ -42,7 +42,7 @@ import tempfile
 import threading
 import time
 from typing import Dict, List, Mapping, Optional, Tuple
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import FormData
@@ -60,6 +60,7 @@ from .config import Settings
 from .users import UserStore
 from .webauth import (
     SESSION_COOKIE_NAME,
+    SlidingWindowRateLimiter,
     issue_csrf,
     session_issued_before,
     verify_csrf,
@@ -73,9 +74,18 @@ logger = logging.getLogger("anki_mcp.oauth")
 # recommends <= 10 minutes; OAuth 2.1 draft pushes further).
 CODE_TTL_SECONDS = 60
 
-# Bound on live refresh tokens per username (oldest dropped first): a client
-# that leaks refresh tokens can only ever hold a bounded slice of the store.
+# OAuth access tokens expire after 1 hour; connectors renew transparently via
+# rotating refresh tokens and grants can be revoked per app in the portal.
+ACCESS_TOKEN_TTL_SECONDS = 3600
+
+# Bound on live refresh / access tokens per username (oldest dropped first).
 MAX_REFRESH_TOKENS_PER_USER = 10
+MAX_ACCESS_TOKENS_PER_USER = 20
+
+# RFC 7636 PKCE bounds: code_verifier is 43..128 unreserved chars; S256
+# base64url(sha256) challenge is always 43 urlsafe base64 chars without padding.
+_PKCE_VERIFIER_RE = re.compile(r"^[A-Za-z0-9._~-]{43,128}$")
+_PKCE_CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
 # Bounds on dynamic client registration. /register is unauthenticated (the
 # MCP spec's DCR path), so it must not grow persisted state without limit:
@@ -243,8 +253,8 @@ def _redirect_uri_allowed(uri: str) -> bool:
     if parsed.scheme == "https":
         return True
     if parsed.scheme == "http":
-        # urlparse lowercases the hostname for us.
-        return parsed.hostname in ("localhost", "127.0.0.1")
+        # urlparse lowercases the hostname and strips IPv6 brackets for us.
+        return parsed.hostname in ("localhost", "127.0.0.1", "::1")
     return False
 
 
@@ -309,6 +319,7 @@ class OAuthStore:
         self._lock = threading.RLock()
         self._clients: Dict[str, dict] = {}
         self._refresh: Dict[str, dict] = {}
+        self._access: Dict[str, dict] = {}
         self._codes: Dict[str, dict] = {}
         self._load()
 
@@ -323,8 +334,13 @@ class OAuthStore:
                 data = json.load(f)
             clients = data.get("clients", {})
             refresh = data.get("refresh_tokens", {})
-            if not isinstance(clients, dict) or not isinstance(refresh, dict):
-                raise ValueError("expected a JSON object with clients/refresh_tokens objects")
+            access = data.get("access_tokens", {})
+            if (
+                not isinstance(clients, dict)
+                or not isinstance(refresh, dict)
+                or not isinstance(access, dict)
+            ):
+                raise ValueError("expected a JSON object with clients/refresh_tokens/access_tokens objects")
         except (OSError, ValueError, AttributeError) as e:
             logger.warning(
                 "OAuth state at %s is unreadable or corrupt (%s); starting fresh "
@@ -335,10 +351,17 @@ class OAuthStore:
             return
         self._clients = {str(key): rec for key, rec in clients.items() if isinstance(rec, dict)}
         self._refresh = {str(key): rec for key, rec in refresh.items() if isinstance(rec, dict)}
+        now = time.time()
+        self._access = {
+            str(key): rec
+            for key, rec in access.items()
+            if isinstance(rec, dict) and float(rec.get("expires_at", 0.0)) > now
+        }
         logger.info(
-            "Loaded %d OAuth clients and %d refresh-token hashes from %s",
+            "Loaded %d OAuth clients, %d refresh-token hashes, and %d active access tokens from %s",
             len(self._clients),
             len(self._refresh),
+            len(self._access),
             self.file_path,
         )
 
@@ -352,8 +375,20 @@ class OAuthStore:
             dir=dir_name if dir_name else ".", prefix="oauth_", suffix=".tmp"
         )
         try:
+            now = time.time()
+            live_access = {
+                k: v for k, v in self._access.items() if float(v.get("expires_at", 0.0)) > now
+            }
             with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
-                json.dump({"clients": self._clients, "refresh_tokens": self._refresh}, f, indent=2)
+                json.dump(
+                    {
+                        "clients": self._clients,
+                        "refresh_tokens": self._refresh,
+                        "access_tokens": live_access,
+                    },
+                    f,
+                    indent=2,
+                )
                 f.flush()
                 os.fsync(f.fileno())
             # mkstemp already creates the file 0o600; re-assert in case of umask oddities.
@@ -495,7 +530,7 @@ class OAuthStore:
             return None
         if record["client_id"] != client_id or record["redirect_uri"] != redirect_uri:
             return None
-        if not isinstance(code_verifier, str) or not code_verifier:
+        if not isinstance(code_verifier, str) or not _PKCE_VERIFIER_RE.fullmatch(code_verifier):
             return None
         if not hmac.compare_digest(_pkce_s256(code_verifier), record["code_challenge"]):
             return None
@@ -506,13 +541,13 @@ class OAuthStore:
         }
 
     def drop_user(self, username: str) -> None:
-        """Drop every authorization code and refresh grant for ``username``.
+        """Drop every authorization code, refresh grant, and access token for ``username``.
 
         Audit F-01: codes and grants are keyed by the username string, so an
         account deleted and recreated under the same name would otherwise
         inherit the previous holder's in-flight connector credentials. Codes
-        are in-memory only (nothing to persist); removed refresh grants are
-        persisted immediately so a restart cannot resurrect them.
+        are in-memory only (nothing to persist); removed refresh/access tokens
+        are persisted immediately so a restart cannot resurrect them.
         """
         with self._lock:
             self._codes = {
@@ -527,13 +562,21 @@ class OAuthStore:
             ]
             for token_hash in stale_refresh:
                 del self._refresh[token_hash]
-            if stale_refresh:
+            stale_access = [
+                token_hash
+                for token_hash, record in self._access.items()
+                if record.get("username") == username
+            ]
+            for token_hash in stale_access:
+                del self._access[token_hash]
+            if stale_refresh or stale_access:
                 self._save_atomic()
-        if stale_refresh:
+        if stale_refresh or stale_access:
             logger.info(
-                "Dropped OAuth state for %r (%d refresh grant(s), codes included)",
+                "Dropped OAuth state for %r (%d refresh grant(s), %d access token(s), codes included)",
                 username,
                 len(stale_refresh),
+                len(stale_access),
             )
 
     # -- refresh tokens (persisted as sha256 hashes; rotated on use) ---------
@@ -579,11 +622,18 @@ class OAuthStore:
                 return None
             if float(record.get("created_at", 0.0)) < min_created_at:
                 return None
-            new_raw = self._store_refresh_locked(record["username"], record["client_id"])
+            grant_id = record.get("grant_id") or secrets.token_urlsafe(16)
+            new_raw = self._store_refresh_locked(
+                record["username"], record["client_id"], grant_id=grant_id
+            )
             self._save_atomic()
-        return new_raw, dict(record)
+        out = dict(record)
+        out["grant_id"] = grant_id
+        return new_raw, out
 
-    def _store_refresh_locked(self, username: str, client_id: str) -> str:
+    def _store_refresh_locked(
+        self, username: str, client_id: str, grant_id: Optional[str] = None
+    ) -> str:
         """Caller holds the lock. Enforce the per-username cap (drop oldest)."""
         same_user = sorted(
             (
@@ -594,27 +644,179 @@ class OAuthStore:
             key=lambda item: float(item[1].get("created_at", 0.0)),
         )
         overflow = len(same_user) - MAX_REFRESH_TOKENS_PER_USER + 1
-        for token_hash, _record in same_user[: max(overflow, 0)]:
+        for token_hash, evicted in same_user[: max(overflow, 0)]:
             del self._refresh[token_hash]
+            evicted_gid = evicted.get("grant_id")
+            if evicted_gid:
+                for ak in [
+                    k for k, v in self._access.items() if v.get("grant_id") == evicted_gid
+                ]:
+                    del self._access[ak]
         raw = secrets.token_urlsafe(32)
+        gid = grant_id or secrets.token_urlsafe(16)
         self._refresh[_hash_refresh_token(raw)] = {
             "username": username,
             "client_id": client_id,
+            "grant_id": gid,
             "created_at": time.time(),
         }
         return raw
 
+    def _store_access_locked(
+        self, username: str, client_id: str, grant_id: str, scope: str = SCOPE
+    ) -> Tuple[str, int]:
+        """Caller holds the lock. Issue a bounded, expiring hashed OAuth access token."""
+        now = time.time()
+        # Opportunistically purge expired tokens before enforcing per-user cap.
+        expired = [k for k, v in self._access.items() if float(v.get("expires_at", 0.0)) <= now]
+        for k in expired:
+            del self._access[k]
+        same_user = sorted(
+            (
+                (token_hash, rec)
+                for token_hash, rec in self._access.items()
+                if rec.get("username") == username
+            ),
+            key=lambda item: float(item[1].get("created_at", 0.0)),
+        )
+        overflow = len(same_user) - MAX_ACCESS_TOKENS_PER_USER + 1
+        for token_hash, _rec in same_user[: max(overflow, 0)]:
+            del self._access[token_hash]
+        raw = secrets.token_urlsafe(32)
+        self._access[_hash_refresh_token(raw)] = {
+            "username": username,
+            "client_id": client_id,
+            "grant_id": grant_id,
+            "scope": scope,
+            "created_at": now,
+            "expires_at": now + ACCESS_TOKEN_TTL_SECONDS,
+        }
+        return raw, ACCESS_TOKEN_TTL_SECONDS
 
-def _consent_page(client_name: str, values: Dict[str, str], csrf_token: str) -> str:
-    """Minimal consent card, styled like the portal's login page (main._page).
+    def issue_grant_tokens(
+        self, username: str, client_id: str, scope: str = SCOPE
+    ) -> Tuple[str, str, int]:
+        """Issue an independent revocable access token + rotating refresh token for a grant."""
+        grant_id = secrets.token_urlsafe(16)
+        with self._lock:
+            refresh_raw = self._store_refresh_locked(username, client_id, grant_id=grant_id)
+            access_raw, expires_in = self._store_access_locked(username, client_id, grant_id, scope)
+            self._save_atomic()
+        logger.info("Issued OAuth tokens for %r (client %r)", username, client_id)
+        return access_raw, refresh_raw, expires_in
+
+    def rotate_grant_tokens(
+        self,
+        raw_refresh: str,
+        expected_client_id: str,
+        min_created_at: float = 0.0,
+    ) -> Optional[Tuple[str, str, int, dict]]:
+        """Atomically rotate a refresh token and mint a fresh bound access token."""
+        if not isinstance(raw_refresh, str) or not raw_refresh:
+            return None
+        with self._lock:
+            record = self._refresh.pop(_hash_refresh_token(raw_refresh), None)
+            if record is None:
+                return None
+            if record.get("client_id") != expected_client_id:
+                return None
+            if float(record.get("created_at", 0.0)) < min_created_at:
+                return None
+            grant_id = record.get("grant_id") or secrets.token_urlsafe(16)
+            new_refresh = self._store_refresh_locked(
+                record["username"], record["client_id"], grant_id=grant_id
+            )
+            access_raw, expires_in = self._store_access_locked(
+                record["username"], record["client_id"], grant_id, SCOPE
+            )
+            self._save_atomic()
+        out = dict(record)
+        out["grant_id"] = grant_id
+        return access_raw, new_refresh, expires_in, out
+
+    def authenticate_access_token(self, raw_token: str) -> Optional[dict]:
+        """Resolve an OAuth access token to ``{"username", "client_id", "grant_id", ...}``."""
+        if not isinstance(raw_token, str) or not raw_token:
+            return None
+        token_hash = _hash_refresh_token(raw_token)
+        now = time.time()
+        with self._lock:
+            record = self._access.get(token_hash)
+            if record is None:
+                return None
+            if now >= float(record.get("expires_at", 0.0)):
+                return None
+            return dict(record)
+
+    def list_user_grants(self, username: str) -> List[dict]:
+        """Return active OAuth grants for ``username`` sorted newest-first."""
+        with self._lock:
+            grants: List[dict] = []
+            seen_gids: set[str] = set()
+            for token_hash, record in self._refresh.items():
+                if record.get("username") != username:
+                    continue
+                gid = record.get("grant_id") or f"legacy:{token_hash[:12]}"
+                if gid in seen_gids:
+                    continue
+                seen_gids.add(gid)
+                client_id = str(record.get("client_id", ""))
+                client = self._clients.get(client_id)
+                client_name = (client or {}).get("client_name") or client_id or "OAuth client"
+                grants.append(
+                    {
+                        "grant_id": gid,
+                        "client_id": client_id,
+                        "client_name": str(client_name),
+                        "created_at": float(record.get("created_at") or 0.0),
+                    }
+                )
+        grants.sort(key=lambda g: g["created_at"], reverse=True)
+        return grants
+
+    def revoke_grant(self, username: str, grant_id: str) -> bool:
+        """Revoke an OAuth grant (all its refresh and access tokens) for ``username``."""
+        if not grant_id:
+            return False
+        with self._lock:
+            removed = False
+            for token_hash, record in list(self._refresh.items()):
+                if record.get("username") != username:
+                    continue
+                rec_gid = record.get("grant_id") or f"legacy:{token_hash[:12]}"
+                if rec_gid == grant_id:
+                    del self._refresh[token_hash]
+                    removed = True
+            for token_hash, record in list(self._access.items()):
+                if record.get("username") != username:
+                    continue
+                if record.get("grant_id") == grant_id:
+                    del self._access[token_hash]
+                    removed = True
+            if removed:
+                self._save_atomic()
+        if removed:
+            logger.info("Revoked OAuth grant %r for %r", grant_id, username)
+        return removed
+
+
+def _consent_page(
+    client_name: str, values: Dict[str, str], csrf_token: str, username: str = ""
+) -> str:
+    """Consent card, styled consistently with the portal (light/dark adaptive).
 
     Every original authorize query parameter is echoed back as a hidden input
-    so the POST re-validates the exact request the user consented to. The card
-    shows the redirect destination's HOST (not just the attacker-chosen client
-    name): with open dynamic registration the name alone is a phishing
-    primitive, the host is where the access token actually goes.
+    so the POST re-validates the exact request the user consented to. Shows
+    the signed-in account, requested scope, full redirect URI, and emphasized
+    redirect destination host.
     """
-    redirect_host = urlparse(values.get("redirect_uri", "")).hostname or "(unknown)"
+    redirect_uri = values.get("redirect_uri", "")
+    redirect_host = urlparse(redirect_uri).hostname or "(unknown)"
+    user_line = (
+        f'<p class="meta">Signed in as <strong>{html.escape(username)}</strong></p>'
+        if username
+        else ""
+    )
     hidden = "".join(
         f'\n  <input type="hidden" name="{html.escape(name)}" value="{html.escape(value)}">'
         for name, value in values.items()
@@ -624,27 +826,24 @@ def _consent_page(client_name: str, values: Dict[str, str], csrf_token: str) -> 
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>Anki MCP - Authorize client</title>
-<style>
-  body {{ font-family: system-ui, sans-serif; background: #f5f5f5; margin: 0;
-         display: flex; justify-content: center; padding-top: 10vh; }}
-  main {{ background: #fff; border: 1px solid #ddd; border-radius: 6px;
-         padding: 2rem; width: 24rem; }}
-  h1 {{ font-size: 1.25rem; margin: 0 0 0.5rem; }}
-  p {{ word-break: break-all; }}
-  form {{ margin-top: 1rem; display: flex; gap: 0.5rem; }}
-  button {{ padding: 0.45rem 1rem; cursor: pointer; }}
-</style>
+<link rel="stylesheet" href="/static/app.css">
 </head>
-<body>
-<main>
+<body class="centered-page">
+<main class="auth-card">
 <h1>Authorize client</h1>
-<p><strong>{html.escape(client_name)}</strong> requests access to your Anki collection.</p>
-<p>The access token will be delivered to: <strong>{html.escape(redirect_host)}</strong></p>
-<form method="post" action="/oauth/authorize">
+{user_line}
+<p><strong>{html.escape(client_name or "Unnamed OAuth Client")}</strong> requests access to your Anki collection.</p>
+<div class="consent-details">
+  <p><strong>Scope:</strong> <code>{html.escape(values.get("scope", SCOPE))}</code> — read, search, review, create, edit, and sync decks, cards, notes, and media.</p>
+  <p>The access token will be delivered to host: <strong>{html.escape(redirect_host)}</strong></p>
+  <p class="muted small">Redirect URI: <code>{html.escape(redirect_uri)}</code></p>
+</div>
+<form method="post" action="/oauth/authorize" class="btn-row">
   <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">{hidden}
-  <button type="submit" name="decision" value="allow">Allow</button>
-  <button type="submit" name="decision" value="deny">Deny</button>
+  <button type="submit" name="decision" value="allow" class="primary">Allow</button>
+  <button type="submit" name="decision" value="deny" class="secondary">Deny</button>
 </form>
 </main>
 </body>
@@ -659,6 +858,14 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
     so a later create_app() rebind of the module globals cannot reach into
     an already-serving app.
     """
+
+    register_limiter = SlidingWindowRateLimiter(max_requests=300, window_seconds=3600)
+    token_limiter = SlidingWindowRateLimiter(max_requests=60, window_seconds=300)
+    app.state.oauth_register_limiter = register_limiter
+    app.state.oauth_token_limiter = token_limiter
+
+    def _client_ip(request: Request) -> str:
+        return request.client.host if request.client else "unknown"
 
     def _param(params: Mapping, name: str) -> str:
         """A stringified form/query parameter, or "" when absent (never "None")."""
@@ -712,7 +919,10 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
         if _param(params, "response_type") != "code":
             return None, PlainTextResponse("unsupported response_type", status_code=400)
         code_challenge = _param(params, "code_challenge")
-        if not code_challenge or _param(params, "code_challenge_method") != "S256":
+        if (
+            not _PKCE_CHALLENGE_RE.fullmatch(code_challenge)
+            or _param(params, "code_challenge_method") != "S256"
+        ):
             return None, PlainTextResponse("PKCE S256 code_challenge is required", status_code=400)
         values = {
             "client_id": client_id,
@@ -755,6 +965,12 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
     # -- dynamic client registration (RFC 7591) ---------------------------------
 
     async def dynamic_register(request: Request) -> JSONResponse:
+        if not register_limiter.allow(_client_ip(request)):
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": "rate limit exceeded"},
+                status_code=429,
+                headers={"Retry-After": "60", **_NO_STORE_HEADERS},
+            )
         # Pre-auth endpoint: cap the body before JSON parsing allocates for
         # it. _enforce_body_limit streams under the cap and caches the bytes,
         # so request.json() parses the bounded buffer instead of re-reading
@@ -811,13 +1027,19 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
             return RedirectResponse(f"/login?next={quote(target, safe='')}", status_code=302)
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
         csrf_token = issue_csrf(session_value)
-        return HTMLResponse(_consent_page(str(client.get("client_name", "")), values_or_error, csrf_token))
+        return HTMLResponse(
+            _consent_page(
+                str(client.get("client_name", "")),
+                values_or_error,
+                csrf_token,
+                username=username,
+            ),
+            headers=_NO_STORE_HEADERS,
+        )
 
     async def authorize_post(request: Request) -> Response:
         session_value = request.cookies.get(SESSION_COOKIE_NAME, "")
         username = _session_username(request)
-        if username is None:
-            return RedirectResponse("/login", status_code=302)
         # Pre-auth-reachable endpoint (the browser may post here with only a
         # stale cookie): the form parse is capped on the streamed bytes with
         # multipart file parts banned (audit F-05).
@@ -828,6 +1050,14 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
         )
         if err is not None:
             return err
+        if username is None:
+            # Preserve the validated OAuth authorize params across /login redirect
+            # when an idle session expired on the consent card.
+            _, values_or_err = _validate_authorize(form)
+            if isinstance(values_or_err, dict):
+                target = "/oauth/authorize?" + urlencode(values_or_err)
+                return RedirectResponse(f"/login?next={quote(target, safe='')}", status_code=302)
+            return RedirectResponse("/login", status_code=302)
         if not verify_csrf(session_value, _param(form, "csrf_token")):
             return PlainTextResponse("Invalid or missing CSRF token.", status_code=403)
         client, values_or_error = _validate_authorize(form)
@@ -861,6 +1091,12 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
     )
 
     async def token_endpoint(request: Request) -> JSONResponse:
+        if not token_limiter.allow(_client_ip(request)):
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": "rate limit exceeded"},
+                status_code=429,
+                headers={"Retry-After": "60", **_NO_STORE_HEADERS},
+            )
         # Pre-auth endpoint (that is the point of OAuth): the form parse is
         # capped on the streamed bytes and multipart file parts are banned
         # before starlette can spool them (audit F-05).
@@ -931,26 +1167,17 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
                 status_code=400,
                 headers=_NO_STORE_HEADERS,
             )
-        raw_token = user_store.peek_token(username)
-        if not raw_token:
-            # Legacy record without token_plaintext: the raw token was never
-            # stored, so only regeneration (portal) can unblock the connector.
-            return JSONResponse(
-                {"error": "server_error", "error_description": _TOKEN_NOT_VIEWABLE},
-                status_code=400,
-                headers=_NO_STORE_HEADERS,
-            )
+        access_token, refresh_token, expires_in = await run_in_threadpool(
+            store.issue_grant_tokens, username, client_id, redeemed["scope"]
+        )
         logger.info("OAuth access token issued to client %r for %r", client_id, username)
-        # Audit F-14: minting the grant fsyncs oauth_state.json; offload the
-        # synchronous store write so the event loop never blocks on the disk.
-        refresh_token = await run_in_threadpool(store.issue_refresh, username, client_id)
         return JSONResponse(
             {
-                "access_token": raw_token,
+                "access_token": access_token,
                 "token_type": "Bearer",
+                "expires_in": expires_in,
                 "scope": redeemed["scope"],
                 "refresh_token": refresh_token,
-                # Deliberately NO expires_in: the MCP token has no expiry.
             },
             headers=_NO_STORE_HEADERS,
         )
@@ -988,39 +1215,38 @@ def add_oauth_routes(app, store: OAuthStore, user_store: UserStore, settings: Se
         # run the synchronous store write in the threadpool so the event loop
         # never blocks on the disk.
         rotated = await run_in_threadpool(
-            store.rotate_refresh, raw_refresh, client_id, min_created_at=epoch
+            store.rotate_grant_tokens, raw_refresh, client_id, min_created_at=epoch
         )
         if rotated is not None:
             # Defense in depth: the same epoch gate re-checked after the
             # rotation, in case the account's epochs moved between the peek
-            # and the rotate; rotate_refresh burned the presented token.
-            new_refresh, record = rotated
+            # and the rotate; rotate_grant_tokens burned the presented token.
+            access_token, new_refresh, expires_in, record = rotated
             user = user_store.get_user(record["username"])
             if user is None or float(record.get("created_at", 0.0)) < max(
                 float(user.created_at or 0.0),
                 float(user.tokens_invalid_before or 0.0),
                 float(user.sessions_invalid_before or 0.0),
             ):
+                # Revoke the just-minted grant if epochs moved concurrently.
+                if record.get("grant_id"):
+                    await run_in_threadpool(
+                        store.revoke_grant, record["username"], record["grant_id"]
+                    )
                 rotated = None
         if rotated is None:
             logger.warning("OAuth refresh token rejected (client %r)", client_id)
             return JSONResponse(
                 {"error": "invalid_grant"}, status_code=400, headers=_NO_STORE_HEADERS
             )
-        new_refresh, record = rotated
+        access_token, new_refresh, expires_in, record = rotated
         username = record["username"]
-        raw_token = user_store.peek_token(username)
-        if not raw_token:
-            return JSONResponse(
-                {"error": "server_error", "error_description": _TOKEN_NOT_VIEWABLE},
-                status_code=400,
-                headers=_NO_STORE_HEADERS,
-            )
         logger.info("OAuth refresh token rotated for %r (client %r)", username, client_id)
         return JSONResponse(
             {
-                "access_token": raw_token,
+                "access_token": access_token,
                 "token_type": "Bearer",
+                "expires_in": expires_in,
                 "scope": SCOPE,
                 "refresh_token": new_refresh,
             },

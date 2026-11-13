@@ -190,11 +190,38 @@ async def test_dynamic_client_registration(client):
 @pytest.mark.asyncio
 async def test_full_authorization_code_flow(app, client):
     token_body, _client_id = await _full_flow_tokens(app, client)
-    assert token_body["access_token"] == app.state.anki_store.peek_token("alice")
+    assert token_body["access_token"]
+    # OAuth access tokens are independent revocable credentials, never the static MCP token.
+    assert token_body["access_token"] != app.state.anki_store.peek_token("alice")
     assert token_body["token_type"] == "Bearer"
     assert token_body["scope"] == "mcp"
     assert token_body["refresh_token"]
-    assert "expires_in" not in token_body  # the MCP token has no expiry
+    assert token_body["expires_in"] == 3600
+
+    # OAuth bearer authenticates against /mcp (not static token required).
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as mcp_client:
+            mcp_res = await mcp_client.post(
+                "/mcp",
+                headers={
+                    "Authorization": f"Bearer {token_body['access_token']}",
+                    "Accept": "application/json, text/event-stream",
+                },
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {"name": "oauth-test", "version": "1"},
+                    },
+                },
+            )
+            assert mcp_res.status_code == 200
 
 
 # -- 4. redirect_uri validation ---------------------------------------------------
@@ -271,7 +298,10 @@ async def test_refresh_token_rotation(app, client):
     )
     assert res.status_code == 200
     rotated = res.json()
-    assert rotated["access_token"] == app.state.anki_store.peek_token("alice")
+    assert rotated["access_token"]
+    assert rotated["access_token"] != token_body["access_token"]
+    assert rotated["access_token"] != app.state.anki_store.peek_token("alice")
+    assert rotated["expires_in"] == 3600
     assert rotated["refresh_token"] != old_refresh
 
     # The old refresh token is dead (rotation burns it)...
@@ -296,7 +326,9 @@ async def test_refresh_token_rotation(app, client):
         },
     )
     assert again.status_code == 200
-    assert again.json()["access_token"] == app.state.anki_store.peek_token("alice")
+    assert again.json()["access_token"] != rotated["access_token"]
+    assert again.json()["access_token"] != app.state.anki_store.peek_token("alice")
+    assert again.json()["expires_in"] == 3600
 
 
 # -- 8. WWW-Authenticate metadata pointer ------------------------------------------------

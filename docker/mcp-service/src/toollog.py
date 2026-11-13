@@ -56,9 +56,13 @@ class ToolUsageLogger:
         self._data_dir = data_dir
         self.max_entries = max_entries
         self._logs: Dict[str, List[Dict[str, Any]]] = {}
+        self._disk_lines: Dict[str, int] = {}
         self._locks: Dict[str, asyncio.Lock] = {}
 
     def _file_path(self, username: str) -> str:
+        return os.path.join(self._data_dir, "users", username, "tool_usage.jsonl")
+
+    def _legacy_file_path(self, username: str) -> str:
         return os.path.join(self._data_dir, "users", username, "tool_usage.json")
 
     def _lock_for(self, username: str) -> asyncio.Lock:
@@ -71,21 +75,53 @@ class ToolUsageLogger:
         return lock
 
     def _load(self, username: str) -> List[Dict[str, Any]]:
-        path = self._file_path(username)
-        if not os.path.exists(path):
-            return []
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                entries = [e for e in data if isinstance(e, dict)]
+        jsonl_path = self._file_path(username)
+        if os.path.exists(jsonl_path):
+            entries: List[Dict[str, Any]] = []
+            line_count = 0
+            try:
+                with open(jsonl_path, "r", encoding="utf-8") as f:
+                    for raw in f:
+                        stripped = raw.strip()
+                        if not stripped:
+                            continue
+                        line_count += 1
+                        try:
+                            parsed = json.loads(stripped)
+                        except ValueError:
+                            continue
+                        if isinstance(parsed, dict):
+                            entries.append(parsed)
+                if len(entries) > self.max_entries:
+                    entries = entries[-self.max_entries :]
+                self._disk_lines[username] = line_count
                 logger.info(
                     "Loaded %d tool-usage entries for %r", len(entries), username
+                )
+                return entries
+            except OSError as e:
+                logger.error("Failed to read tool-usage log for %r: %s", username, e)
+                self._disk_lines[username] = 0
+                return []
+
+        legacy_path = self._legacy_file_path(username)
+        if not os.path.exists(legacy_path):
+            self._disk_lines[username] = 0
+            return []
+        try:
+            with open(legacy_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                entries = [e for e in data if isinstance(e, dict)][-self.max_entries :]
+                self._disk_lines[username] = self.max_entries * 2  # trigger compaction on next write
+                logger.info(
+                    "Loaded %d legacy tool-usage entries for %r", len(entries), username
                 )
                 return entries
             logger.warning("Corrupted tool-usage log for %r; starting fresh", username)
         except (OSError, ValueError) as e:
             logger.error("Failed to read tool-usage log for %r: %s", username, e)
+        self._disk_lines[username] = 0
         return []
 
     def _entries_for(self, username: str) -> List[Dict[str, Any]]:
@@ -95,6 +131,21 @@ class ToolUsageLogger:
             self._logs[username] = entries
         return entries
 
+    def _append_line(self, username: str, entry: Dict[str, Any]) -> None:
+        path = self._file_path(username)
+        dir_name = os.path.dirname(path)
+        os.makedirs(dir_name, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        fd = os.open(path, flags, 0o600)
+        try:
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception as e:
+            logger.error("Failed to append tool-usage log for %r: %s", username, e)
+            raise
+
     def _save_atomic(self, username: str, entries: List[Dict[str, Any]]) -> None:
         path = self._file_path(username)
         dir_name = os.path.dirname(path)
@@ -102,7 +153,8 @@ class ToolUsageLogger:
         temp_fd, temp_path = tempfile.mkstemp(dir=dir_name, prefix="toolusage_", suffix=".tmp")
         try:
             with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
-                json.dump(entries, f, indent=2)
+                for entry in entries:
+                    f.write(json.dumps(entry, separators=(",", ":")) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
             os.chmod(temp_path, 0o600)
@@ -124,9 +176,7 @@ class ToolUsageLogger:
         duration_ms: int,
         error: Optional[str] = None,
     ) -> None:
-        """Append one entry, evicting beyond the cap. Never raises into a
-        tool call path on ordinary failures: storage errors are logged and
-        the in-memory buffer still updates (the log is best-effort)."""
+        """Append one entry, evicting beyond the cap and compacting periodically."""
         entry = {
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "tool": tool,
@@ -139,12 +189,14 @@ class ToolUsageLogger:
             entries.append(entry)
             while len(entries) > self.max_entries:
                 entries.pop(0)
+            disk_lines = self._disk_lines.get(username, 0) + 1
             try:
-                # The mkstemp/json.dump/fsync rewrite runs on a worker thread
-                # so the event loop is never blocked by disk I/O; the per-user
-                # asyncio lock is held across the call, so writers stay
-                # serialized and saves cannot interleave.
-                await asyncio.to_thread(self._save_atomic, username, entries)
+                if disk_lines >= max(self.max_entries * 2, 20):
+                    await asyncio.to_thread(self._save_atomic, username, entries)
+                    self._disk_lines[username] = len(entries)
+                else:
+                    await asyncio.to_thread(self._append_line, username, entry)
+                    self._disk_lines[username] = disk_lines
             except Exception:
                 logger.exception("Tool-usage log write failed for %r (in-memory kept)", username)
 
@@ -166,4 +218,5 @@ class ToolUsageLogger:
         old buffer or lazily recreates both entries.
         """
         self._logs.pop(username, None)
+        self._disk_lines.pop(username, None)
         self._locks.pop(username, None)

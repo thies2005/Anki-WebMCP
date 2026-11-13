@@ -326,3 +326,47 @@ class LoginRateLimiter:
         """Evict oldest-activity entries (dict order) until within the cap."""
         while len(self._entries) > self.max_entries:
             self._entries.pop(next(iter(self._entries)))
+
+
+class SlidingWindowRateLimiter:
+    """Bounded per-key fixed/sliding-window request rate limiter."""
+
+    def __init__(
+        self,
+        max_requests: int = 60,
+        window_seconds: float = 300.0,
+        max_entries: int = 1000,
+        now_fn: Callable[[], float] = time.time,
+    ):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.max_entries = max_entries
+        self._now = now_fn
+        self._lock = threading.Lock()
+        self._buckets: Dict[str, list[float]] = {}
+
+    def allow(self, key: str) -> bool:
+        """Record a hit for ``key`` if under the limit; return True iff allowed."""
+        now = self._now()
+        cutoff = now - self.window_seconds
+        with self._lock:
+            # Prune expired keys lazily.
+            stale = [
+                k for k, stamps in self._buckets.items() if not stamps or stamps[-1] <= cutoff
+            ]
+            for k in stale:
+                del self._buckets[k]
+            stamps = self._buckets.pop(key, [])
+            stamps = [t for t in stamps if t > cutoff]
+            if len(stamps) >= self.max_requests:
+                self._buckets[key] = stamps
+                self._evict_over_cap()
+                return False
+            stamps.append(now)
+            self._buckets[key] = stamps
+            self._evict_over_cap()
+            return True
+
+    def _evict_over_cap(self) -> None:
+        while len(self._buckets) > self.max_entries:
+            self._buckets.pop(next(iter(self._buckets)))

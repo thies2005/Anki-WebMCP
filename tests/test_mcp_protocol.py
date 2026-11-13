@@ -351,7 +351,7 @@ MUTATING_TOOLS = {
     "suspend_cards", "unsuspend_cards",
     "set_due_date", "move_cards", "answer_card", "store_media_file",
     "update_deck_config", "set_card_flags",
-    "bury_cards", "unbury_cards", "reposition_new_cards",
+    "bury_cards", "unbury_cards", "reposition_new_cards", "delete_media_file",
 }
 
 # The readOnlyHint complement of MUTATING_TOOLS: pure reads, annotated
@@ -363,6 +363,7 @@ READ_ONLY_TOOLS = {
     "find_duplicates", "list_note_types", "get_note_type",
     "preview_note_type_change", "find_cards", "get_card", "get_review_queue",
     "get_media_file", "list_media_files", "get_collection_stats",
+    "list_tags", "get_sync_status",
 }
 
 

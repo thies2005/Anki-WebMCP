@@ -14,12 +14,11 @@ request's task. See the Task 5 report for the verification trail.
 import logging
 from typing import Optional
 
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse
 
 from .config import Settings, get_settings
-from .oauth import public_base_url
+from .oauth import OAuthStore, public_base_url
 from .users import UserStore
 
 logger = logging.getLogger("anki_mcp.auth")
@@ -48,8 +47,14 @@ WEB_AUTH_PATHS = frozenset(
         "/",
         "/login",
         "/logout",
+        "/static/app.css",
+        "/static/app.js",
+        "/portal/password",
         "/portal/regenerate-token",
         "/portal/credentials",
+        "/portal/credentials/disconnect",
+        "/portal/credentials/test",
+        "/portal/oauth/revoke",
         "/portal/sync",
         "/portal/backup/create",
         "/portal/backup/confirm",
@@ -64,6 +69,7 @@ WEB_AUTH_PATHS = frozenset(
         "/admin/set-role",
         "/admin/delete-user",
         "/admin/tool-rules",
+        "/admin/maintenance",
         *OAUTH_AUTH_PATHS,
     }
 )
@@ -82,69 +88,96 @@ def _bearer_challenge(request: Request) -> str:
     )
 
 
-class AuthMiddleware(BaseHTTPMiddleware):
-    """Protects the MCP endpoint with per-user token authentication.
+class AuthMiddleware:
+    """Pure-ASGI authentication middleware for the MCP endpoint.
 
     Authentication is mandatory and has no configuration switch: constructing
     without a :class:`UserStore` raises, so the endpoint can never serve
-    unauthenticated (the legacy single-token middleware's fail-closed
-    construction contract, carried over).
+    unauthenticated. Pure ASGI avoids ``BaseHTTPMiddleware`` stream buffering
+    and per-request task overhead on SSE/streamable-HTTP traffic.
     """
 
-    def __init__(self, app, store: UserStore, settings: Optional[Settings] = None, session_guard=None):
-        super().__init__(app)
+    def __init__(
+        self,
+        app,
+        store: UserStore,
+        settings: Optional[Settings] = None,
+        session_guard=None,
+        oauth_store: Optional[OAuthStore] = None,
+    ):
         if store is None:
             raise ValueError(
                 "AuthMiddleware requires a UserStore. Refusing to serve an "
                 "MCP endpoint that could never authenticate anybody."
             )
+        self.app = app
         self.store = store
         self.settings = settings or get_settings()
-        # Optional BoundedSessionManager (audit F-04): binds mcp-session-ids to
-        # the authenticated (username, token_hash), refuses cross-user reuse,
-        # and caps sessions per user. Created by create_app AFTER this
-        # middleware in the stack, so the guard always sees an authenticated
-        # request.state here.
         self.session_guard = session_guard
+        self.oauth_store = oauth_store
 
-    async def dispatch(self, request: Request, call_next) -> Response:
-        # Permit health checks, CORS preflights, and the cookie-authenticated
-        # web routes without bearer-token authentication.
-        if request.url.path == "/health" or request.method == "OPTIONS" or request.url.path in WEB_AUTH_PATHS:
-            return await call_next(request)
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope, receive=receive)
+        path = request.url.path
+        if path == "/health" or request.method == "OPTIONS" or path in WEB_AUTH_PATHS:
+            await self.app(scope, receive, send)
+            return
 
         provided_token = self._extract_token(request)
         if not provided_token:
-            logger.warning("Rejected unauthenticated request to %r: missing token", request.url.path)
-            return JSONResponse(
+            logger.warning("Rejected unauthenticated request to %r: missing token", path)
+            res = JSONResponse(
                 status_code=401,
-                content={"error": "Unauthorized: Missing authentication token (Authorization: Bearer <token> or X-API-Key)"},
+                content={
+                    "error": "Unauthorized: Missing authentication token (Authorization: Bearer <token> or X-API-Key)"
+                },
                 headers={"WWW-Authenticate": _bearer_challenge(request)},
             )
+            await res(scope, receive, send)
+            return
 
-        # sha256 + in-memory scan (no I/O, no scrypt): safe to run inline.
+        # 1. Personal static MCP token (constant-time sha256 scan).
         user = self.store.authenticate_token(provided_token)
+        auth_binding = user.token_hash if user is not None else ""
+
+        # 2. Expiring, per-grant revocable OAuth access token (when OAuth enabled).
+        if user is None and self.oauth_store is not None:
+            grant = self.oauth_store.authenticate_access_token(provided_token)
+            if grant is not None:
+                candidate = self.store.get_user(grant["username"])
+                if candidate is not None:
+                    epoch = max(
+                        float(candidate.created_at or 0.0),
+                        float(candidate.tokens_invalid_before or 0.0),
+                        float(candidate.sessions_invalid_before or 0.0),
+                    )
+                    if float(grant.get("created_at") or 0.0) >= epoch:
+                        user = candidate
+                        auth_binding = f"oauth:{grant.get('grant_id', '')}"
+
         if user is None:
-            logger.warning("Rejected request to %r: invalid token provided", request.url.path)
-            return JSONResponse(
+            logger.warning("Rejected request to %r: invalid token provided", path)
+            res = JSONResponse(
                 status_code=401,
                 content={"error": "Unauthorized: Invalid authentication token"},
                 headers={"WWW-Authenticate": _bearer_challenge(request)},
             )
+            await res(scope, receive, send)
+            return
 
-        # Travel with the ASGI scope (scope["state"]) into the MCP SDK's
-        # session task; tool wrappers read it via the tool Context.
-        request.state.username = user.username
-        request.state.user = user
+        state = scope.setdefault("state", {})
+        state["username"] = user.username
+        state["user"] = user
+        state["auth_binding"] = auth_binding
 
-        # Audit F-04: the MCP endpoint's session table is guarded by the app's
-        # BoundedSessionManager (ownership binding + per-user cap). It runs
-        # here — after authentication, before the SDK sees the request — so a
-        # session id can never be exercised by a different credential than the
-        # one that created it.
-        if self.session_guard is not None and request.url.path == self.session_guard.mcp_path:
-            return await self.session_guard.handle_request(request, call_next)
-        return await call_next(request)
+        if self.session_guard is not None and path == self.session_guard.mcp_path:
+            await self.session_guard.handle_asgi(scope, receive, send, self.app)
+            return
+        await self.app(scope, receive, send)
 
     @staticmethod
     def _extract_token(request: Request) -> Optional[str]:

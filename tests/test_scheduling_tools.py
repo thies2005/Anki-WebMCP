@@ -194,10 +194,9 @@ async def test_bury_then_unbury_round_trip_restores_queue_state(env):
 
 
 @pytest.mark.asyncio
-async def test_unbury_also_restores_suspended_cards(env):
-    """Pins the disclosed semantics: the wheel's unbury IS
-    restore_buried_and_suspended_cards, so a SUSPENDED card in the selection
-    comes back too. Documented in the tool description."""
+async def test_unbury_preserves_suspended_cards(env):
+    """Unburying restores ONLY buried cards (queue in -2/-3); suspended cards
+    (queue == -1) stay suspended."""
     reg, manager = env
     cids = await reg.run("katja", lambda col: [
         _add_basic_note(col, "bury me"), _add_basic_note(col, "suspend me"),
@@ -213,10 +212,10 @@ async def test_unbury_also_restores_suspended_cards(env):
 
     res = await card_tools.unbury_cards(manager, reg, "katja", card_ids=cids)
     assert res.success is True, res.error
-    assert res.data == {"unburied": 2, "selected": 2}
-    # BOTH restored to their pre-bury/suspend queues (0 = new).
+    assert res.data == {"unburied": 1, "selected": 2}
+    # Only the buried card is restored to queue 0; the suspended card stays -1.
     assert (await _card_state(reg, "katja", cids[0]))[0] == 0
-    assert (await _card_state(reg, "katja", cids[1]))[0] == 0
+    assert (await _card_state(reg, "katja", cids[1]))[0] == -1
 
 
 @pytest.mark.asyncio

@@ -13,7 +13,7 @@ cap bounds both memory copies of one payload.
 import base64
 import logging
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from ..errors import CollectionToolError
 from ..models import MutationResponse, SyncStatus, validate_media_filename
@@ -129,3 +129,45 @@ async def list_media_files(registry, username: str, limit: int = 200) -> Dict[st
         }
 
     return await registry.run(username, _list)
+
+
+async def delete_media_file(
+    sync_manager: SyncManager,
+    registry,
+    username: str,
+    filename: str,
+    confirm: bool = False,
+    idempotency_key: Optional[str] = None,
+) -> MutationResponse:
+    """Move a media file to Anki's media trash after a fail-closed snapshot & confirm gate."""
+    _validate_media_filename(filename)
+    if not confirm:
+        logger.info("delete_media_file for %r skipped: confirm=False", username)
+        return MutationResponse(
+            success=False,
+            local_status="skipped",
+            sync_status=SyncStatus(),
+            error=(
+                "This operation deletes a media file from your collection; pass confirm=true "
+                "to proceed (a pre-delete-media collection snapshot is taken first)."
+            ),
+        )
+    logger.info("Executing delete_media_file for %r: %r", username, filename)
+
+    def _delete(col) -> Dict[str, Any]:
+        path = os.path.join(col.media.dir(), filename)
+        if not os.path.isfile(path):
+            raise CollectionToolError(f"Media file {filename!r} not found in collection media.")
+        registry.snapshot_locked(col, username, "pre-delete-media")
+        col.media.trash_files([filename])
+        return {"filename": filename, "deleted": True, "snapshot_reason": "pre-delete-media"}
+
+    async def _mutation() -> Dict[str, Any]:
+        return await registry.run(username, _delete)
+
+    return await sync_manager.execute_mutation(
+        username,
+        operation_name="delete_media_file",
+        mutation_fn=_mutation,
+        idempotency_key=idempotency_key,
+    )
