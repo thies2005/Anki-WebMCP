@@ -24,10 +24,6 @@ jobs:
   tests:
     name: Test suite
     runs-on: ubuntu-latest
-    env:
-      # Fail-closed setting; the service refuses to start without it.
-      # Tests set their own secrets explicitly, this only mirrors a real boot.
-      SESSION_SECRET: ci-secret
     steps:
       - uses: actions/checkout@v4
 
