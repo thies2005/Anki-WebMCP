@@ -1039,10 +1039,16 @@ def test_runtime_can_decompress_the_wheels_zstd_backup_member():
         "pip install zstandard"
     )
     # Frame built the way the wheel builds its member: no content-size field.
-    import zstandard
-
     payload = b"restore-me" * 1000
-    frame = zstandard.ZstdCompressor(write_content_size=False).compress(payload)
+    try:
+        import zstandard
+
+        frame = zstandard.ZstdCompressor(write_content_size=False).compress(payload)
+    except ModuleNotFoundError:
+        from compression import zstd as _stdlib_zstd
+
+        comp = _stdlib_zstd.ZstdCompressor()
+        frame = comp.compress(payload, _stdlib_zstd.ZstdCompressor.FLUSH_BLOCK) + comp.flush()
     assert _zstd_decompress(frame) == payload
 
 

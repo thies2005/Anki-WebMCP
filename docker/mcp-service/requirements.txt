@@ -6,4 +6,4 @@ python-multipart>=0.0.18,<0.19
 anki==26.9.3
 # Restore-side decompression of the wheel's .colpkg backups on Python < 3.14
 # (the service prefers the stdlib compression.zstd module when present).
-zstandard>=0.23
+zstandard>=0.23; python_version < "3.14"
